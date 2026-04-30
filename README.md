@@ -10,6 +10,10 @@
 
 ---
 
+<p align="center"><img src="screenshot.png" alt="Nintendo Switch Library (NSL) 스크린샷" width="900"></p>
+
+---
+
 ## 주요 기능
 
 ### 다양한 포맷 지원 및 스캔

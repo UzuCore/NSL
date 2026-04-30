@@ -10,7 +10,7 @@
 
 ---
 
-<p align="center"><img src="screenshot.png" alt="Nintendo Switch Library (NSL) 스크린샷" width="900"></p>
+<p align="center"><img src="screenshot.png" alt="Nintendo Switch Library (NSL) 스크린샷"></p>
 
 ---
 

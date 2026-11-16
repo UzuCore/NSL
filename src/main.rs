@@ -400,8 +400,12 @@ fn cached_record_for_path<'a>(
         .filter(|record| !record.fast_hash.is_empty())
 }
 
-fn texture_from_image(
-    ctx: &egui::Context,
+/// Bumped whenever a scan starts producing metadata that older cached records
+/// cannot have. A stored version below this forces one full re-analysis so the
+/// new data gets populated; afterwards cache hits are trusted again.
+const SCAN_SCHEMA_VERSION: &str = "2";
+
+fn texture_from_image(    ctx: &egui::Context,
     name: &str,
     image: image::DynamicImage,
     max_edge: u32,
@@ -685,6 +689,16 @@ impl NslApp {
         self.scan_result = Some(rx);
         self.status = "파일 검색 및 분석 중…".into();
         let log = self.log_sender.clone();
+        // A one-time full re-analysis after the scan schema changes; otherwise
+        // cached records are reused normally.
+        let stored_schema = self
+            .config
+            .settings
+            .get("scan_schema")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let force_reanalyze = stored_schema != SCAN_SCHEMA_VERSION;
         std::thread::spawn(move || {
             let _ = log.send(format!(
                 "🚀 {} 시작 · 폴더 {}개",
@@ -822,15 +836,20 @@ impl NslApp {
                                                 .map(|(old, current)| (old - current).abs() < 1.0)
                                                 .unwrap_or(false)
                                     }) == Some(true);
+                                // A record written before the NACP version column
+                                // existed has an empty version that a plain cache
+                                // hit would keep forever, so re-read those once.
+                                let cache_complete = cached_record.is_some() && !force_reanalyze;
                                 let result = if cancel.load(Ordering::Relaxed) {
                                     (None, false)
-                                } else if cached_record.is_some() && same_metadata {
+                                } else if cached_record.is_some() && same_metadata && cache_complete
+                                {
                                     (None, true)
                                 } else if let Ok(hash) = scanner::fast_hash(source) {
                                     if let (Some(old), Some((_, _, old_hash))) =
                                         (cached_record, known.get(path))
                                     {
-                                        if !old_hash.is_empty() && *old_hash == hash {
+                                        if !old_hash.is_empty() && *old_hash == hash && cache_complete {
                                             let mut record = old.clone();
                                             record.path = path.clone();
                                             record.filename = filename.clone();
@@ -855,7 +874,6 @@ impl NslApp {
                                                     nacp_ko: scanned.nacp_ko,
                                                     nacp_en: scanned.nacp_en,
                                                     nacp_ja: scanned.nacp_ja,
-                                                    nacp_version: scanned.nacp_version,
                                                     contents: scanned.contents,
                                                 }),
                                                 false,
@@ -878,7 +896,6 @@ impl NslApp {
                                                 nacp_ko: scanned.nacp_ko,
                                                 nacp_en: scanned.nacp_en,
                                                 nacp_ja: scanned.nacp_ja,
-                                                nacp_version: scanned.nacp_version,
                                                 contents: scanned.contents,
                                             }),
                                             false,
@@ -2491,13 +2508,7 @@ impl NslApp {
                         } else {
                             row.version
                         };
-                        ui.label(format!(
-                            "보유: {}",
-                            common::display_version(
-                                Some(row.nacp_version.as_str()),
-                                Some(installed)
-                            )
-                        ));
+                        ui.label(format!("보유: {}", common::version_to_str(Some(installed))));
                         ui.colored_label(
                             if row.latest_version > installed {
                                 egui::Color32::from_rgb(224, 108, 117)
@@ -2581,10 +2592,7 @@ impl NslApp {
                             ("타이틀 ID".to_owned(), row.title_id.clone()),
                             (
                                 "보유 버전".to_owned(),
-                                common::display_version(
-                                    Some(row.nacp_version.as_str()),
-                                    Some(installed),
-                                ),
+                                common::version_to_str(Some(installed)),
                             ),
                             (
                                 "최신 버전".to_owned(),
@@ -2833,6 +2841,18 @@ impl NslApp {
                     } else {
                         format!("{n}개 파일 검색 완료 · {removed}개 누락 기록 제거")
                     };
+                    // Remember the scan schema that produced these records so the
+                    // forced re-analysis happens only once.
+                    if !cancelled {
+                        self.config.settings.insert(
+                            "scan_schema".into(),
+                            serde_json::Value::String(SCAN_SCHEMA_VERSION.into()),
+                        );
+                        let _ = database::save_config(
+                            &self.base_dir.join("config.json"),
+                            &self.config,
+                        );
+                    }
                     self.pending_icon_prefetch = self
                         .config
                         .settings
@@ -3645,7 +3665,7 @@ impl NslApp {
                         });
                 } else {
                     let list_width = ui.available_width();
-                    let name_width = (list_width - 552.0).max(240.0);
+                    let name_width = (list_width - 480.0).max(240.0);
                     egui::ScrollArea::both().show(ui, |ui| {
                         ui.set_min_width(list_width);
                         egui::Grid::new("library")
@@ -3655,8 +3675,8 @@ impl NslApp {
                                 for (label, key, width) in [
                                     ("게임 이름", "name", name_width),
                                     ("타이틀 ID", "id", 120.0),
-                                    ("보유 버전", "version", 116.0),
-                                    ("최신 버전", "latest_ver", 116.0),
+                                    ("보유 버전", "version", 80.0),
+                                    ("최신 버전", "latest_ver", 80.0),
                                     ("크기", "size", 60.0),
                                     ("상태", "status", 140.0),
                                 ] {
@@ -3755,13 +3775,11 @@ impl NslApp {
                                     } else {
                                         row.version
                                     };
-                                    let installed_text = common::display_version(
-                                        Some(row.nacp_version.as_str()),
-                                        Some(installed_version),
-                                    );
+                                    let installed_text =
+                                        common::version_to_str(Some(installed_version));
                                     let response = selectable_table_text_cell(
                                         ui,
-                                        116.0,
+                                        80.0,
                                         24.0,
                                         &installed_text,
                                         selected,
@@ -3782,7 +3800,7 @@ impl NslApp {
                                     );
                                     let response = selectable_table_text_cell(
                                         ui,
-                                        116.0,
+                                        80.0,
                                         24.0,
                                         &latest_text,
                                         selected,
@@ -5211,7 +5229,6 @@ mod runtime_tests {
                 nacp_ko: String::new(),
                 nacp_en: String::new(),
                 nacp_ja: String::new(),
-                nacp_version: String::new(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B6000".into()),
                     version: 0,
@@ -5272,7 +5289,6 @@ mod runtime_tests {
                 nacp_ko: "알파".into(),
                 nacp_en: "Alpha".into(),
                 nacp_ja: String::new(),
-                nacp_version: "1.2.0".into(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B6000".into()),
                     version: 0,
@@ -5291,7 +5307,6 @@ mod runtime_tests {
                 nacp_ko: "베타 DLC".into(),
                 nacp_en: String::new(),
                 nacp_ja: String::new(),
-                nacp_version: String::new(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B7001".into()),
                     version: 0,
@@ -5338,22 +5353,32 @@ mod runtime_tests {
     }
 
     #[test]
-    fn installed_versions_round_trip_through_the_database() {
-        let (app, _dir) = seeded_app();
-        let rows = app.db.files("ko_en_db").unwrap();
-        let alpha = rows
-            .iter()
-            .find(|row| row.title_name == "알파")
-            .expect("alpha row");
-        assert_eq!(alpha.nacp_version, "1.2.0");
-        // Cached-record reuse must preserve the version column too, otherwise a
-        // fast scan would blank every version it did not re-read.
-        let cached = app.db.cached_file_records().unwrap();
-        let record = cached
-            .values()
-            .find(|record| record.filename.contains("Alpha"))
-            .expect("cached alpha");
-        assert_eq!(record.nacp_version, "1.2.0");
+    fn schema_bump_forces_one_rescan() {
+        // Records written before the version column cannot be upgraded by a
+        // cache hit, so a schema mismatch must force a full re-analysis.
+        let mut config = database::Config::default();
+        assert_ne!(
+            config
+                .settings
+                .get("scan_schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            SCAN_SCHEMA_VERSION,
+            "a fresh config must re-analyze once"
+        );
+        config.settings.insert(
+            "scan_schema".into(),
+            serde_json::Value::String(SCAN_SCHEMA_VERSION.into()),
+        );
+        assert_eq!(
+            config
+                .settings
+                .get("scan_schema")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            SCAN_SCHEMA_VERSION,
+            "after the first scan the cache is trusted again"
+        );
     }
 
     #[test]

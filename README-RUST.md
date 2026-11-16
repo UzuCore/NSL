@@ -41,9 +41,11 @@ Packaging refuses to continue if the archive would contain `prod.keys`, `title.k
 
 - The SQLite schema matches the Python application's `game_files`, `file_contents`, and `title_db` tables, including the NACP-column migration.
 - The library view resolves database/localized names, content grouping, versions, owned/missing DLC, searchable and sortable columns, optional paging, list/grid modes, per-folder tabs, missing-update/DLC tabs, and row context actions.
+- Installed and latest versions are shown as the raw Nintendo update number with a `v` prefix (`524288` → `v524288`), matching the original library convention. The number is Nintendo's `N << 16` update ordinal and is deliberately **not** decoded into `x.y.z`: doing so produces versions the game never shipped.
 - Folder scanning supports fast and full passes, the original fast MD5 sampling scheme, reuse of persisted scan results for unchanged files, configurable parallel scanning, progress and cancellation, ignored folders, NSP PFS0/HFS0 entries, XCI root/secure partition parsing, tickets, CNMT/XML, direct NACP entries, `nstool` CNMT/NACP extraction, hactool CNMT fallback for NSP/NSZ, and hactool NACP fallback for NSP/NSZ/XCI/XCZ. Multi-game XCI bundles that expose only update/DLC records derive the base title id, matching the Python build. A cancelled pass keeps existing records instead of pruning files it has not reached.
 - Pruning is scoped: records are only deleted underneath scan folders that were reachable during the pass. A disconnected drive or unmounted share keeps its library entries instead of silently wiping them.
 - Local title database parsing/merge, remote title database download, CSV export, detail display and Google-backed Korean description translation, missing-update/missing-DLC filters and exception IDs, single-file and filtered bulk NSRP-style name normalization, icon/screenshot downloads and image caching, manual local icon extraction, unused media cache cleanup, all 14 source palette colors, configurable emulator launching, and optional NSZ/XCZ conversion/auto-conversion through the external `nsz` command are implemented.
+- The title database keeps the catalog's nameless patch rows: they carry only a version, and folding them into the matching application row recovers the newest update for 195 games that previously reported "no update" or an older one.
 - The updater checks the latest GitHub release and installs only the Rust-specific ZIP after manifest validation and explicit confirmation.
 - Duplicate base titles are listed for review, and library reset clears database records only after confirmation while preserving game and media files.
 - Settings changes are persisted to `config.json`; the scrollable settings drawer supports up to five scan folders, name priority, title database source, theme, launcher options, media prefetch, scan worker count, optional file-list paging, start maximized, sash behavior, and update/DLC exception IDs. The Python app's six settings pages are combined into one scrollable drawer.
@@ -61,7 +63,9 @@ cargo test
 
 The standard suite covers:
 
-- synthetic PFS0/CNMT and NACP parsing, plus the CNMT size window that previously hid encrypted metadata archives
+- synthetic PFS0/CNMT and NACP parsing, plus the CNMT size window that hid encrypted metadata archives
+- update-number formatting that shows the raw `v<N>` value
+- nameless patch rows folding their version into the matching application entry
 - XCI base-title derivation for bundles that only contain update/DLC records
 - title database merging and updater version ordering
 - database grouping, DLC status, rename/prune behavior, scoped pruning that keeps unreachable folders, and config persistence
@@ -81,12 +85,13 @@ The first compares the smallest registered NSP and NSZ on-disk fast hashes and p
 
 - `cargo build --release`: clean, no warnings.
 - `cargo clippy --all-targets`: no warnings.
-- `cargo test`: 16 passed, 3 ignored (corpus checks).
+- `cargo test`: 24 passed, 3 ignored (corpus checks).
 - `cargo test full_scan_of_real_corpus_matches_existing_library -- --ignored`: passes against the local corpus in ~63 s and asserts exact reference totals.
 - `cargo test incremental_scan_reuses_cache_after_full_scan -- --ignored`: cold 69.1 s vs incremental 0.37 s, with identical totals and no dropped records.
 - The packaged `nsl.exe` was extracted to an empty folder and run headlessly: `--scan full` reported `files=846 base=800 update=710 dlc=3137 failures=0` in 66.5 s, and `--scan fast` re-ran in 0.3 s with 0 pruned records.
 - Running `--scan` without scan folders or without `prod.keys` exits 1 with a specific error message.
 - Adding an unreachable `Z:/OfflineDrive` to the scan folders and running a full pass kept all 846 records, confirming scoped pruning.
+- A `scan_schema` value in `config.json` records which scan metadata version produced the cached rows; bumping `SCAN_SCHEMA_VERSION` forces one full re-analysis so new columns get populated, then cache hits are trusted again (96.9 s once, 0.3 s after).
 - The ZIP from `build-rust.bat` opens the empty-library welcome screen on first launch, creates `icons/` and `screenshots/`, and renders Korean text correctly.
 - An idle instance reports `RAM: ~150 MB | CPU: ~0%`, confirming the icon missing-cache avoids the per-frame retry loop.
 

@@ -25,40 +25,16 @@ pub fn base_dir() -> PathBuf {
     executable_dir
 }
 
-/// Formats a Nintendo update number for display.
+/// Shows a version exactly as stored: the raw Nintendo update number with a
+/// `v` prefix (`524288` -> `v524288`).
 ///
-/// Nintendo numbers updates as `N << 16` (65536 = 1st update, 131072 = 2nd).
-/// That integer is **not** a semantic version: 65536 decoded as major/minor/
-/// patch yields "1.0.1", which no game ever shipped. The human-readable
-/// version lives in the NACP display version, so anything here is an update
-/// ordinal and is labelled as such.
+/// The value is Nintendo's `N << 16` update ordinal, not a semantic version,
+/// so it is displayed verbatim rather than decoded into fields that would read
+/// as a version the game never shipped.
 pub fn version_to_str(version: Option<i64>) -> String {
-    let Some(v) = version else { return "-".into() };
-    if v <= 0 {
-        return "v1.0.0".into();
-    }
-    let ordinal = v >> 16;
-    if ordinal > 0 {
-        format!("업데이트 {ordinal}")
-    } else {
-        // Not a plausible update number; show it verbatim rather than invent a
-        // version out of its bits.
-        format!("업데이트 ? ({v})")
-    }
-}
-
-/// Formats the installed version of a package.
-///
-/// A combined base+update file carries both a real version string and an
-/// update ordinal, so both are shown: "v1.0.0 · 업데이트 5". Showing only the
-/// string would hide which patch is installed.
-pub fn display_version(display: Option<&str>, update: Option<i64>) -> String {
-    let text = display.map(str::trim).filter(|v| !v.is_empty());
-    let ordinal = update.filter(|v| *v > 0).map(|v| v >> 16).filter(|v| *v > 0);
-    match (text, ordinal) {
-        (Some(text), Some(ordinal)) => format!("v{text} · 업데이트 {ordinal}"),
-        (Some(text), None) => format!("v{text}"),
-        (None, _) => version_to_str(update),
+    match version {
+        None => "-".into(),
+        Some(v) => format!("v{v}"),
     }
 }
 
@@ -92,25 +68,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_numbers_are_not_decoded_as_semantic_versions() {
-        // 65536 is Nintendo's 1st update. Decoding its bits as major.minor.patch
-        // produced "v1.0.1", a version the game never shipped.
-        assert_eq!(version_to_str(Some(65536)), "업데이트 1");
-        assert_eq!(version_to_str(Some(131072)), "업데이트 2");
-        assert_eq!(version_to_str(Some(458752)), "업데이트 7");
-        assert_eq!(version_to_str(Some(0)), "v1.0.0");
+    fn formats_versions_as_the_raw_update_number() {
+        // The library shows the stored Nintendo update number verbatim.
+        assert_eq!(version_to_str(Some(524288)), "v524288");
+        assert_eq!(version_to_str(Some(65536)), "v65536");
+        assert_eq!(version_to_str(Some(0)), "v0");
         assert_eq!(version_to_str(None), "-");
-        assert!(!version_to_str(Some(65536)).contains("1.0.1"));
-    }
-
-    #[test]
-    fn display_version_prefers_the_nacp_string() {
-        assert_eq!(display_version(Some("1.10"), Some(65536)), "v1.10 · 업데이트 1");
-        assert_eq!(display_version(Some(" 1.0.3 "), None), "v1.0.3");
-        assert_eq!(display_version(Some("   "), Some(131072)), "업데이트 2");
-        assert_eq!(display_version(None, Some(65536)), "업데이트 1");
-        // A base package (update 0) shows the version only.
-        assert_eq!(display_version(Some("1.0.0"), Some(0)), "v1.0.0");
     }
 
     #[test]

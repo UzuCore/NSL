@@ -56,7 +56,7 @@ pub fn format_count(n: i64) -> String {
     let first_group = digits.len() % 3;
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
     formatted.push_str(&digits[..first_group]);
-    for (index, chunk) in digits[first_group..].as_bytes().chunks(3).enumerate() {
+    for (index, chunk) in digits.as_bytes()[first_group..].chunks(3).enumerate() {
         if first_group != 0 || index != 0 {
             formatted.push(',');
         }

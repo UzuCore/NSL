@@ -16,7 +16,7 @@ use anyhow::Result;
 use eframe::egui;
 use rayon::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -25,10 +25,106 @@ use std::{
     },
 };
 
+const ICON_CACHE_MAX: usize = 300;
+const ICON_LOAD_BUDGET: usize = 32;
+
+/// Process memory and CPU usage for the status bar meter.
+#[derive(Clone, Copy, Debug, Default)]
+struct ResourceSample {
+    working_set_bytes: u64,
+    cpu_percent: f32,
+}
+
+#[cfg(windows)]
+fn process_resource_sample(previous: Option<(std::time::Instant, u64)>) -> Option<(ResourceSample, (std::time::Instant, u64))> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetProcessTimes(
+            process: *mut core::ffi::c_void,
+            creation: *mut i64,
+            exit: *mut i64,
+            kernel: *mut i64,
+            user: *mut i64,
+        ) -> i32;
+    }
+    #[link(name = "psapi")]
+    extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut MemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+
+    // SAFETY: the handle is the current pseudo-handle, and both output buffers are
+    // fully initialized stack structs of the size we pass to the OS.
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut counters = MemoryCounters {
+            cb: std::mem::size_of::<MemoryCounters>() as u32,
+            ..Default::default()
+        };
+        if GetProcessMemoryInfo(handle, &mut counters, counters.cb) == 0 {
+            return None;
+        }
+        let (mut created, mut exited, mut kernel, mut user) = (0i64, 0i64, 0i64, 0i64);
+        if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
+            return None;
+        }
+        let total_cpu_100ns = (kernel.max(0) as u64).saturating_add(user.max(0) as u64);
+        let now = std::time::Instant::now();
+        let cpu_percent = previous
+            .map(|(last_at, last_cpu)| {
+                let wall = now.duration_since(last_at).as_secs_f64();
+                if wall <= 0.0 {
+                    return 0.0;
+                }
+                let cores = std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1) as f64;
+                let cpu = total_cpu_100ns.saturating_sub(last_cpu) as f64 / 10_000_000.0;
+                ((cpu / wall) * 100.0 / cores) as f32
+            })
+            .unwrap_or(0.0);
+        Some((
+            ResourceSample {
+                working_set_bytes: counters.working_set_size as u64,
+                cpu_percent,
+            },
+            (now, total_cpu_100ns),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_resource_sample(
+    _previous: Option<(std::time::Instant, u64)>,
+) -> Option<(ResourceSample, (std::time::Instant, u64))> {
+    None
+}
+
 struct ScanProgress {
     completed: AtomicUsize,
     total: AtomicUsize,
 }
+
+/// Files applied to the database, stale rows removed, and whether the pass was cancelled.
+type ScanOutcome = (usize, usize, bool);
 
 fn paint_selectable_cell(
     ui: &egui::Ui,
@@ -184,6 +280,7 @@ fn contrasting_button_text(background: egui::Color32) -> egui::Color32 {
 
 struct NslApp {
     db: database::Database,
+    base_dir: PathBuf,
     stats: database::LibraryStats,
     rows: Vec<library::GameFile>,
     folders: Vec<String>,
@@ -201,7 +298,7 @@ struct NslApp {
     settings_folder_selected: Option<usize>,
     reset_panel_width: bool,
     status: String,
-    scan_result: Option<Receiver<std::result::Result<(usize, usize, bool), String>>>,
+    scan_result: Option<Receiver<std::result::Result<ScanOutcome, String>>>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_progress: Option<Arc<ScanProgress>>,
     titledb_result: Option<Receiver<std::result::Result<usize, String>>>,
@@ -220,6 +317,8 @@ struct NslApp {
     sort_desc: bool,
     media_result: Option<Receiver<std::result::Result<(String, usize), String>>>,
     icon_textures: HashMap<String, egui::TextureHandle>,
+    icon_lru: VecDeque<String>,
+    icon_missing: HashSet<String>,
     screenshot_textures: HashMap<String, egui::TextureHandle>,
     texture_selection: Option<i64>,
     icon_dir: PathBuf,
@@ -247,6 +346,9 @@ struct NslApp {
     log_lines: Vec<String>,
     log_open: bool,
     was_working: bool,
+    resource_sample: ResourceSample,
+    resource_clock: Option<(std::time::Instant, u64)>,
+    resource_refresh_at: Option<std::time::Instant>,
 }
 
 fn path_is_within(path: &str, folder: &str) -> bool {
@@ -298,12 +400,97 @@ fn cached_record_for_path<'a>(
         .filter(|record| !record.fast_hash.is_empty())
 }
 
+fn texture_from_image(
+    ctx: &egui::Context,
+    name: &str,
+    image: image::DynamicImage,
+    max_edge: u32,
+) -> Option<egui::TextureHandle> {
+    let thumb = image.thumbnail(max_edge, max_edge).to_rgba8();
+    if thumb.width() == 0 || thumb.height() == 0 {
+        return None;
+    }
+    let size = [thumb.width() as usize, thumb.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw());
+    Some(ctx.load_texture(name, color, Default::default()))
+}
+
 impl NslApp {
+    fn ensure_icon_texture(&mut self, ctx: &egui::Context, title_id: &str, budget: &mut usize) {
+        if title_id.is_empty() || self.icon_textures.contains_key(title_id) {
+            return;
+        }
+        if *budget == 0 || self.icon_missing.contains(title_id) {
+            return;
+        }
+        let path = self.icon_dir.join(format!("{title_id}.png"));
+        let Ok(img) = image::open(&path) else {
+            // Remember misses so the grid does not stat/open the same file every frame.
+            self.icon_missing.insert(title_id.to_owned());
+            return;
+        };
+        *budget -= 1;
+        if let Some(texture) = texture_from_image(ctx, "game_icon", img, 160) {
+            self.icon_textures.insert(title_id.to_owned(), texture);
+            self.icon_lru.push_back(title_id.to_owned());
+            self.trim_icon_cache();
+        }
+    }
+    fn trim_icon_cache(&mut self) {
+        while self.icon_lru.len() > ICON_CACHE_MAX {
+            let Some(oldest) = self.icon_lru.pop_front() else {
+                break;
+            };
+            if self.icon_lru.contains(&oldest) {
+                continue;
+            }
+            self.icon_textures.remove(&oldest);
+        }
+    }
+    fn touch_icon(&mut self, title_id: &str) {
+        if self.icon_textures.contains_key(title_id) {
+            self.icon_lru.retain(|id| id != title_id);
+            self.icon_lru.push_back(title_id.to_owned());
+        }
+    }
+    fn invalidate_icons(&mut self) {
+        self.icon_textures.clear();
+        self.icon_lru.clear();
+        self.icon_missing.clear();
+    }
+    fn resource_usage_text(&self) -> String {
+        if self.resource_sample.working_set_bytes == 0 {
+            return String::new();
+        }
+        format!(
+            "RAM: {:.1} MB  |  CPU: {:.1}%",
+            self.resource_sample.working_set_bytes as f64 / (1024.0 * 1024.0),
+            self.resource_sample.cpu_percent
+        )
+    }
+    fn refresh_resource_sample(&mut self, ctx: &egui::Context) {
+        let now = std::time::Instant::now();
+        if self
+            .resource_refresh_at
+            .is_some_and(|deadline| now < deadline)
+        {
+            return;
+        }
+        if let Some((sample, clock)) = process_resource_sample(self.resource_clock) {
+            self.resource_sample = sample;
+            self.resource_clock = Some(clock);
+        }
+        self.resource_refresh_at = Some(now + std::time::Duration::from_secs(1));
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
     fn new() -> Result<Self> {
-        let db = database::Database::open(common::base_dir().join("library.db"))?;
+        Self::with_base_dir(common::base_dir())
+    }
+    fn with_base_dir(base_dir: PathBuf) -> Result<Self> {
+        let db = database::Database::open(base_dir.join("library.db"))?;
         db.init()?;
         let stats = db.stats()?;
-        let config = database::load_config(&common::base_dir().join("config.json"))?;
+        let config = database::load_config(&base_dir.join("config.json"))?;
         let (log_sender, log_receiver) = mpsc::channel();
         let view_mode = config
             .settings
@@ -334,12 +521,13 @@ impl NslApp {
         } else {
             String::new()
         };
-        let icon_dir = common::base_dir().join("icons");
-        let screenshot_dir = common::base_dir().join("screenshots");
+        let icon_dir = base_dir.join("icons");
+        let screenshot_dir = base_dir.join("screenshots");
         std::fs::create_dir_all(&icon_dir)?;
         std::fs::create_dir_all(&screenshot_dir)?;
         let mut app = Self {
             db,
+            base_dir: base_dir.clone(),
             stats,
             rows: Vec::new(),
             folders,
@@ -356,7 +544,7 @@ impl NslApp {
             settings_category: 0,
             settings_folder_selected: None,
             reset_panel_width: false,
-            status: "준비됨".into(),
+            status: "대기".into(),
             scan_result: None,
             scan_cancel: None,
             scan_progress: None,
@@ -376,6 +564,8 @@ impl NslApp {
             sort_desc: false,
             media_result: None,
             icon_textures: HashMap::new(),
+            icon_lru: VecDeque::new(),
+            icon_missing: HashSet::new(),
             screenshot_textures: HashMap::new(),
             texture_selection: None,
             icon_dir,
@@ -403,6 +593,9 @@ impl NslApp {
             log_lines: Vec::new(),
             log_open: false,
             was_working: false,
+            resource_sample: ResourceSample::default(),
+            resource_clock: None,
+            resource_refresh_at: None,
         };
         app.start_reload();
         Ok(app)
@@ -495,19 +688,24 @@ impl NslApp {
                 },
                 folders.len()
             ));
-            let result = (|| -> Result<(usize, usize, bool)> {
+            let result = (|| -> Result<ScanOutcome> {
                 let mut discovered = Vec::new();
                 let mut existing = Vec::new();
                 let mut skipped = 0usize;
                 let mut candidates = Vec::new();
+                let mut scanned_roots: Vec<String> = Vec::new();
                 'folders: for folder in &folders {
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
                     let root = PathBuf::from(folder);
                     if !root.exists() {
+                        let _ = log.send(format!(
+                            "⚠ 폴더에 접근할 수 없습니다 · {folder} (기록은 유지됩니다)"
+                        ));
                         continue;
                     }
+                    scanned_roots.push(normalize_scan_path(&root));
                     let ignored = [
                         "saves",
                         "save",
@@ -730,7 +928,7 @@ impl NslApp {
                 let removed = if was_cancelled {
                     0
                 } else {
-                    db.delete_missing_files(&existing)?
+                    db.delete_missing_files_within(&existing, &scanned_roots)?
                 };
                 let _ = log.send(format!(
                     "💾 DB 반영 완료 · 새 기록 {}개 · 누락 제거 {}개{}",
@@ -755,7 +953,7 @@ impl NslApp {
         if self.titledb_result.is_some() {
             return;
         }
-        let dir = common::base_dir().join("titledb");
+        let dir = self.base_dir.join("titledb");
         let db = self.db.clone();
         let source = self
             .config
@@ -786,7 +984,7 @@ impl NslApp {
         if self.titledb_result.is_some() {
             return;
         }
-        let dir = common::base_dir().join("titledb");
+        let dir = self.base_dir.join("titledb");
         let db = self.db.clone();
         let (tx, rx) = mpsc::channel();
         self.titledb_result = Some(rx);
@@ -894,7 +1092,7 @@ impl NslApp {
         if self.decompress_result.is_some() {
             return;
         }
-        let root = common::base_dir().join("workspaces");
+        let root = self.base_dir.join("workspaces");
         let log = self.log_sender.clone();
         let (tx, rx) = mpsc::channel();
         self.decompress_result = Some(rx);
@@ -1311,7 +1509,7 @@ impl NslApp {
         if self.update_prepare_result.is_some() {
             return;
         }
-        let base_dir = common::base_dir();
+        let base_dir = self.base_dir.clone();
         let (tx, rx) = mpsc::channel();
         self.update_prepare_result = Some(rx);
         self.status = format!("Rust 업데이트 v{version} 다운로드 및 검증 중");
@@ -2114,9 +2312,10 @@ impl NslApp {
                                     settings_row_label(ui, "");
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(
-                                                "💡 NSZ → NSP, XCZ → XCI 로 변환 후 실행합니다. (C:\\Users\\Public\\NSL_Workspace) 는 매번 실행 전에 자동으로 비워집니다.",
-                                            )
+                                            egui::RichText::new(format!(
+                                                "💡 NSZ → NSP, XCZ → XCI 로 변환 후 실행합니다. 변환 파일은 {} 에 생성되며, 다음 변환 전에 이전 작업 폴더가 자동으로 정리됩니다.",
+                                                self.base_dir.join("workspaces").display()
+                                            ))
                                             .color(egui::Color32::GRAY),
                                         )
                                         .wrap(),
@@ -2465,7 +2664,7 @@ impl NslApp {
                                     let key = path.to_string_lossy().into_owned();
                                     if let Some(tex) = self.screenshot_textures.get(&key) {
                                         let texture_size = tex.size_vec2();
-                                        let width = ui.available_width().min(900.0).max(1.0);
+                                        let width = ui.available_width().clamp(1.0, 900.0);
                                         let height =
                                             width * texture_size.y / texture_size.x.max(1.0);
                                         let response = ui.add(
@@ -2519,6 +2718,13 @@ impl NslApp {
 
 impl eframe::App for NslApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_frame(ctx);
+    }
+}
+
+impl NslApp {
+    fn ui_frame(&mut self, ctx: &egui::Context) {
+        self.refresh_resource_sample(ctx);
         let theme_id = self
             .config
             .settings
@@ -2755,7 +2961,7 @@ impl eframe::App for NslApp {
             match done {
                 Ok((label, n)) => {
                     self.status = format!("{label} 다운로드 완료 · {n}장 저장");
-                    self.icon_textures.clear();
+                    self.invalidate_icons();
                     self.screenshot_textures.clear();
                     self.start_pending_media();
                 }
@@ -2825,18 +3031,9 @@ impl eframe::App for NslApp {
             .cloned()
         {
             let key = row.title_id.clone();
-            let path = self.icon_dir.join(format!("{key}.png"));
-            if !key.is_empty() && !self.icon_textures.contains_key(&key) && path.exists() {
-                if let Ok(img) = image::open(path) {
-                    let rgba = img.to_rgba8();
-                    let size = [rgba.width() as usize, rgba.height() as usize];
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                    self.icon_textures.insert(
-                        key,
-                        ctx.load_texture("game_icon", color, Default::default()),
-                    );
-                }
-            }
+            let mut budget = ICON_LOAD_BUDGET;
+            self.ensure_icon_texture(ctx, &key, &mut budget);
+            self.touch_icon(&key);
         }
         let selected_screenshot_paths: Vec<PathBuf> = self
             .selected
@@ -2864,15 +3061,13 @@ impl eframe::App for NslApp {
             .unwrap_or_default();
         for path in &selected_screenshot_paths {
             let key = path.to_string_lossy().into_owned();
-            if !self.screenshot_textures.contains_key(&key) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                self.screenshot_textures.entry(key)
+            {
                 if let Ok(img) = image::open(path) {
-                    let thumb = img.thumbnail(1200, 800).to_rgba8();
-                    let size = [thumb.width() as usize, thumb.height() as usize];
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, thumb.as_raw());
-                    self.screenshot_textures.insert(
-                        key,
-                        ctx.load_texture("screenshot", color, Default::default()),
-                    );
+                    if let Some(texture) = texture_from_image(ctx, "screenshot", img, 1200) {
+                        entry.insert(texture);
+                    }
                 }
             }
         }
@@ -2891,7 +3086,7 @@ impl eframe::App for NslApp {
                 "last_tab_key".into(),
                 serde_json::Value::String(String::new()),
             );
-            let _ = database::save_config(&common::base_dir().join("config.json"), &self.config);
+            let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
         }
         if self.folder_filter != folder_filter_before {
             self.current_page = 0;
@@ -2951,16 +3146,14 @@ impl eframe::App for NslApp {
                     ui.separator();
                 }
                 ui.horizontal(|ui| {
-                    let label = if self.status == "준비됨" {
-                        if self.settings_open {
-                            "설정"
-                        } else {
-                            "설정 닫힘"
-                        }
-                    } else {
-                        self.status.as_str()
-                    };
-                    ui.label(label);
+                    ui.label(self.status.as_str());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(self.resource_usage_text())
+                                .monospace()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    });
                 });
             });
         if close_log {
@@ -3097,7 +3290,7 @@ impl eframe::App for NslApp {
                                         serde_json::Value::String(key),
                                     );
                                     let _ = database::save_config(
-                                        &common::base_dir().join("config.json"),
+                                        &self.base_dir.join("config.json"),
                                         &self.config,
                                     );
                                 }
@@ -3316,37 +3509,13 @@ impl eframe::App for NslApp {
                                         .max_col_width(grid_card_width)
                                         .spacing(egui::vec2(0.0, 0.0))
                                         .show(ui, |ui| {
+                                            let mut icon_budget = ICON_LOAD_BUDGET;
                                             for (index, row) in page_items.iter().enumerate() {
-                                                if !row.title_id.is_empty()
-                                                    && !self
-                                                        .icon_textures
-                                                        .contains_key(&row.title_id)
-                                                {
-                                                    let path = self
-                                                        .icon_dir
-                                                        .join(format!("{}.png", row.title_id));
-                                                    if let Ok(img) = image::open(path) {
-                                                        let rgba =
-                                                            img.thumbnail(160, 160).to_rgba8();
-                                                        let size = [
-                                                            rgba.width() as usize,
-                                                            rgba.height() as usize,
-                                                        ];
-                                                        let color =
-                                                        egui::ColorImage::from_rgba_unmultiplied(
-                                                            size,
-                                                            rgba.as_raw(),
-                                                        );
-                                                        self.icon_textures.insert(
-                                                            row.title_id.clone(),
-                                                            ctx.load_texture(
-                                                                "grid_icon",
-                                                                color,
-                                                                Default::default(),
-                                                            ),
-                                                        );
-                                                    }
-                                                }
+                                                self.ensure_icon_texture(
+                                                    ctx,
+                                                    &row.title_id,
+                                                    &mut icon_budget,
+                                                );
                                                 let selected = self.selected == Some(row.id);
                                                 let card_response = egui::Frame::none()
                                                     .fill(if selected {
@@ -3967,9 +4136,9 @@ impl eframe::App for NslApp {
         if self.config.settings != settings_before || self.folders != folders_before {
             self.config.scan_folders = self.folders.clone();
             if let Err(e) =
-                database::save_config(&common::base_dir().join("config.json"), &self.config)
+                database::save_config(&self.base_dir.join("config.json"), &self.config)
             {
-                self.status = format!("?ㅼ젙 ????ㅽ뙣: {e}");
+                self.status = format!("설정 저장 실패: {e}");
             }
             let name_mode_after = self
                 .config
@@ -4202,7 +4371,7 @@ impl eframe::App for NslApp {
                                 }
                                 self.remove_folder_confirm = None;
                                 match database::save_config(
-                                    &common::base_dir().join("config.json"),
+                                    &self.base_dir.join("config.json"),
                                     &self.config,
                                 ) {
                                     Ok(()) => self.status = format!("폴더 제거: {folder}"),
@@ -4329,7 +4498,7 @@ impl eframe::App for NslApp {
                             if ui.button("적용하고 다시 시작").clicked() {
                                 self.update_ready = None;
                                 if let Err(e) =
-                                    updater::launch_apply_and_exit(&task_dir, &common::base_dir())
+                                    updater::launch_apply_and_exit(&task_dir, &self.base_dir)
                                 {
                                     self.status = format!("업데이트 적용 실패: {e}");
                                 }
@@ -4418,11 +4587,11 @@ impl eframe::App for NslApp {
                             ui.label("지원 형식: NSP, NSZ, XCI, XCZ");
                             ui.label(format!(
                                 "DB: {}",
-                                common::base_dir().join("library.db").display()
+                                self.base_dir.join("library.db").display()
                             ));
                             ui.label(format!(
                                 "캐시: {}",
-                                common::base_dir().join("caches").display()
+                                self.base_dir.join("caches").display()
                             ));
                         });
                     });
@@ -4636,7 +4805,8 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                             ui.close_menu();
                         }
                         if ui.button("타이틀 DB 현황").clicked() {
-                            app.titledb_info = Some(local_titledb_status());
+                            app.titledb_info =
+                                Some(local_titledb_status(&app.base_dir.join("titledb")));
                             ui.close_menu();
                         }
                         ui.separator();
@@ -4750,7 +4920,7 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                             serde_json::Value::String(app.view_mode.clone()),
                         );
                         let _ = database::save_config(
-                            &common::base_dir().join("config.json"),
+                            &app.base_dir.join("config.json"),
                             &app.config,
                         );
                     }
@@ -4788,8 +4958,7 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
     });
 }
 
-fn local_titledb_status() -> String {
-    let directory = common::base_dir().join("titledb");
+fn local_titledb_status(directory: &std::path::Path) -> String {
     let mut lines = vec![format!("저장 위치: {}\n", directory.display())];
     for name in ["titles.json", "versions.json", "KR.ko.json"] {
         let path = directory.join(name);
@@ -4814,8 +4983,23 @@ fn local_titledb_status() -> String {
     lines.join("\n")
 }
 
+fn load_window_icon() -> Option<egui::IconData> {
+    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
+    let image = image::load_from_memory_with_format(ICON_BYTES, image::ImageFormat::Ico).ok()?;
+    let rgba = image.to_rgba8();
+    if rgba.width() == 0 || rgba.height() == 0 {
+        return None;
+    }
+    Some(egui::IconData {
+        rgba: rgba.as_raw().clone(),
+        width: rgba.width(),
+        height: rgba.height(),
+    })
+}
+
 fn main() -> Result<()> {
     let app = NslApp::new()?;
+    let _ = decompress::cleanup_workspaces(&common::base_dir().join("workspaces"));
     let start_maximized = app
         .config
         .settings
@@ -4823,11 +5007,15 @@ fn main() -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("0")
         == "1";
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1400.0, 860.0])
+        .with_min_inner_size([1400.0, 860.0])
+        .with_maximized(start_maximized);
+    if let Some(icon) = load_window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1400.0, 860.0])
-            .with_min_inner_size([1400.0, 860.0])
-            .with_maximized(start_maximized),
+        viewport,
         ..Default::default()
     };
     let window_title = format!("NSL  v{}", env!("CARGO_PKG_VERSION"));
@@ -4926,5 +5114,269 @@ mod runtime_tests {
         assert!(cached_record_for_path(&records, &path).is_some());
         records.get_mut(&path).unwrap().fast_hash.clear();
         assert!(cached_record_for_path(&records, &path).is_none());
+    }
+
+    /// Drives the real egui `update()` loop headlessly so the rendered screens,
+    /// filter paths, and tab transitions are exercised without a window.
+    fn run_app_ticks(app: &mut NslApp, ticks: usize) -> egui::Context {
+        let ctx = egui::Context::default();
+        install_korean_font(&ctx);
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1456.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        for _ in 0..ticks {
+            ctx.begin_pass(input.take());
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+            input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            };
+        }
+        ctx
+    }
+
+    fn seeded_app() -> (NslApp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        std::fs::create_dir_all(base.join("icons")).unwrap();
+        std::fs::create_dir_all(base.join("screenshots")).unwrap();
+        let db = database::Database::open(base.join("library.db")).unwrap();
+        db.init().unwrap();
+        db.upsert_files(&[
+            database::FileRecord {
+                path: "E:\\NSW\\Alpha [0100D2C0115B6000][v0][Base].nsz".into(),
+                filename: "Alpha [0100D2C0115B6000][v0][Base].nsz".into(),
+                size: 4_000_000,
+                mtime: Some(1.0),
+                file_type: "nsz".into(),
+                scan_folder: "E:\\NSW".into(),
+                fast_hash: "hash-alpha".into(),
+                nacp_ko: "알파".into(),
+                nacp_en: "Alpha".into(),
+                nacp_ja: String::new(),
+                contents: vec![scanner::Content {
+                    title_id: Some("0100D2C0115B6000".into()),
+                    version: 0,
+                    content_type: "base".into(),
+                    source: "header_cnmt".into(),
+                }],
+            },
+            database::FileRecord {
+                path: "E:\\NSW\\Beta [0100D2C0115B7001][v0][DLC].nsz".into(),
+                filename: "Beta [0100D2C0115B7001][v0][DLC].nsz".into(),
+                size: 1_000_000,
+                mtime: Some(2.0),
+                file_type: "nsz".into(),
+                scan_folder: "E:\\NSW".into(),
+                fast_hash: "hash-beta".into(),
+                nacp_ko: "베타 DLC".into(),
+                nacp_en: String::new(),
+                nacp_ja: String::new(),
+                contents: vec![scanner::Content {
+                    title_id: Some("0100D2C0115B7001".into()),
+                    version: 0,
+                    content_type: "dlc".into(),
+                    source: "header_cnmt".into(),
+                }],
+            },
+        ])
+        .unwrap();
+        let mut config = database::Config {
+            scan_folders: vec!["E:\\NSW".into()],
+            ..Default::default()
+        };
+        config
+            .settings
+            .insert("name_mode".into(), serde_json::Value::String("db".into()));
+        config.settings.insert(
+            "titledb_source".into(),
+            serde_json::Value::String("custom".into()),
+        );
+        database::save_config(&base.join("config.json"), &config).unwrap();
+
+        let app = NslApp::with_base_dir(base).unwrap();
+        (app, dir)
+    }
+
+    fn wait_for_rows(app: &mut NslApp, ctx: &egui::Context) {
+        for _ in 0..200 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(ctx);
+            let _ = ctx.end_pass();
+            if !app.rows.is_empty() && app.reload_result.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("library rows did not load");
+    }
+
+    #[test]
+    fn headless_app_loads_library_and_renders_every_screen() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        assert_eq!(app.rows.len(), 2, "both records should be visible");
+
+        // Grid, list, settings, and each section of the settings drawer must render.
+        for view in ["grid", "list"] {
+            app.view_mode = view.into();
+            run_app_ticks(&mut app, 2);
+        }
+        app.settings_open = true;
+        for category in 0..6 {
+            app.settings_category = category;
+            app.status = format!("settings category {category}");
+            run_app_ticks(&mut app, 2);
+        }
+        app.settings_open = false;
+        app.settings_category = 0;
+
+        for tab in 0..4 {
+            app.detail_tab = tab;
+            run_app_ticks(&mut app, 2);
+        }
+
+        app.shortcuts_open = true;
+        run_app_ticks(&mut app, 1);
+        app.shortcuts_open = false;
+        app.about_open = true;
+        run_app_ticks(&mut app, 1);
+        app.about_open = false;
+        app.log_open = true;
+        run_app_ticks(&mut app, 1);
+    }
+
+    #[test]
+    fn headless_app_filters_search_and_folder_tabs() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        assert_eq!(app.rows.len(), 2);
+
+        // The default library view is base-only, matching the Python build: a
+        // standalone DLC file never becomes its own card.
+        app.kind_filter = "base".into();
+        let base_rows = app
+            .rows
+            .iter()
+            .filter(|row| app.row_matches_current_filter(row))
+            .count();
+        assert_eq!(base_rows, 1);
+        assert!(app
+            .rows
+            .iter()
+            .filter(|row| app.row_matches_current_filter(row))
+            .all(|row| row.content_type == "base"));
+
+        // Search matches title name, filename, or title id.
+        app.kind_filter.clear();
+        app.search = "Beta".into();
+        let matches: Vec<_> = library::visible(&app.rows, &app.search)
+            .filter(|row| app.row_matches_current_filter(row))
+            .map(|row| row.size)
+            .collect();
+        assert_eq!(matches, vec![1_000_000]);
+
+        app.search = "0100D2C0115B6000".into();
+        let by_id = library::visible(&app.rows, &app.search).count();
+        assert_eq!(by_id, 1, "title id search must hit exactly one file");
+        app.search.clear();
+
+        app.kind_filter = "dlc".into();
+        let dlc_rows: Vec<_> = app
+            .rows
+            .iter()
+            .filter(|row| app.row_matches_current_filter(row))
+            .collect();
+        assert_eq!(
+            dlc_rows.len(),
+            2,
+            "DLC filter lists the owning base card and the DLC file itself"
+        );
+        assert!(dlc_rows.iter().any(|row| row.dlc_count > 0));
+
+        // An unreachable folder tab must not panic or hide everything.
+        app.folder_filter = "MISSING_UPDATES".into();
+        run_app_ticks(&mut app, 1);
+        app.folder_filter = "Z:\\missing".into();
+        run_app_ticks(&mut app, 1);
+        app.folder_filter.clear();
+        app.kind_filter = "base".into();
+        run_app_ticks(&mut app, 1);
+        assert_eq!(app.rows.len(), 2);
+    }
+
+    /// Full scan of the real local corpus into a scratch database. Ignored by
+    /// default because it needs E:\NSW and prod.keys present.
+    #[test]
+    #[ignore = "requires the local game corpus and prod.keys"]
+    fn full_scan_of_real_corpus_matches_existing_library() {
+        let (mut app, dir) = seeded_app();
+        let base = dir.path().to_path_buf();
+        app.folders = vec!["E:\\NSW".into()];
+        app.config.scan_folders = app.folders.clone();
+        database::save_config(&base.join("config.json"), &app.config).unwrap();
+        app.db.clear_library_data().unwrap();
+
+        app.start_scan(false);
+        let ctx = egui::Context::default();
+        let mut finished = false;
+        for _ in 0..120_000 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+            if app.scan_result.is_none() && app.reload_result.is_none() && app.scan_progress.is_none()
+            {
+                finished = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(finished, "scan did not finish: {}", app.status);
+
+        let count = app.rows.len();
+        let stats = app.db.stats().unwrap();
+        let failures = app
+            .log_lines
+            .iter()
+            .filter(|line| line.contains("분석 실패"))
+            .count();
+        assert_eq!(failures, 0, "no file may fail analysis; status: {}", app.status);
+        assert!(
+            count > 700,
+            "expected the full library, scanned only {count} rows"
+        );
+        assert_eq!(stats.base_count, 800, "base rows must match the reference library");
+        assert_eq!(stats.update_count, 710, "update rows must match the reference library");
+        assert_eq!(stats.dlc_count, 3137, "dlc rows must match the reference library");
+
+        // Every discovered file must carry a fast hash so the next pass can reuse it.
+        let cached = app.db.cached_file_records().unwrap();
+        assert_eq!(cached.len(), count);
+        assert!(cached.values().all(|record| !record.fast_hash.is_empty()));
+        assert!(cached
+            .values()
+            .all(|record| !record.contents.is_empty()));
     }
 }

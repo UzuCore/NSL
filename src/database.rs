@@ -107,9 +107,11 @@ pub struct Config {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// mtime, size, fast hash for a path already present in the database.
+pub type KnownFile = (Option<f64>, i64, String);
+
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LibraryStats {
-    pub file_count: i64,
+pub struct LibraryStats {    pub file_count: i64,
     pub total_size: i64,
     pub base_count: i64,
     pub update_count: i64,
@@ -500,21 +502,38 @@ impl Database {
             .collect::<rusqlite::Result<HashSet<_>>>()?;
         Ok(ids)
     }
-    pub fn delete_missing_files(&self, paths: &[String]) -> Result<usize> {
-        let conn = self.connect()?;
-        if paths.is_empty() {
+    pub fn delete_missing_files_within(&self, paths: &[String], roots: &[String]) -> Result<usize> {
+        // Empty `paths` is meaningful: the scanned roots are reachable but contain
+        // no game files, so stale rows under those roots should be pruned.
+        if roots.is_empty() {
             return Ok(0);
         }
+        let normalize = |value: &str| {
+            value
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        };
+        let keep: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let roots: Vec<String> = roots.iter().map(|root| normalize(root)).collect();
+        let conn = self.connect()?;
         let tx = conn.unchecked_transaction()?;
         let mut stmt = tx.prepare("SELECT path FROM game_files")?;
         let all = stmt
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
-        let keep: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
         let dead: Vec<_> = all
             .into_iter()
-            .filter(|p| !keep.contains(p.as_str()))
+            .filter(|path| {
+                if keep.contains(path.as_str()) {
+                    return false;
+                }
+                let normalized = normalize(path);
+                roots
+                    .iter()
+                    .any(|root| normalized == *root || normalized.starts_with(&format!("{root}\\")))
+            })
             .collect();
         for p in &dead {
             tx.execute("DELETE FROM file_contents WHERE path=?1", [p])?;
@@ -536,7 +555,7 @@ impl Database {
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
-    pub fn known_files(&self) -> Result<HashMap<String, (Option<f64>, i64, String)>> {
+    pub fn known_files(&self) -> Result<HashMap<String, KnownFile>> {
         let conn = self.connect()?;
         let mut stmt = conn
             .prepare("SELECT path,mtime,COALESCE(size,0),COALESCE(fast_hash,'') FROM game_files")?;
@@ -746,15 +765,47 @@ mod tests {
             .iter()
             .any(|c| c.title_id.as_deref() == Some("0100D2C0115B6000")));
         assert!(db.known_files().unwrap().contains_key(renamed));
-        assert_eq!(db.delete_missing_files(&[renamed.into()]).unwrap(), 0);
-        assert_eq!(db.delete_missing_files(&[]).unwrap(), 0);
+        assert_eq!(db.delete_missing_files_within(&[renamed.into()], &["C:\\games".into()]).unwrap(), 0);
+        assert_eq!(db.delete_missing_files_within(&[], &[]).unwrap(), 0);
         assert_eq!(
-            db.delete_missing_files(&["C:\\games\\kept.nsp".into()])
+            db.delete_missing_files_within(&["C:\\games\\kept.nsp".into()], &["C:\\games".into()])
                 .unwrap(),
             1
         );
         assert!(db.file_contents(renamed).unwrap().is_empty());
         assert!(!db.known_files().unwrap().contains_key(renamed));
+    }
+
+    #[test]
+    fn scoped_prune_keeps_unreachable_folder_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("library.db")).unwrap();
+        db.init().unwrap();
+        db.upsert_files(&[
+            file_record(
+                "E:\\games\\a.nsp",
+                "a.nsp",
+                vec![content("0100D2C0115B6000", 0, "base")],
+            ),
+            file_record(
+                "F:\\archive\\b.nsp",
+                "b.nsp",
+                vec![content("0100D2C0115B6800", 65536, "update")],
+            ),
+        ])
+        .unwrap();
+
+        // Only E:\ was reachable this pass: its vanished files are pruned, while
+        // every F:\ record must survive because that drive was not scanned.
+        let removed = db
+            .delete_missing_files_within(&[], &["E:\\games".into()])
+            .unwrap();
+        assert_eq!(removed, 1);
+        let remaining = db.known_files().unwrap();
+        assert!(!remaining.contains_key("E:\\games\\a.nsp"));
+        assert!(remaining.contains_key("F:\\archive\\b.nsp"));
+        assert_eq!(db.delete_missing_files_within(&[], &[]).unwrap(), 0);
+        assert!(db.known_files().unwrap().contains_key("F:\\archive\\b.nsp"));
     }
 
     #[test]

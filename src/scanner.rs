@@ -56,6 +56,14 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02X}")).collect()
 }
 
+fn xml_title_id_regex() -> &'static Regex {
+    static XML_TID: OnceLock<Regex> = OnceLock::new();
+    XML_TID.get_or_init(|| {
+        Regex::new(r"(?is)<(?:TitleId|Id|ApplicationId)[^>]*>\s*(?:0[xX])?([0-9a-f]{16})\s*</")
+            .expect("XML title id regex is valid")
+    })
+}
+
 fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
     const NSP_OFFSETS: [u64; 6] = [0, 0x200, 0x400, 0x1000, 0x4000, 0x8000];
     const XCI_OFFSETS: [u64; 6] = [0x8000, 0x4000, 0, 0x200, 0x400, 0x1000];
@@ -136,7 +144,7 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
                     }
                 }
             }
-            if lower.ends_with(".cnmt") && len >= 13 && len <= 1_048_576 {
+            if lower.ends_with(".cnmt") && (13..=1_048_576).contains(&len) {
                 let mut b = [0; 13];
                 if file.seek(SeekFrom::Start(data_start + off)).is_ok()
                     && file.read_exact(&mut b).is_ok()
@@ -164,10 +172,7 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
                     && file.read_exact(&mut b).is_ok()
                 {
                     let s = String::from_utf8_lossy(&b);
-                    let re = Regex::new(
-                        r"(?is)<(?:TitleId|Id|ApplicationId)[^>]*>\s*(?:0[xX])?([0-9a-f]{16})\s*</",
-                    )
-                    .unwrap();
+                    let re = xml_title_id_regex();
                     if let Some(c) = re.captures(&s) {
                         let tid = c[1].to_ascii_uppercase();
                         content = Some(Content {
@@ -464,11 +469,17 @@ pub fn has_prod_keys() -> bool {
     prod_keys().is_some()
 }
 
+/// Encrypted CNMT metadata archives are tiny (a few KB), so this must stay well
+/// below 1 MiB or title ids silently disappear from the library.
+fn is_cnmt_candidate_size(size: u64) -> bool {
+    (1024..=64 * 1024 * 1024).contains(&size)
+}
+
 fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
     let mut entries = pfs_ncas(path)?;
     entries.retain(|entry| {
         !entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
-            && (1024 * 1024..=64 * 1024 * 1024).contains(&entry.size)
+            && (64 * 1024..=512 * 1024 * 1024).contains(&entry.size)
     });
     let mut source = File::open(path).ok()?;
     let work = tempfile::tempdir().ok()?;
@@ -521,9 +532,11 @@ fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
     let Some(mut entries) = pfs_ncas(path) else {
         return Vec::new();
     };
+    // CNMT NCAs are tiny (a few KB to a few hundred KB), so requiring 1 MiB
+    // silently skipped every metadata archive in the library.
     entries.retain(|entry| {
         entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
-            && (1024 * 1024..=64 * 1024 * 1024).contains(&entry.size)
+            && is_cnmt_candidate_size(entry.size)
     });
     let Ok(mut source) = File::open(path) else {
         return Vec::new();
@@ -835,14 +848,14 @@ fn finish_scan(
         .captures(filename)
         .and_then(|m| m[1].parse().ok())
         .unwrap_or(0);
+    let is_xci = path
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.eq_ignore_ascii_case("xci") || v.eq_ignore_ascii_case("xcz"))
+        .unwrap_or(false);
     if contents.is_empty() {
         let title_id = tid_re.captures(filename).map(|m| m[1].to_ascii_uppercase());
         let kind = title_id.as_deref().map(content_type).unwrap_or("unknown");
-        let is_xci = path
-            .extension()
-            .and_then(|v| v.to_str())
-            .map(|v| v.eq_ignore_ascii_case("xci") || v.eq_ignore_ascii_case("xcz"))
-            .unwrap_or(false);
         contents.push(Content {
             source: if title_id.is_some() {
                 "filename"
@@ -854,6 +867,25 @@ fn finish_scan(
             version,
             content_type: if is_xci { "base" } else { kind }.into(),
         });
+    }
+    // Multi-game XCI/XCZ bundles can expose update/DLC entries only. The library
+    // filters on base records, so derive the base title id like the Python build.
+    if is_xci && !contents.iter().any(|c| c.content_type == "base") {
+        if let Some(first) = contents
+            .iter()
+            .filter_map(|c| c.title_id.as_deref())
+            .find(|tid| tid.starts_with("01") && tid.len() >= 13)
+        {
+            let derived = format!("{}000", &first[..13]);
+            if !contents.iter().any(|c| c.title_id.as_deref() == Some(derived.as_str())) {
+                contents.push(Content {
+                    title_id: Some(derived),
+                    version: 0,
+                    content_type: "base".into(),
+                    source: "derived_base".into(),
+                });
+            }
+        }
     }
     Ok(ScanResult {
         fast_hash: hash,
@@ -913,6 +945,21 @@ mod tests {
     }
 
     #[test]
+    fn cnmt_candidates_include_small_encrypted_metadata_archives() {
+        // Real CNMT NCAs are small: a 3.5 KB and a 36 KB archive were both
+        // skipped by an earlier 1 MiB lower bound, which silently dropped the
+        // title id for most of the library. Guard the accepted size window.
+        for size in [1_024u64, 3_584, 36_864, 629_248] {
+            assert!(
+                is_cnmt_candidate_size(size),
+                "CNMT archive of {size} bytes must be considered"
+            );
+        }
+        assert!(!is_cnmt_candidate_size(512), "tiny files are not NCAs");
+        assert!(!is_cnmt_candidate_size(65 * 1024 * 1024));
+    }
+
+    #[test]
     fn parses_cnmt_metadata_from_pfs0() {
         let mut cnmt = Vec::new();
         cnmt.extend_from_slice(&0x0100_D2C0_115B_6800u64.to_le_bytes());
@@ -946,6 +993,63 @@ mod tests {
             container_nacp(&mut file, &path),
             ("한국어".into(), "English title".into(), "日本語".into())
         );
+    }
+
+    #[test]
+    fn derives_base_record_for_multi_game_xci_bundles() {
+        let path = Path::new("Bundle [0100D2C0115B6800][v65536].xci");
+        let result = finish_scan(
+            path,
+            "Bundle [0100D2C0115B6800][v65536].xci",
+            "hash".into(),
+            vec![
+                Content {
+                    title_id: Some("0100D2C0115B6800".into()),
+                    version: 65536,
+                    content_type: "update".into(),
+                    source: "header_cnmt".into(),
+                },
+                Content {
+                    title_id: Some("0100D2C0115B7001".into()),
+                    version: 0,
+                    content_type: "dlc".into(),
+                    source: "header_cnmt".into(),
+                },
+            ],
+            Default::default(),
+        )
+        .unwrap();
+
+        let derived = result
+            .contents
+            .iter()
+            .find(|c| c.source == "derived_base")
+            .expect("bundle without base entry must derive one");
+        assert_eq!(derived.title_id.as_deref(), Some("0100D2C0115B6000"));
+        assert_eq!(derived.content_type, "base");
+    }
+
+    #[test]
+    fn keeps_existing_base_record_in_xci_bundles() {
+        let path = Path::new("Bundle.xci");
+        let result = finish_scan(
+            path,
+            "Bundle.xci",
+            "hash".into(),
+            vec![Content {
+                title_id: Some("0100D2C0115B6000".into()),
+                version: 0,
+                content_type: "base".into(),
+                source: "header_cnmt".into(),
+            }],
+            Default::default(),
+        )
+        .unwrap();
+
+        assert!(!result
+            .contents
+            .iter()
+            .any(|c| c.source == "derived_base"));
     }
 
     #[test]

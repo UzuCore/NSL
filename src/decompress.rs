@@ -15,6 +15,32 @@ fn nsz_tool() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Removes leftover conversion workspaces. The Python build cleared its fixed
+/// workspace on every launch; the port creates stamped folders, so prune old
+/// ones here to avoid unbounded disk growth.
+pub fn cleanup_workspaces(work_root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(work_root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("NSL_Workspace_") {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            if std::fs::remove_dir_all(&path).is_ok() {
+                removed += 1;
+            }
+        } else if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 pub fn decompress(src: &Path, work_root: &Path) -> Result<PathBuf> {
     let tool = nsz_tool().context("NSZ 압축 해제 도구(nsz)를 PATH에서 찾지 못했습니다")?;
     let kind = src
@@ -27,6 +53,8 @@ pub fn decompress(src: &Path, work_root: &Path) -> Result<PathBuf> {
         "NSZ 또는 XCZ 파일만 변환할 수 있습니다"
     );
     anyhow::ensure!(src.is_file(), "원본 파일을 찾을 수 없습니다");
+    std::fs::create_dir_all(work_root)?;
+    cleanup_workspaces(work_root);
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let workspace = work_root.join(format!("NSL_Workspace_{stamp}"));
     std::fs::create_dir_all(&workspace)?;

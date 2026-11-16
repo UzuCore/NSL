@@ -8,7 +8,7 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 eframe = "0.29"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "ico"] }
 md5 = "0.7"
 rayon = "1"
 regex = "1"

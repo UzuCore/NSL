@@ -1,0 +1,33 @@
+# Build output
+/target/
+/dist/
+/dist-rust/
+/build/
+/bin/
+/*.exe
+/*.log
+
+# Local data / caches (never commit)
+/library.db
+/library.db-shm
+/library.db-wal
+/config.json
+/caches/
+/icons/
+/screenshots/
+/titledb/*.json
+/prod.keys
+/title.keys
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.spec.bak
+
+# Screenshots captured during manual QA
+/python-*.png
+/rust-*.png
+
+# OS cruft
+Thumbs.db
+desktop.ini

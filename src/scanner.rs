@@ -20,6 +20,7 @@ pub struct ScanResult {
     pub nacp_ko: String,
     pub nacp_en: String,
     pub nacp_ja: String,
+    pub nacp_version: String,
 }
 #[derive(Clone, Debug)]
 pub struct Content {
@@ -197,7 +198,61 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
     Vec::new()
 }
 
-fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
+/// NACP layout: 16 language entries of 0x300 bytes starting at 0, then the
+/// application metadata. The human-readable version strings live at 0x3060
+/// (display version, e.g. "1.10") and 0x3070 (none).
+const NACP_ENTRY_SIZE: usize = 0x300;
+const NACP_LANGUAGES: usize = 15;
+/// Enough bytes to cover the localized names plus the trailing metadata that
+/// holds the display version at 0x3060. Reading only the name table (0x2D00)
+/// silently loses the version.
+const NACP_REQUIRED_LEN: usize = 0x3080;
+const NACP_DISPLAY_VERSION_OFFSET: usize = 0x3060;
+const NACP_DISPLAY_VERSION_LEN: usize = 0x10;
+
+fn nacp_name_at(bytes: &[u8], index: usize) -> String {
+    let start = index * NACP_ENTRY_SIZE;
+    let end = (start + 0x200).min(bytes.len());
+    if start >= end {
+        return String::new();
+    }
+    let field = &bytes[start..end];
+    let end = field.iter().position(|v| *v == 0).unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..end])
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
+}
+
+/// Reads the display version stored in a raw `control.nacp`.
+///
+/// This is the string the console shows for an application ("1.10", "1.0.3"),
+/// and it is the only place a real version number exists. The Nintendo update
+/// integer (`N << 16`) cannot be turned into one - deriving "1.0.1" from 65536
+/// produces a version that the game never had.
+fn nacp_display_version(bytes: &[u8]) -> Option<String> {
+    let start = NACP_DISPLAY_VERSION_OFFSET;
+    let end = (start + NACP_DISPLAY_VERSION_LEN).min(bytes.len());
+    if start >= end {
+        return None;
+    }
+    let field = &bytes[start..end];
+    let end = field.iter().position(|v| *v == 0).unwrap_or(field.len());
+    let value: String = String::from_utf8_lossy(&field[..end])
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_owned();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn container_nacp(file: &mut File, path: &Path) -> (String, String, String, String) {
     let size = match file.metadata() {
         Ok(m) => m.len(),
         Err(_) => return Default::default(),
@@ -245,7 +300,7 @@ fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
             let off = u64::from_le_bytes(table[p..p + 8].try_into().unwrap());
             let len = u64::from_le_bytes(table[p + 8..p + 16].try_into().unwrap());
             let no = u32::from_le_bytes(table[p + 16..p + 20].try_into().unwrap()) as usize;
-            if no >= sl || len < (0x300 * 15) as u64 || len > 0x10000 || data + off + len > size {
+            if no >= sl || len < NACP_REQUIRED_LEN as u64 || len > 0x10000 || data + off + len > size {
                 continue;
             }
             let end = strings[no..]
@@ -259,29 +314,21 @@ fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
             {
                 continue;
             }
-            let mut bytes = vec![0; 0x300 * 15];
+            let mut bytes = vec![0; NACP_REQUIRED_LEN];
             if file.seek(SeekFrom::Start(data + off)).is_err()
                 || file.read_exact(&mut bytes).is_err()
             {
                 continue;
             }
-            let name = |index: usize| -> String {
-                let s = &bytes[index * 0x300..index * 0x300 + 0x200];
-                let end = s.iter().position(|v| *v == 0).unwrap_or(s.len());
-                String::from_utf8_lossy(&s[..end])
-                    .trim()
-                    .chars()
-                    .filter(|c| !c.is_control())
-                    .collect()
-            };
-            let en = if !name(0).is_empty() {
-                name(0)
+            let en = if !nacp_name_at(&bytes, 0).is_empty() {
+                nacp_name_at(&bytes, 0)
             } else {
-                name(1)
+                nacp_name_at(&bytes, 1)
             };
-            let ja = name(2);
-            let ko = name(12);
-            return (ko, en, ja);
+            let ja = nacp_name_at(&bytes, 2);
+            let ko = nacp_name_at(&bytes, 12);
+            let version = nacp_display_version(&bytes).unwrap_or_default();
+            return (ko, en, ja, version);
         }
     }
     Default::default()
@@ -374,26 +421,27 @@ pub(crate) fn extract_nca_section0(nca: &Path, output_dir: &Path) -> bool {
 
 fn nacp_file_names(path: &Path) -> Option<(String, String, String)> {
     let data = std::fs::read(path).ok()?;
-    if data.len() < 0x300 * 15 {
+    if data.len() < NACP_ENTRY_SIZE * NACP_LANGUAGES {
         return None;
     }
-    let name = |index: usize| {
-        let field = &data[index * 0x300..index * 0x300 + 0x200];
-        let end = field.iter().position(|b| *b == 0).unwrap_or(field.len());
-        String::from_utf8_lossy(&field[..end])
-            .trim()
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect::<String>()
+    let en = if nacp_name_at(&data, 0).is_empty() {
+        nacp_name_at(&data, 1)
+    } else {
+        nacp_name_at(&data, 0)
     };
-    let en = if name(0).is_empty() { name(1) } else { name(0) };
-    let ja = name(2);
-    let ko = name(12);
+    let ja = nacp_name_at(&data, 2);
+    let ko = nacp_name_at(&data, 12);
     if ko.is_empty() && en.is_empty() && ja.is_empty() {
         None
     } else {
         Some((ko, en, ja))
     }
+}
+
+/// `control.nacp` extracted from an encrypted package, reduced to its display version.
+fn nacp_file_version(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    nacp_display_version(&data)
 }
 
 #[derive(Clone)]
@@ -654,6 +702,44 @@ fn hactool_nacp_names(path: &Path) -> Option<(String, String, String)> {
     }
 }
 
+/// Display version from a package whose NACP needs an external decryptor.
+///
+/// Only asked for when the direct container read produced no version, so the
+/// common unencrypted case never pays for the extra tool invocation.
+fn hactool_nacp_version(path: &Path) -> Option<String> {
+    let mut entries = pfs_ncas(path)?;
+    entries.retain(|entry| {
+        !entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
+            && (64 * 1024..=512 * 1024 * 1024).contains(&entry.size)
+    });
+    let mut source = File::open(path).ok()?;
+    let work = tempfile::tempdir().ok()?;
+    for (index, entry) in entries.iter().take(12).enumerate() {
+        let nca = work.path().join(format!("version_{index}.nca"));
+        if source.seek(SeekFrom::Start(entry.offset)).is_err() {
+            continue;
+        }
+        let mut limited = source.by_ref().take(entry.size);
+        let Ok(mut output) = File::create(&nca) else {
+            continue;
+        };
+        if std::io::copy(&mut limited, &mut output).is_err() {
+            continue;
+        }
+        let section = work.path().join(format!("version_section_{index}"));
+        if std::fs::create_dir_all(&section).is_err() {
+            continue;
+        }
+        let args = vec![format!("--section0dir={}", section.display())];
+        if matches!(run_hactool(&args, &nca), Some((true, _))) {
+            if let Some(version) = nacp_file_version(&section.join("control.nacp")) {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn run_nstool(path: &Path, extra: &[String]) -> Option<String> {
     let (Some(engine), Some(keys)) = (nstool_path(), prod_keys()) else {
         return None;
@@ -774,7 +860,7 @@ pub fn fast_hash(path: &Path) -> Result<String> {
 pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<ScanResult> {
     let mut file = File::open(path)?;
     let mut contents = container_contents(&mut file, path);
-    let (nacp_ko, nacp_en, nacp_ja) = container_nacp(&mut file, path);
+    let (nacp_ko, nacp_en, nacp_ja, nacp_version) = container_nacp(&mut file, path);
     if path
         .extension()
         .and_then(|v| v.to_str())
@@ -787,13 +873,13 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
         }
         // Use XCI control metadata when the package-level PFS did not expose NACP directly.
         let mut names = if !names.0.is_empty() || !names.1.is_empty() || !names.2.is_empty() {
-            names
+            (names.0, names.1, names.2, nacp_version)
         } else {
-            (nacp_ko, nacp_en, nacp_ja)
+            (nacp_ko, nacp_en, nacp_ja, nacp_version)
         };
         if names.0.is_empty() && names.1.is_empty() && names.2.is_empty() {
             if let Some(found) = hactool_nacp_names(path) {
-                names = found;
+                names = (found.0, found.1, found.2, names.3);
             }
         }
         return finish_scan(path, filename, hash, contents, names);
@@ -823,10 +909,17 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
             contents = deep;
         }
     }
-    let mut names = (nacp_ko, nacp_en, nacp_ja);
+    let mut names = (nacp_ko, nacp_en, nacp_ja, nacp_version);
     if names.0.is_empty() && names.1.is_empty() && names.2.is_empty() {
         if let Some(found) = hactool_nacp_names(path) {
-            names = found;
+            names = (found.0, found.1, found.2, names.3);
+        }
+    }
+    // Encrypted packages (NSZ/XCZ) hide the NACP behind an NCA, so the direct
+    // container read above finds no version and the external tool has to supply it.
+    if names.3.is_empty() {
+        if let Some(version) = hactool_nacp_version(path) {
+            names.3 = version;
         }
     }
     finish_scan(path, filename, hash, contents, names)
@@ -837,7 +930,7 @@ fn finish_scan(
     filename: &str,
     hash: String,
     contents: Vec<Content>,
-    names: (String, String, String),
+    names: (String, String, String, String),
 ) -> Result<ScanResult> {
     static TID: OnceLock<Regex> = OnceLock::new();
     static VERSION: OnceLock<Regex> = OnceLock::new();
@@ -893,6 +986,7 @@ fn finish_scan(
         nacp_ko: names.0,
         nacp_en: names.1,
         nacp_ja: names.2,
+        nacp_version: names.3,
     })
 }
 
@@ -980,19 +1074,40 @@ mod tests {
 
     #[test]
     fn reads_localized_names_from_control_nacp() {
-        let mut nacp = vec![0; 0x300 * 15];
+        let mut nacp = vec![0; NACP_REQUIRED_LEN];
         for (index, name) in [(0usize, "English title"), (2, "日本語"), (12, "한국어")] {
             let offset = index * 0x300;
             nacp[offset..offset + name.len()].copy_from_slice(name.as_bytes());
         }
+        // Real display version, as found in a shipped NACP at 0x3060.
+        let version = b"1.10";
+        nacp[0x3060..0x3060 + version.len()].copy_from_slice(version);
         let bytes = pfs0(&[("control.nacp", nacp)]);
         let (_dir, path) = write_temp_file(&bytes, "sample.nsp");
         let mut file = File::open(&path).unwrap();
 
         assert_eq!(
             container_nacp(&mut file, &path),
-            ("한국어".into(), "English title".into(), "日本語".into())
+            (
+                "한국어".into(),
+                "English title".into(),
+                "日本語".into(),
+                "1.10".into()
+            )
         );
+    }
+
+    #[test]
+    fn nacp_display_version_reads_the_real_string() {
+        let mut nacp = vec![0u8; NACP_REQUIRED_LEN];
+        nacp[0x3060..0x3064].copy_from_slice(b"1.10");
+        assert_eq!(nacp_display_version(&nacp).as_deref(), Some("1.10"));
+
+        let blank = vec![0u8; NACP_REQUIRED_LEN];
+        assert_eq!(nacp_display_version(&blank), None);
+
+        // A truncated NACP must not read past the buffer or panic.
+        assert_eq!(nacp_display_version(&[0u8; 8]), None);
     }
 
     #[test]

@@ -855,6 +855,7 @@ impl NslApp {
                                                     nacp_ko: scanned.nacp_ko,
                                                     nacp_en: scanned.nacp_en,
                                                     nacp_ja: scanned.nacp_ja,
+                                                    nacp_version: scanned.nacp_version,
                                                     contents: scanned.contents,
                                                 }),
                                                 false,
@@ -877,6 +878,7 @@ impl NslApp {
                                                 nacp_ko: scanned.nacp_ko,
                                                 nacp_en: scanned.nacp_en,
                                                 nacp_ja: scanned.nacp_ja,
+                                                nacp_version: scanned.nacp_version,
                                                 contents: scanned.contents,
                                             }),
                                             false,
@@ -2489,7 +2491,13 @@ impl NslApp {
                         } else {
                             row.version
                         };
-                        ui.label(format!("보유: {}", common::version_to_str(Some(installed))));
+                        ui.label(format!(
+                            "보유: {}",
+                            common::display_version(
+                                Some(row.nacp_version.as_str()),
+                                Some(installed)
+                            )
+                        ));
                         ui.colored_label(
                             if row.latest_version > installed {
                                 egui::Color32::from_rgb(224, 108, 117)
@@ -2573,7 +2581,10 @@ impl NslApp {
                             ("타이틀 ID".to_owned(), row.title_id.clone()),
                             (
                                 "보유 버전".to_owned(),
-                                common::version_to_str(Some(installed)),
+                                common::display_version(
+                                    Some(row.nacp_version.as_str()),
+                                    Some(installed),
+                                ),
                             ),
                             (
                                 "최신 버전".to_owned(),
@@ -3634,7 +3645,7 @@ impl NslApp {
                         });
                 } else {
                     let list_width = ui.available_width();
-                    let name_width = (list_width - 480.0).max(240.0);
+                    let name_width = (list_width - 552.0).max(240.0);
                     egui::ScrollArea::both().show(ui, |ui| {
                         ui.set_min_width(list_width);
                         egui::Grid::new("library")
@@ -3644,8 +3655,8 @@ impl NslApp {
                                 for (label, key, width) in [
                                     ("게임 이름", "name", name_width),
                                     ("타이틀 ID", "id", 120.0),
-                                    ("보유 버전", "version", 80.0),
-                                    ("최신 버전", "latest_ver", 80.0),
+                                    ("보유 버전", "version", 116.0),
+                                    ("최신 버전", "latest_ver", 116.0),
                                     ("크기", "size", 60.0),
                                     ("상태", "status", 140.0),
                                 ] {
@@ -3744,11 +3755,13 @@ impl NslApp {
                                     } else {
                                         row.version
                                     };
-                                    let installed_text =
-                                        common::version_to_str(Some(installed_version));
+                                    let installed_text = common::display_version(
+                                        Some(row.nacp_version.as_str()),
+                                        Some(installed_version),
+                                    );
                                     let response = selectable_table_text_cell(
                                         ui,
-                                        80.0,
+                                        116.0,
                                         24.0,
                                         &installed_text,
                                         selected,
@@ -3769,7 +3782,7 @@ impl NslApp {
                                     );
                                     let response = selectable_table_text_cell(
                                         ui,
-                                        80.0,
+                                        116.0,
                                         24.0,
                                         &latest_text,
                                         selected,
@@ -5198,6 +5211,7 @@ mod runtime_tests {
                 nacp_ko: String::new(),
                 nacp_en: String::new(),
                 nacp_ja: String::new(),
+                nacp_version: String::new(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B6000".into()),
                     version: 0,
@@ -5258,6 +5272,7 @@ mod runtime_tests {
                 nacp_ko: "알파".into(),
                 nacp_en: "Alpha".into(),
                 nacp_ja: String::new(),
+                nacp_version: "1.2.0".into(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B6000".into()),
                     version: 0,
@@ -5276,6 +5291,7 @@ mod runtime_tests {
                 nacp_ko: "베타 DLC".into(),
                 nacp_en: String::new(),
                 nacp_ja: String::new(),
+                nacp_version: String::new(),
                 contents: vec![scanner::Content {
                     title_id: Some("0100D2C0115B7001".into()),
                     version: 0,
@@ -5319,6 +5335,25 @@ mod runtime_tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         panic!("library rows did not load");
+    }
+
+    #[test]
+    fn installed_versions_round_trip_through_the_database() {
+        let (app, _dir) = seeded_app();
+        let rows = app.db.files("ko_en_db").unwrap();
+        let alpha = rows
+            .iter()
+            .find(|row| row.title_name == "알파")
+            .expect("alpha row");
+        assert_eq!(alpha.nacp_version, "1.2.0");
+        // Cached-record reuse must preserve the version column too, otherwise a
+        // fast scan would blank every version it did not re-read.
+        let cached = app.db.cached_file_records().unwrap();
+        let record = cached
+            .values()
+            .find(|record| record.filename.contains("Alpha"))
+            .expect("cached alpha");
+        assert_eq!(record.nacp_version, "1.2.0");
     }
 
     #[test]

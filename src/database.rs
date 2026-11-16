@@ -18,6 +18,8 @@ pub struct FileRecord {
     pub nacp_ko: String,
     pub nacp_en: String,
     pub nacp_ja: String,
+    /// Human-readable version from the package NACP ("1.10"), "" when unknown.
+    pub nacp_version: String,
     pub contents: Vec<crate::scanner::Content>,
 }
 
@@ -46,6 +48,9 @@ pub struct GameFile {
     pub nacp_ko: String,
     pub nacp_en: String,
     pub nacp_ja: String,
+    /// Real version string from the installed package, "" when the scan could
+    /// not read it. Prefer this over the update ordinal for display.
+    pub nacp_version: String,
     pub owned_dlcs: Vec<(String, String)>,
     pub missing_dlcs: Vec<(String, String)>,
 }
@@ -157,7 +162,8 @@ impl Database {
             id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL,
             filename TEXT NOT NULL, size INTEGER DEFAULT 0, mtime REAL, fast_hash TEXT,
             file_type TEXT, last_seen TEXT, scan_folder TEXT,
-            nacp_ko TEXT DEFAULT '', nacp_en TEXT DEFAULT '', nacp_ja TEXT DEFAULT '');
+            nacp_ko TEXT DEFAULT '', nacp_en TEXT DEFAULT '', nacp_ja TEXT DEFAULT '',
+            nacp_version TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS file_contents (
             id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, title_id TEXT,
             version INTEGER DEFAULT 0, content_type TEXT DEFAULT 'unknown',
@@ -171,7 +177,7 @@ impl Database {
         CREATE INDEX IF NOT EXISTS idx_titledb_base ON title_db(UPPER(SUBSTR(title_id,1,13))||'000');")?;
         // Existing 1.4.x databases may predate localized NACP columns.
         if let Ok(conn) = self.connect() {
-            for col in ["nacp_ko", "nacp_en", "nacp_ja"] {
+            for col in ["nacp_ko", "nacp_en", "nacp_ja", "nacp_version"] {
                 let _ = conn.execute_batch(&format!(
                     "ALTER TABLE game_files ADD COLUMN {col} TEXT DEFAULT ''"
                 ));
@@ -204,7 +210,7 @@ impl Database {
     }
     pub fn files(&self, name_mode: &str) -> Result<Vec<GameFile>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
+        let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),COALESCE(gf.nacp_version,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
         let raw = stmt
             .query_map([], |r| {
                 Ok((
@@ -216,17 +222,18 @@ impl Database {
                     r.get::<_, String>(5)?,
                     r.get::<_, String>(6)?,
                     r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                     Content {
-                        title_id: r.get(8)?,
-                        version: r.get(9)?,
-                        kind: r.get(10)?,
+                        title_id: r.get(9)?,
+                        version: r.get(10)?,
+                        kind: r.get(11)?,
                     },
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut by_path: HashMap<String, Vec<Content>> = HashMap::new();
         let mut file_data = HashMap::new();
-        for (id, path, filename, size, file_type, ko, en, ja, c) in raw {
+        for (id, path, filename, size, file_type, ko, en, ja, nacp_version, c) in raw {
             file_data.entry(path.clone()).or_insert((
                 id,
                 path.clone(),
@@ -236,6 +243,7 @@ impl Database {
                 ko,
                 en,
                 ja,
+                nacp_version,
             ));
             if c.title_id.is_some() || c.kind != "unknown" {
                 by_path.entry(path).or_default().push(c);
@@ -296,7 +304,7 @@ impl Database {
             }
         }
         let mut result = Vec::new();
-        for (path, (id, _, filename, size, file_type, ko, en, ja)) in file_data {
+        for (path, (id, _, filename, size, file_type, ko, en, ja, nacp_version)) in file_data {
             let cs = by_path.get(&path).cloned().unwrap_or_default();
             let best = cs
                 .iter()
@@ -413,6 +421,7 @@ impl Database {
                 nacp_ko: ko,
                 nacp_en: en,
                 nacp_ja: ja,
+                nacp_version,
                 owned_dlcs,
                 missing_dlcs,
             });
@@ -424,12 +433,12 @@ impl Database {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         for f in files {
-            tx.execute("INSERT INTO game_files(path,filename,size,mtime,fast_hash,file_type,last_seen,scan_folder,nacp_ko,nacp_en,nacp_ja)
-                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(path) DO UPDATE SET
+            tx.execute("INSERT INTO game_files(path,filename,size,mtime,fast_hash,file_type,last_seen,scan_folder,nacp_ko,nacp_en,nacp_ja,nacp_version)
+                VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) ON CONFLICT(path) DO UPDATE SET
                 filename=excluded.filename,size=excluded.size,mtime=excluded.mtime,
                 fast_hash=excluded.fast_hash,file_type=excluded.file_type,last_seen=excluded.last_seen,scan_folder=excluded.scan_folder,
-                nacp_ko=excluded.nacp_ko,nacp_en=excluded.nacp_en,nacp_ja=excluded.nacp_ja",
-                params![f.path,f.filename,f.size,f.mtime,f.fast_hash,f.file_type,chrono::Utc::now().to_rfc3339(),f.scan_folder,f.nacp_ko,f.nacp_en,f.nacp_ja])?;
+                nacp_ko=excluded.nacp_ko,nacp_en=excluded.nacp_en,nacp_ja=excluded.nacp_ja,nacp_version=excluded.nacp_version",
+                params![f.path,f.filename,f.size,f.mtime,f.fast_hash,f.file_type,chrono::Utc::now().to_rfc3339(),f.scan_folder,f.nacp_ko,f.nacp_en,f.nacp_ja,f.nacp_version])?;
             tx.execute("DELETE FROM file_contents WHERE path=?1", [&f.path])?;
             let contents = if f.contents.is_empty() {
                 vec![crate::scanner::Content {
@@ -569,7 +578,7 @@ impl Database {
     }
     pub fn cached_file_records(&self) -> Result<HashMap<String, FileRecord>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT path,filename,COALESCE(size,0),mtime,COALESCE(file_type,''),COALESCE(scan_folder,''),COALESCE(fast_hash,''),COALESCE(nacp_ko,''),COALESCE(nacp_en,''),COALESCE(nacp_ja,'') FROM game_files")?;
+        let mut stmt = conn.prepare("SELECT path,filename,COALESCE(size,0),mtime,COALESCE(file_type,''),COALESCE(scan_folder,''),COALESCE(fast_hash,''),COALESCE(nacp_ko,''),COALESCE(nacp_en,''),COALESCE(nacp_ja,''),COALESCE(nacp_version,'') FROM game_files")?;
         let mut records = HashMap::new();
         for row in stmt.query_map([], |r| {
             let path: String = r.get(0)?;
@@ -586,6 +595,7 @@ impl Database {
                     nacp_ko: r.get(7)?,
                     nacp_en: r.get(8)?,
                     nacp_ja: r.get(9)?,
+                    nacp_version: r.get(10)?,
                     contents: Vec::new(),
                 },
             ))
@@ -672,6 +682,7 @@ mod tests {
             nacp_ko: "한국어 제목".into(),
             nacp_en: "English title".into(),
             nacp_ja: "日本語タイトル".into(),
+            nacp_version: "1.0.3".into(),
             contents,
         }
     }

@@ -598,6 +598,13 @@ impl NslApp {
             resource_refresh_at: None,
         };
         app.start_reload();
+        // A packaged build ships the title database files, so match them on first
+        // launch instead of showing "DB: 0" until the user clicks DB 매칭.
+        if app.stats.title_db_count == 0
+            && app.base_dir.join("titledb").join("titles.json").is_file()
+        {
+            app.start_local_titledb_import();
+        }
         Ok(app)
     }
     fn start_reload(&mut self) {
@@ -4983,8 +4990,86 @@ fn local_titledb_status(directory: &std::path::Path) -> String {
     lines.join("\n")
 }
 
-fn load_window_icon() -> Option<egui::IconData> {
-    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
+/// Runs a scan to completion without a window and prints a summary. Returns the
+/// process exit code: 0 on success, 1 when the scan could not start or failed.
+fn run_headless_scan(mut app: NslApp, incremental: bool) -> i32 {
+    if app.folders.is_empty() {
+        eprintln!("error: no scan folders configured");
+        return 1;
+    }
+    if !scanner::has_prod_keys() {
+        eprintln!("error: prod.keys not found next to the executable or in %USERPROFILE%\\.switch");
+        return 1;
+    }
+    // A CLI scan must not kick off icon/screenshot prefetching afterwards; the
+    // scan-completion handler re-reads these settings.
+    app.config.settings.insert(
+        "scan_icon".into(),
+        serde_json::Value::String("0".into()),
+    );
+    app.config.settings.insert(
+        "scan_screenshot".into(),
+        serde_json::Value::String("0".into()),
+    );
+    app.start_scan(incremental);
+    app.pending_icon_prefetch = false;
+    app.pending_screenshot_prefetch = false;
+    let ctx = egui::Context::default();
+    let started = std::time::Instant::now();
+    loop {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1456.0, 900.0),
+            )),
+            ..Default::default()
+        });
+        app.ui_frame(&ctx);
+        let _ = ctx.end_pass();
+        if app.scan_result.is_none()
+            && app.reload_result.is_none()
+            && app.scan_progress.is_none()
+        {
+            break;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(6 * 60 * 60) {
+            eprintln!("error: scan timed out");
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let failures = app
+        .log_lines
+        .iter()
+        .filter(|line| line.contains("분석 실패") || line.contains("스캔 오류"))
+        .count();
+    let stats = match app.db.stats() {
+        Ok(stats) => stats,
+        Err(error) => {
+            eprintln!("error: could not read database stats: {error}");
+            return 1;
+        }
+    };
+    println!(
+        "scan=done mode={} files={} base={} update={} dlc={} title_db={} failures={} elapsed={:.1}s status={}",
+        if incremental { "fast" } else { "full" },
+        stats.file_count,
+        stats.base_count,
+        stats.update_count,
+        stats.dlc_count,
+        stats.title_db_count,
+        failures,
+        started.elapsed().as_secs_f64(),
+        app.status
+    );
+    if failures > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn load_window_icon() -> Option<egui::IconData> {    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
     let image = image::load_from_memory_with_format(ICON_BYTES, image::ImageFormat::Ico).ok()?;
     let rgba = image.to_rgba8();
     if rgba.width() == 0 || rgba.height() == 0 {
@@ -5000,6 +5085,17 @@ fn load_window_icon() -> Option<egui::IconData> {
 fn main() -> Result<()> {
     let app = NslApp::new()?;
     let _ = decompress::cleanup_workspaces(&common::base_dir().join("workspaces"));
+
+    // Headless scan mode: lets release builds be verified (and scheduled scans be
+    // automated) without opening a window.
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if let Some(position) = args.iter().position(|arg| arg == "--scan") {
+        let mode = args.get(position + 1).map(String::as_str).unwrap_or("fast");
+        let incremental = !matches!(mode, "full" | "all");
+        let exit = run_headless_scan(app, incremental);
+        std::process::exit(exit);
+    }
+
     let start_maximized = app
         .config
         .settings
@@ -5262,6 +5358,49 @@ mod runtime_tests {
     }
 
     #[test]
+    fn first_launch_matches_bundled_title_db_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        std::fs::create_dir_all(base.join("titledb")).unwrap();
+        std::fs::write(
+            base.join("titledb").join("titles.json"),
+            r#"{"titledb":{"0100D2C0115B6000":{"name":"Bundled Title"}}}"#,
+        )
+        .unwrap();
+
+        let mut app = NslApp::with_base_dir(base.clone()).unwrap();
+        assert!(
+            app.titledb_result.is_some(),
+            "bundled title database must be imported on first launch"
+        );
+        let ctx = egui::Context::default();
+        for _ in 0..600 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+            if app.titledb_result.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.titledb_result.is_none(), "title database import stalled");
+        assert_eq!(app.db.stats().unwrap().title_db_count, 1);
+
+        // A second construction must not re-import an already populated table.
+        let restarted = NslApp::with_base_dir(base).unwrap();
+        assert!(
+            restarted.titledb_result.is_none(),
+            "populated title table must not be re-imported on every launch"
+        );
+    }
+
+    #[test]
     fn headless_app_filters_search_and_folder_tabs() {
         let (mut app, _dir) = seeded_app();
         let ctx = run_app_ticks(&mut app, 2);
@@ -5378,5 +5517,68 @@ mod runtime_tests {
         assert!(cached
             .values()
             .all(|record| !record.contents.is_empty()));
+    }
+
+    /// Incremental pass must reuse the cache written by the full pass, keep the
+    /// same totals, and stay much faster than a cold scan.
+    #[test]
+    #[ignore = "requires the local game corpus and prod.keys"]
+    fn incremental_scan_reuses_cache_after_full_scan() {
+        let (mut app, dir) = seeded_app();
+        let base = dir.path().to_path_buf();
+        app.folders = vec!["E:\\NSW".into()];
+        app.config.scan_folders = app.folders.clone();
+        database::save_config(&base.join("config.json"), &app.config).unwrap();
+        app.db.clear_library_data().unwrap();
+        let ctx = egui::Context::default();
+
+        let full_start = std::time::Instant::now();
+        app.start_scan(false);
+        assert!(run_until_idle(&mut app, &ctx), "full scan timed out");
+        let full_elapsed = full_start.elapsed();
+        let full_stats = app.db.stats().unwrap();
+
+        let incremental_start = std::time::Instant::now();
+        app.start_scan(true);
+        assert!(run_until_idle(&mut app, &ctx), "incremental scan timed out");
+        let incremental_elapsed = incremental_start.elapsed();
+        let incremental_stats = app.db.stats().unwrap();
+
+        assert_eq!(full_stats.base_count, 800);
+        assert_eq!(incremental_stats.base_count, 800);
+        assert_eq!(incremental_stats.update_count, 710);
+        assert_eq!(incremental_stats.dlc_count, 3137);
+        assert_eq!(
+            incremental_stats.file_count, full_stats.file_count,
+            "incremental pass must not drop records"
+        );
+        assert!(
+            incremental_elapsed < full_elapsed,
+            "incremental scan ({incremental_elapsed:?}) should be faster than the cold scan ({full_elapsed:?})"
+        );
+        eprintln!(
+            "full={full_elapsed:?} incremental={incremental_elapsed:?} files={}",
+            incremental_stats.file_count
+        );
+    }
+
+    fn run_until_idle(app: &mut NslApp, ctx: &egui::Context) -> bool {
+        for _ in 0..120_000 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(ctx);
+            let _ = ctx.end_pass();
+            if app.scan_result.is_none() && app.reload_result.is_none() && app.scan_progress.is_none()
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
     }
 }

@@ -283,5 +283,7 @@ mod tests {
         assert!(is_newer("1.4.9-beta", "1.4.8"));
         assert!(!is_newer("1.4.8+build.7", "v1.4.8"));
         assert!(!is_newer("1.4.8", "1.4.8.0"));
+        assert!(is_newer("2.0.1", "2.0.0"));
+        assert!(!is_newer("2.0.1", "2.0.1"));
     }
 }

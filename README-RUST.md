@@ -98,6 +98,10 @@ The first compares the smallest registered NSP and NSZ on-disk fast hashes and p
 
 The Rust port still differs in presentation details, including the Python app's rich log formatting and theme-card settings page; settings are combined into a scrollable drawer.
 
+### Desktop usability
+
+Windows GUI smoke testing on 2026-11-18 exercised the actual application with a separate 846-file SQLite backup: library search/paging/sorting, list/grid and detail modes, seven settings categories, theme changes and persistence, store search/paging, download session settings, keyboard shortcuts, compact window layout, and restart. Pressing Escape clears both the edit box and committed search filters. The window defaults to 1280×760 and supports resizing down to 920×620; statistics move beneath the toolbar when space is constrained. Background activity no longer opens an intrusive floating log window automatically; use the **로그** toolbar control to view logs. See `QA_GUI_2026-11-18.md` for the detailed test matrix and untested scenarios.
+
 ### Reliability and performance hardening (November 18, 2026)
 
 - Full-folder scan pruning is disabled for roots containing unreadable descendants; empty/truncated packages fail analysis instead of being reported as successful. Schema changes also trigger re-analysis during incremental scans.

@@ -411,7 +411,6 @@ struct NslApp {
     log_receiver: Receiver<String>,
     log_lines: Vec<String>,
     log_open: bool,
-    was_working: bool,
     resource_sample: ResourceSample,
     resource_clock: Option<(std::time::Instant, u64)>,
     resource_refresh_at: Option<std::time::Instant>,
@@ -709,7 +708,6 @@ impl NslApp {
             log_receiver,
             log_lines: Vec::new(),
             log_open: false,
-            was_working: false,
             resource_sample: ResourceSample::default(),
             resource_clock: None,
             resource_refresh_at: None,
@@ -1377,7 +1375,7 @@ impl NslApp {
                 self.catalog_page -= 1;
             }
             ui.label(format!(
-                "페이지 {} / {} · {}개 일치 (최대 2,000개 표시)",
+                "페이지 {} / {} · {}개 일치",
                 self.catalog_page + 1,
                 page_count,
                 self.catalog_matching_indices.len()
@@ -3820,13 +3818,8 @@ impl NslApp {
             theme::apply(ctx, &theme_id);
             self.active_theme = theme_id;
         }
-        let mut received_log = false;
         while let Ok(line) = self.log_receiver.try_recv() {
             self.log_lines.push(line);
-            received_log = true;
-        }
-        if received_log {
-            self.log_open = true;
         }
         if self.log_lines.len() > 2000 {
             self.log_lines.drain(..self.log_lines.len() - 2000);
@@ -3850,8 +3843,22 @@ impl NslApp {
             self.start_scan(true);
         }
         if escape {
+            // TextEdit changes its buffer during this frame, so clearing only
+            // `search` can leave the debounced/committed query filtering the
+            // list indefinitely until the user types again.
             self.search.clear();
+            self.search_committed.clear();
+            self.search_pending = None;
             self.search_focus = false;
+            self.current_page = 0;
+            self.filtered_key = None;
+            if self.folder_filter == "CATALOG" {
+                self.catalog_search.clear();
+                self.catalog_search_committed.clear();
+                self.catalog_search_pending = None;
+                self.catalog_search_cache = None;
+                self.catalog_page = 0;
+            }
         }
         if enter && !ctx.wants_keyboard_input() {
             if let Some(row) = self
@@ -3883,11 +3890,8 @@ impl NslApp {
         .into_iter()
         .filter_map(|(active, label)| active.then_some(label))
         .collect::<Vec<_>>();
-        let is_working = !active_tasks.is_empty();
-        if is_working && !self.was_working {
-            self.log_open = true;
-        }
-        self.was_working = is_working;
+        // Background scans/downloads must not steal focus by opening the log
+        // window. The toolbar has a dedicated log toggle for users who want it.
         if self
             .torrent_progress
             .iter()
@@ -6173,6 +6177,18 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
             );
         });
         ui.separator();
+        // Keep controls and statistics on separate rows when the viewport is
+        // too narrow for both; otherwise egui can paint overlapping widgets.
+        let compact_top_bar = ui.available_width() < 1400.0;
+        let statistics = format!(
+            "파일: {}  |  게임: {}  업데이트: {}  DLC: {}  |  {}  |  DB: {}",
+            common::format_count(app.stats.file_count),
+            common::format_count(app.stats.base_count),
+            common::format_count(app.stats.update_count),
+            common::format_count(app.stats.dlc_count),
+            common::format_size(app.stats.total_size.max(0) as u64),
+            common::format_count(app.stats.title_db_count)
+        );
         ui.scope(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
             ui.spacing_mut().interact_size.y = 30.0;
@@ -6229,9 +6245,15 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                     if ui.button("설정").clicked() {
                         app.settings_open = !app.settings_open;
                     }
+                    if ui.button("로그").clicked() {
+                        app.log_open = !app.log_open;
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let search = ui.add_sized(
-                            [220.0, ui.spacing().interact_size.y],
+                            [
+                                if compact_top_bar { 170.0 } else { 220.0 },
+                                ui.spacing().interact_size.y,
+                            ],
                             egui::TextEdit::singleline(&mut app.search)
                                 .id(egui::Id::new("library_search"))
                                 .vertical_align(egui::Align::Center)
@@ -6243,19 +6265,19 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                         }
                         ui.label("검색");
                         ui.separator();
-                        ui.label(format!(
-                            "파일: {}  |  게임: {}  업데이트: {}  DLC: {}  |  {}  |  DB: {}",
-                            common::format_count(app.stats.file_count),
-                            common::format_count(app.stats.base_count),
-                            common::format_count(app.stats.update_count),
-                            common::format_count(app.stats.dlc_count),
-                            common::format_size(app.stats.total_size.max(0) as u64),
-                            common::format_count(app.stats.title_db_count)
-                        ));
+                        if !compact_top_bar {
+                            ui.label(&statistics);
+                        }
                     });
                 },
             );
         });
+        if compact_top_bar {
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new(statistics).small());
+            });
+        }
         ui.add_space(2.0);
     });
 }
@@ -6385,8 +6407,8 @@ fn main() -> Result<()> {
         .unwrap_or("0")
         == "1";
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1400.0, 860.0])
-        .with_min_inner_size([1400.0, 860.0])
+        .with_inner_size([1280.0, 760.0])
+        .with_min_inner_size([920.0, 620.0])
         .with_maximized(start_maximized);
     if let Some(icon) = load_window_icon() {
         viewport = viewport.with_icon(icon);
@@ -6717,6 +6739,66 @@ mod runtime_tests {
         app.catalog_page = 21;
         run_app_ticks(&mut app, 1);
         assert_eq!(app.catalog_page, 21);
+    }
+
+    #[test]
+    fn background_messages_do_not_force_log_window_open() {
+        let (mut app, _dir) = seeded_app();
+        assert!(!app.log_open);
+        app.log_sender
+            .send("background cover update".into())
+            .unwrap();
+        run_app_ticks(&mut app, 2);
+        assert!(app
+            .log_lines
+            .iter()
+            .any(|line| line == "background cover update"));
+        assert!(
+            !app.log_open,
+            "background logs must not obscure the library"
+        );
+    }
+
+    #[test]
+    fn escape_clears_both_edit_buffer_and_committed_filters() {
+        // Regression from real Windows GUI QA: Esc emptied the search edit,
+        // while its debounced query still filtered the library indefinitely.
+        let (mut app, _dir) = seeded_app();
+        app.search = "nonexistent-game".into();
+        app.search_committed = app.search.clone();
+        app.search_pending = Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        app.catalog_search = "Mario".into();
+        app.catalog_search_committed = "Mario".into();
+        app.catalog_search_pending =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        app.folder_filter = "CATALOG".into();
+        app.current_page = 3;
+        app.catalog_page = 2;
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 860.0),
+            )),
+            ..Default::default()
+        });
+        app.ui_frame(&ctx);
+        let _ = ctx.end_pass();
+        assert_eq!(app.search, "");
+        assert_eq!(app.search_committed, "");
+        assert!(app.search_pending.is_none());
+        assert_eq!(app.catalog_search, "");
+        assert_eq!(app.catalog_search_committed, "");
+        assert!(app.catalog_search_pending.is_none());
+        assert_eq!(app.current_page, 0);
+        assert_eq!(app.catalog_page, 0);
     }
 
     #[test]

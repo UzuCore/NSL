@@ -18,7 +18,8 @@ $version = $Matches[1]
 $required = @(
     @{ From = (Join-Path $root 'target\release\nsl.exe'); To = 'nsl.exe' },
     @{ From = (Join-Path $root 'bin\nstool.exe');         To = 'bin\nstool.exe' },
-    @{ From = (Join-Path $root 'bin\hactool.exe');        To = 'bin\hactool.exe' }
+    @{ From = (Join-Path $root 'bin\hactool.exe');        To = 'bin\hactool.exe' },
+    @{ From = (Join-Path $root 'licenses\hactool-ISC.txt'); To = 'licenses\hactool-ISC.txt' }
 )
 foreach ($item in $required) {
     if (-not (Test-Path -LiteralPath $item.From)) {
@@ -42,10 +43,12 @@ New-Item -ItemType Directory -Path (Join-Path $staging 'bin') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $staging 'titledb') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $staging 'icons') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $staging 'screenshots') -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $staging 'licenses') -Force | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $root 'target\release\nsl.exe') -Destination (Join-Path $staging 'nsl.exe')
 Copy-Item -LiteralPath (Join-Path $root 'bin\nstool.exe') -Destination (Join-Path $staging 'bin\nstool.exe')
 Copy-Item -LiteralPath (Join-Path $root 'bin\hactool.exe') -Destination (Join-Path $staging 'bin\hactool.exe')
+Copy-Item -LiteralPath (Join-Path $root 'licenses\hactool-ISC.txt') -Destination (Join-Path $staging 'licenses\hactool-ISC.txt')
 foreach ($file in $titleDbFiles) {
     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $staging ('titledb\' + $file.Name))
 }

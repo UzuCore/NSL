@@ -6,6 +6,7 @@ mod database;
 mod decompress;
 mod library;
 mod media;
+mod native_nca;
 mod scanner;
 mod theme;
 mod titledb;
@@ -7130,6 +7131,92 @@ mod runtime_tests {
         assert_eq!(cached.len(), count);
         assert!(cached.values().all(|record| !record.fast_hash.is_empty()));
         assert!(cached.values().all(|record| !record.contents.is_empty()));
+        // Compare against the original DB read-only to identify stale cached
+        // values. Exact correctness is checked separately against a fresh
+        // legacy hactool extraction of the same on-disk game files.
+        let reference_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library.db");
+        let reference = rusqlite::Connection::open_with_flags(
+            reference_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let mut file_stmt = reference.prepare(
+            "SELECT path,COALESCE(nacp_ko,''),COALESCE(nacp_en,''),COALESCE(nacp_ja,'') FROM game_files"
+        ).unwrap();
+        let mut compared_files = 0usize;
+        let mut reference_name_differences = 0usize;
+        for row in file_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (path, ko, en, ja) = row.unwrap();
+            let normalized = normalize_scan_path_text(&path);
+            let new = cached
+                .get(&normalized)
+                .unwrap_or_else(|| panic!("missing reference path"));
+            if (
+                new.nacp_ko.as_str(),
+                new.nacp_en.as_str(),
+                new.nacp_ja.as_str(),
+            ) != (ko.as_str(), en.as_str(), ja.as_str())
+            {
+                reference_name_differences += 1;
+            }
+            compared_files += 1;
+        }
+        assert_eq!(compared_files, 846);
+        let mut content_stmt = reference
+            .prepare("SELECT path,title_id,version,content_type FROM file_contents")
+            .unwrap();
+        let mut reference_contents: HashMap<String, HashSet<(Option<String>, i64, String)>> =
+            HashMap::new();
+        for row in content_stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+        {
+            let (path, id, version, kind) = row.unwrap();
+            reference_contents
+                .entry(normalize_scan_path_text(&path))
+                .or_default()
+                .insert((id, version, kind));
+        }
+        let mut compared_contents = 0usize;
+        let mut reference_content_differences = 0usize;
+        for (path, expected) in &reference_contents {
+            let actual: HashSet<_> = cached
+                .get(path)
+                .unwrap()
+                .contents
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.title_id.clone(),
+                        entry.version,
+                        entry.content_type.clone(),
+                    )
+                })
+                .collect();
+            if &actual != expected {
+                reference_content_differences += 1;
+            }
+            compared_contents += actual.len();
+        }
+        assert_eq!(compared_contents, 4_647);
+        eprintln!("SCAN_REFERENCE_COMPARISON files={compared_files} content_entries={compared_contents} old_names_different={reference_name_differences} old_contents_different={reference_content_differences}");
         let localized = cached
             .values()
             .filter(|record| {

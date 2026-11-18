@@ -33,6 +33,10 @@ pub(crate) mod scan_profile {
     pub static XCI: Stage = Stage::new();
     pub static CNMT_RAW_OK: AtomicU64 = AtomicU64::new(0);
     pub static CNMT_FALLBACK: AtomicU64 = AtomicU64::new(0);
+    pub static NATIVE_CNMT_OK: AtomicU64 = AtomicU64::new(0);
+    pub static NATIVE_CNMT_FALLBACK: AtomicU64 = AtomicU64::new(0);
+    pub static NATIVE_NACP_OK: AtomicU64 = AtomicU64::new(0);
+    pub static NATIVE_NACP_FALLBACK: AtomicU64 = AtomicU64::new(0);
 
     pub struct Stage {
         count: AtomicU64,
@@ -92,6 +96,16 @@ pub(crate) mod scan_profile {
         .chain([
             format!("cnmt_raw_ok={}", CNMT_RAW_OK.load(Ordering::Relaxed)),
             format!("cnmt_fallback={}", CNMT_FALLBACK.load(Ordering::Relaxed)),
+            format!("native_cnmt_ok={}", NATIVE_CNMT_OK.load(Ordering::Relaxed)),
+            format!(
+                "native_cnmt_fallback={}",
+                NATIVE_CNMT_FALLBACK.load(Ordering::Relaxed)
+            ),
+            format!("native_nacp_ok={}", NATIVE_NACP_OK.load(Ordering::Relaxed)),
+            format!(
+                "native_nacp_fallback={}",
+                NATIVE_NACP_FALLBACK.load(Ordering::Relaxed)
+            ),
         ])
         .collect::<Vec<_>>()
         .join(" | ")
@@ -520,16 +534,21 @@ pub(crate) fn extract_nca_section0(nca: &Path, output_dir: &Path) -> bool {
 
 fn nacp_file_names(path: &Path) -> Option<(String, String, String)> {
     let data = std::fs::read(path).ok()?;
-    if data.len() < NACP_ENTRY_SIZE * NACP_LANGUAGES {
+    nacp_names_from_bytes(&data)
+}
+
+pub(crate) fn nacp_names_from_bytes(data: &[u8]) -> Option<(String, String, String)> {
+    if data.len() < NACP_REQUIRED_LEN {
         return None;
     }
-    let en = if nacp_name_at(&data, 0).is_empty() {
-        nacp_name_at(&data, 1)
+    let first = nacp_name_at(data, 0);
+    let en = if first.is_empty() {
+        nacp_name_at(data, 1)
     } else {
-        nacp_name_at(&data, 0)
+        first
     };
-    let ja = nacp_name_at(&data, 2);
-    let ko = nacp_name_at(&data, 12);
+    let ja = nacp_name_at(data, 2);
+    let ko = nacp_name_at(data, 12);
     if ko.is_empty() && en.is_empty() && ja.is_empty() {
         None
     } else {
@@ -617,6 +636,13 @@ fn is_cnmt_candidate_size(size: u64) -> bool {
 }
 
 fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
+    hactool_nsp_names_with_native(path, true)
+}
+
+fn hactool_nsp_names_with_native(
+    path: &Path,
+    enable_native: bool,
+) -> Option<(String, String, String)> {
     #[cfg(test)]
     let _perf = scan_profile::NSP_NAMES.start();
     let mut entries = pfs_ncas(path)?;
@@ -625,8 +651,35 @@ fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
             && (64 * 1024..=512 * 1024 * 1024).contains(&entry.size)
     });
     let mut source = File::open(path).ok()?;
+    let native_keys = enable_native
+        .then(|| prod_keys().and_then(|path| crate::native_nca::cached_keys(&path)))
+        .flatten();
+    if let Some(ref keys) = native_keys {
+        // Match hactool's first readable Control NCA in the same size-sorted
+        // order. RomFS root-file traversal (native_nca::extract_nacp) now
+        // selects exactly the same NACP even when remaster data also exists.
+        for entry in entries.iter().take(12) {
+            if let Some(kind) =
+                crate::native_nca::content_kind(&mut source, entry.offset, entry.size, keys)
+            {
+                if kind != 2 {
+                    continue;
+                }
+                if let Some(names) =
+                    crate::native_nca::extract_nacp(&mut source, entry.offset, entry.size, keys)
+                {
+                    #[cfg(test)]
+                    scan_profile::NATIVE_NACP_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(names);
+                }
+            }
+        }
+    }
+    // Unrecognized headers and missing keys use the original verified hactool.
     let work = tempfile::tempdir().ok()?;
     for (index, entry) in entries.iter().take(12).enumerate() {
+        #[cfg(test)]
+        scan_profile::NATIVE_NACP_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nca = work.path().join(format!("candidate_{index}.nca"));
         source.seek(SeekFrom::Start(entry.offset)).ok()?;
         let mut limited = source.by_ref().take(entry.size);
@@ -659,7 +712,7 @@ fn parse_cnmt_path(path: &Path) -> Option<Content> {
     parse_cnmt_header(&data)
 }
 
-fn parse_cnmt_header(data: &[u8]) -> Option<Content> {
+pub(crate) fn parse_cnmt_header(data: &[u8]) -> Option<Content> {
     if data.len() < 13 {
         return None;
     }
@@ -762,6 +815,10 @@ fn cnmt_from_raw_section(path: &Path) -> Vec<Content> {
 }
 
 fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
+    hactool_nsp_contents_with_native(path, true)
+}
+
+fn hactool_nsp_contents_with_native(path: &Path, enable_native: bool) -> Vec<Content> {
     #[cfg(test)]
     let _perf = scan_profile::NSP_CONTENTS.start();
     let Some(mut entries) = pfs_ncas(path) else {
@@ -775,11 +832,39 @@ fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
     let Ok(mut source) = File::open(path) else {
         return Vec::new();
     };
-    let Ok(work) = tempfile::tempdir() else {
-        return Vec::new();
-    };
+    let native_keys = enable_native
+        .then(|| prod_keys().and_then(|path| crate::native_nca::cached_keys(&path)))
+        .flatten();
+    // The legacy extraction workspace is only needed if native crypto cannot
+    // handle a particular NCA. Normal metadata extraction is diskless.
+    let mut work = None;
     let mut contents = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
+        if let Some(ref keys) = native_keys {
+            if let Some(extracted) =
+                crate::native_nca::extract_cnmt(&mut source, entry.offset, entry.size, keys)
+            {
+                #[cfg(test)]
+                scan_profile::NATIVE_CNMT_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for content in extracted {
+                    if !contents
+                        .iter()
+                        .any(|known: &Content| known.title_id == content.title_id)
+                    {
+                        contents.push(content);
+                    }
+                }
+                continue;
+            }
+        }
+        #[cfg(test)]
+        scan_profile::NATIVE_CNMT_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if work.is_none() {
+            work = tempfile::tempdir().ok();
+        }
+        let Some(ref work) = work else {
+            continue;
+        };
         let nca = work.path().join(format!("meta_{index}.nca"));
         if source.seek(SeekFrom::Start(entry.offset)).is_err() {
             continue;
@@ -1440,5 +1525,74 @@ mod tests {
                 "{extension} scan missed library title ID {expected_id}"
             );
         }
+    }
+
+    /// Compare freshly decoded native metadata with freshly extracted hactool
+    /// results. The existing library database may contain older name values.
+    #[test]
+    #[ignore = "reads all local games and starts hactool for differential QA"]
+    fn native_metadata_matches_legacy_hactool_real_corpus() {
+        use rayon::prelude::*;
+        use rusqlite::{Connection, OpenFlags};
+
+        let reference = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("library.db");
+        let db = Connection::open_with_flags(reference, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let paths: Vec<String> = db
+            .prepare(
+                "SELECT path FROM game_files WHERE lower(file_type) IN ('nsp','nsz') ORDER BY path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(paths.len(), 846);
+        let started = std::time::Instant::now();
+        let names_only = std::env::var_os("NSL_QA_NAMES_ONLY").is_some();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let compared: Vec<_> = pool.install(|| {
+            paths
+                .par_iter()
+                .map(|name| {
+                    let path = Path::new(name);
+                    let content_equal = if names_only {
+                        true
+                    } else {
+                        let native = hactool_nsp_contents_with_native(path, true);
+                        let legacy = hactool_nsp_contents_with_native(path, false);
+                        let as_set = |contents: Vec<Content>| {
+                            contents.into_iter()
+                                .map(|entry| (entry.title_id, entry.version, entry.content_type))
+                                .collect::<HashSet<_>>()
+                        };
+                        as_set(native) == as_set(legacy)
+                    };
+                    let native_names = hactool_nsp_names_with_native(path, true);
+                    let legacy_names = hactool_nsp_names_with_native(path, false);
+                    let names_equal = native_names == legacy_names;
+                    if !names_equal {
+                        eprintln!("NACP_PARITY_DETAIL filename={:?} native={native_names:?} legacy={legacy_names:?}",path.file_name());
+                    }
+                    (name.clone(), content_equal, names_equal)
+                })
+                .collect()
+        });
+        let different_content: Vec<_> = compared.iter().filter(|(_, same, _)| !same).collect();
+        let different_names: Vec<_> = compared.iter().filter(|(_, _, same)| !same).collect();
+        eprintln!("NATIVE_HACTOOL_DIFFERENTIAL files={} content_differences={} names_differences={} elapsed={:.2}s",
+            compared.len(), different_content.len(), different_names.len(), started.elapsed().as_secs_f64());
+        assert!(
+            different_content.is_empty(),
+            "CNMT differences on {} files",
+            different_content.len()
+        );
+        assert!(
+            different_names.is_empty(),
+            "NACP differences on {} files",
+            different_names.len()
+        );
     }
 }

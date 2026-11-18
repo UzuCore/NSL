@@ -98,6 +98,10 @@ The first compares the smallest registered NSP and NSZ on-disk fast hashes and p
 
 The Rust port still differs in presentation details, including the Python app's rich log formatting and theme-card settings page; settings are combined into a scrollable drawer.
 
+### Performance hardening
+
+Library refresh now queries only the title metadata families referenced by installed files and their possible DLC, using an indexed 12-digit title family key rather than materializing every global title description. Store pages virtualize visible rows and request only visible, uncached covers in bounded four-way parallel batches with a retry cooldown. Scan cache loading executes off the UI thread with a single unified cache read, and DLC ownership checks use hash sets. See `QA_OPTIMIZATION_2026-11-18.md` for query measurements, regression results, and remaining profiling opportunities.
+
 ### Desktop usability
 
 Windows GUI smoke testing on 2026-11-18 exercised the actual application with a separate 846-file SQLite backup: library search/paging/sorting, list/grid and detail modes, seven settings categories, theme changes and persistence, store search/paging, download session settings, keyboard shortcuts, compact window layout, and restart. Pressing Escape clears both the edit box and committed search filters. The window defaults to 1280×760 and supports resizing down to 920×620; statistics move beneath the toolbar when space is constrained. Background activity no longer opens an intrusive floating log window automatically; use the **로그** toolbar control to view logs. See `QA_GUI_2026-11-18.md` for the detailed test matrix and untested scenarios.

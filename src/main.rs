@@ -31,6 +31,9 @@ use std::{
 const ICON_CACHE_MAX: usize = 300;
 const ICON_LOAD_BUDGET: usize = 32;
 const STORE_COVER_CACHE_MAX: usize = 128;
+const STORE_COVER_FETCH_BATCH: usize = 16;
+const STORE_COVER_DOWNLOAD_THREADS: usize = 4;
+const STORE_COVER_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Everything that changes the filtered/sorted library view. When this is
 /// unchanged between frames the previous computation is reused.
@@ -398,7 +401,8 @@ struct NslApp {
     catalog_cover_textures: HashMap<String, egui::TextureHandle>,
     catalog_cover_lru: VecDeque<String>,
     catalog_cover_missing: HashSet<String>,
-    catalog_cover_queue: Option<Receiver<std::result::Result<usize, String>>>,
+    catalog_cover_retry_after: HashMap<String, std::time::Instant>,
+    catalog_cover_queue: Option<Receiver<(usize, Vec<String>)>>,
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
     download_delete_confirm: Option<(String, String)>,
@@ -695,6 +699,7 @@ impl NslApp {
             catalog_cover_textures: HashMap::new(),
             catalog_cover_lru: VecDeque::new(),
             catalog_cover_missing: HashSet::new(),
+            catalog_cover_retry_after: HashMap::new(),
             catalog_cover_queue: None,
             torrent_engine: None,
             torrent_progress: Vec::new(),
@@ -806,22 +811,6 @@ impl NslApp {
         }
         let folders = self.folders.clone();
         let db = self.db.clone();
-        let known = db
-            .known_files()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(path, record)| (normalize_scan_path_text(&path), record))
-            .collect::<HashMap<_, _>>();
-        let cached_records = db
-            .cached_file_records()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(path, mut record)| {
-                let path = normalize_scan_path_text(&path);
-                record.path = path.clone();
-                (path, record)
-            })
-            .collect::<HashMap<_, _>>();
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(ScanProgress {
             completed: AtomicUsize::new(0),
@@ -865,6 +854,17 @@ impl NslApp {
                 folders.len()
             ));
             let result = (|| -> Result<ScanOutcome> {
+                // One cache read serves metadata comparison AND content reuse.
+                // Building two large HashMaps duplicated path strings and DB IO.
+                let cached_records = db
+                    .cached_file_records()?
+                    .into_iter()
+                    .map(|(path, mut record)| {
+                        let path = normalize_scan_path_text(&path);
+                        record.path = path.clone();
+                        (path, record)
+                    })
+                    .collect::<HashMap<_, _>>();
                 let mut discovered = Vec::new();
                 let mut existing = Vec::new();
                 let mut skipped = 0usize;
@@ -957,9 +957,10 @@ impl NslApp {
                             .map(|d| d.as_secs_f64());
                         existing.push(path.clone());
                         if incremental && !force_reanalyze {
-                            if let Some((old_mtime, old_size, _)) = known.get(&path) {
-                                if *old_size == meta.len() as i64
-                                    && old_mtime
+                            if let Some(old) = cached_records.get(&path) {
+                                if old.size == meta.len() as i64
+                                    && old
+                                        .mtime
                                         .zip(mtime)
                                         .map(|(a, b)| (a - b).abs() < 1.0)
                                         .unwrap_or(false)
@@ -1013,14 +1014,14 @@ impl NslApp {
                             .par_iter()
                             .map(|(source, path, filename, size, mtime, ext, folder)| {
                                 let cached_record = cached_record_for_path(&cached_records, path);
-                                let same_metadata =
-                                    known.get(path).map(|(old_mtime, old_size, _)| {
-                                        *old_size == *size
-                                            && old_mtime
-                                                .zip(*mtime)
-                                                .map(|(old, current)| (old - current).abs() < 1.0)
-                                                .unwrap_or(false)
-                                    }) == Some(true);
+                                let same_metadata = cached_records.get(path).map(|old| {
+                                    old.size == *size
+                                        && old
+                                            .mtime
+                                            .zip(*mtime)
+                                            .map(|(old, current)| (old - current).abs() < 1.0)
+                                            .unwrap_or(false)
+                                }) == Some(true);
                                 // A record written before the NACP version column
                                 // existed has an empty version that a plain cache
                                 // hit would keep forever, so re-read those once.
@@ -1034,14 +1035,8 @@ impl NslApp {
                                 {
                                     (None, true)
                                 } else if let Ok(hash) = scanner::fast_hash(source) {
-                                    if let (Some(old), Some((_, _, old_hash))) =
-                                        (cached_record, known.get(path))
-                                    {
-                                        if incremental
-                                            && !old_hash.is_empty()
-                                            && *old_hash == hash
-                                            && cache_complete
-                                        {
+                                    if let Some(old) = cached_record {
+                                        if incremental && old.fast_hash == hash && cache_complete {
                                             let mut record = old.clone();
                                             record.path = path.clone();
                                             record.filename = filename.clone();
@@ -1391,40 +1386,39 @@ impl NslApp {
             }
         });
         ui.separator();
-        let page_items: Vec<catalog::CatalogItem> = self
+        // Keep only lightweight indices for the page. Clone heavyweight
+        // catalog entries (magnet links and other strings) only for the rows
+        // that the virtualized scroll area will actually display.
+        let page_indices: Vec<usize> = self
             .catalog_matching_indices
             .iter()
             .skip(self.catalog_page * page_size)
             .take(page_size)
-            .map(|&index| self.catalog_state.items[index].clone())
+            .copied()
             .collect();
         let download_root = self.base_dir.join("downloads");
         let selected_topic = self.catalog_selected.clone();
-        let cover_jobs: Vec<(String, String)> = page_items
-            .iter()
-            .filter(|item| !item.cover.is_empty() && !item.topic_id.is_empty())
-            .filter(|item| Self::safe_catalog_topic_id(&item.topic_id))
-            .filter(|item| {
-                !self.catalog_cover_missing.contains(&item.topic_id)
-                    && !self.catalog_cover_textures.contains_key(&item.topic_id)
-                    || !self
-                        .catalog_cover_dir
-                        .join(format!("{}.jpg", item.topic_id))
-                        .exists()
-            })
-            .map(|item| (item.topic_id.clone(), item.cover.clone()))
-            .collect();
-        self.start_cover_prefetch(cover_jobs);
+        let mut cover_jobs = Vec::new();
+        let now = std::time::Instant::now();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, 64.0, page_indices.len(), |ui, row_range| {
                 egui::Grid::new("catalog_grid")
                     .striped(true)
                     .num_columns(6)
                     .min_col_width(60.0)
+                    .spacing(egui::vec2(4.0, 2.0))
                     .show(ui, |ui| {
                         let mut cover_budget = ICON_LOAD_BUDGET;
-                        for item in &page_items {
+                        for &index in &page_indices[row_range] {
+                            let item = self.catalog_state.items[index].clone();
+                            if self.catalog_cover_queue.is_none()
+                                && cover_jobs.len() < STORE_COVER_FETCH_BATCH
+                                && self.should_prefetch_catalog_cover(&item, now)
+                                && !cover_jobs.iter().any(|(id, _)| id == &item.topic_id)
+                            {
+                                cover_jobs.push((item.topic_id.clone(), item.cover.clone()));
+                            }
                             self.ensure_catalog_cover(ui.ctx(), &item.topic_id, &mut cover_budget);
                             if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
                                 ui.add(egui::Image::new((cover.id(), egui::vec2(60.0, 60.0))));
@@ -1450,12 +1444,13 @@ impl NslApp {
                             ui.label(truncate_label(&item.image_format, 24));
                             let button = ui.add_enabled(true, egui::Button::new("다운로드"));
                             if button.clicked() {
-                                self.start_catalog_torrent(item);
+                                self.start_catalog_torrent(&item);
                             }
                             ui.end_row();
                         }
                     });
             });
+        self.start_cover_prefetch(cover_jobs);
         ui.label(format!(
             "저장 위치: {}\\<게임 폴더>",
             download_root.display()
@@ -1505,7 +1500,26 @@ impl NslApp {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }
 
-    /// Queue covers for every visible catalog item that has no local file.
+    fn should_prefetch_catalog_cover(
+        &self,
+        item: &catalog::CatalogItem,
+        now: std::time::Instant,
+    ) -> bool {
+        !item.cover.is_empty()
+            && Self::safe_catalog_topic_id(&item.topic_id)
+            && self
+                .catalog_cover_retry_after
+                .get(&item.topic_id)
+                .is_none_or(|deadline| *deadline <= now)
+            && !self
+                .catalog_cover_dir
+                .join(format!("{}.jpg", item.topic_id))
+                .is_file()
+    }
+
+    /// Fetch a small bounded batch; never block later catalog pages behind
+    /// dozens of serial network timeouts. Failed URLs are retried only after
+    /// a cooldown, not on every GUI repaint.
     fn start_cover_prefetch(&mut self, items: Vec<(String, String)>) {
         if self.catalog_cover_queue.is_some() || items.is_empty() {
             return;
@@ -1515,39 +1529,62 @@ impl NslApp {
         self.catalog_cover_queue = Some(rx);
         std::thread::spawn(move || {
             let agent = ureq::AgentBuilder::new()
-                .timeout(std::time::Duration::from_secs(20))
+                .timeout(std::time::Duration::from_secs(12))
                 .build();
-            let mut fetched = 0usize;
-            for (topic_id, url) in items {
-                if !Self::safe_catalog_topic_id(&topic_id) {
-                    continue;
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(STORE_COVER_DOWNLOAD_THREADS)
+                .build();
+            let results = match pool {
+                Ok(pool) => pool.install(|| {
+                    items
+                        .into_par_iter()
+                        .map(|(topic_id, url)| {
+                            let target = dir.join(format!("{topic_id}.jpg"));
+                            let saved = (|| -> anyhow::Result<bool> {
+                                if target.is_file() {
+                                    return Ok(false);
+                                }
+                                let response = agent.get(&url).call()?;
+                                let mut bytes = Vec::new();
+                                response
+                                    .into_reader()
+                                    .take(16 * 1024 * 1024 + 1)
+                                    .read_to_end(&mut bytes)?;
+                                anyhow::ensure!(bytes.len() <= 16 * 1024 * 1024, "커버 파일 초과");
+                                let header =
+                                    image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+                                        .with_guessed_format()?;
+                                let (width, height) = header.into_dimensions()?;
+                                anyhow::ensure!(
+                                    width > 0
+                                        && height > 0
+                                        && u64::from(width) * u64::from(height) <= 12_000_000,
+                                    "커버 해상도 초과"
+                                );
+                                image::load_from_memory(&bytes)?;
+                                database::atomic_write(&target, &bytes)?;
+                                Ok(true)
+                            })();
+                            (topic_id, saved)
+                        })
+                        .collect::<Vec<_>>()
+                }),
+                Err(_) => {
+                    let failed = items.into_iter().map(|(topic_id, _)| topic_id).collect();
+                    let _ = tx.send((0, failed));
+                    return;
                 }
-                let target = dir.join(format!("{topic_id}.jpg"));
-                if target.exists() {
-                    continue;
-                }
-                match agent.get(&url).call() {
-                    Ok(response) => {
-                        let mut bytes = Vec::new();
-                        let mut reader = response.into_reader();
-                        if (&mut reader)
-                            .take(16 * 1024 * 1024 + 1)
-                            .read_to_end(&mut bytes)
-                            .is_ok()
-                            && bytes.len() <= 16 * 1024 * 1024
-                            && image::load_from_memory(&bytes).is_ok()
-                        {
-                            let tmp = dir.join(format!("{topic_id}.jpg.tmp"));
-                            if std::fs::write(&tmp, &bytes).is_ok() {
-                                let _ = std::fs::rename(&tmp, &target);
-                                fetched += 1;
-                            }
-                        }
-                    }
-                    Err(_) => continue,
+            };
+            let mut downloaded = 0;
+            let mut failed = Vec::new();
+            for (topic_id, result) in results {
+                match result {
+                    Ok(true) => downloaded += 1,
+                    Ok(false) => {}
+                    Err(_) => failed.push(topic_id),
                 }
             }
-            let _ = tx.send(Ok(fetched));
+            let _ = tx.send((downloaded, failed));
         });
     }
 
@@ -4031,6 +4068,8 @@ impl NslApp {
                         self.catalog_page = 0;
                         self.catalog_search_cache = None;
                         self.catalog_matching_indices.clear();
+                        self.catalog_cover_retry_after.clear();
+                        self.catalog_cover_missing.clear();
                     }
                 }
                 Err(e) => self.status = e,
@@ -4044,14 +4083,15 @@ impl NslApp {
             .and_then(|rx| rx.try_recv().ok());
         if let Some(done) = cover_done {
             self.catalog_cover_queue = None;
-            match done {
-                Ok(fetched) if fetched > 0 => {
-                    self.catalog_cover_missing.clear();
-                    self.status = format!("스토어 커버 {fetched}개 받음");
-                    ctx.request_repaint();
-                }
-                Ok(_) => {}
-                Err(e) => self.status = e,
+            let (fetched, failed) = done;
+            let retry_at = std::time::Instant::now() + STORE_COVER_RETRY_DELAY;
+            for topic_id in failed {
+                self.catalog_cover_retry_after.insert(topic_id, retry_at);
+            }
+            if fetched > 0 {
+                self.catalog_cover_missing.clear();
+                self.status = format!("스토어 커버 {fetched}개 받음");
+                ctx.request_repaint();
             }
         } else if self.catalog_cover_queue.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -6739,6 +6779,37 @@ mod runtime_tests {
         app.catalog_page = 21;
         run_app_ticks(&mut app, 1);
         assert_eq!(app.catalog_page, 21);
+    }
+
+    #[test]
+    fn catalog_cover_jobs_respect_disk_cache_and_retry_cooldown() {
+        let (mut app, dir) = seeded_app();
+        let item = catalog::CatalogItem {
+            topic_id: "opt-test-001".into(),
+            cover: "https://example.test/cover.jpg".into(),
+            ..Default::default()
+        };
+        let now = std::time::Instant::now();
+        assert!(app.should_prefetch_catalog_cover(&item, now));
+        app.catalog_cover_retry_after
+            .insert(item.topic_id.clone(), now + STORE_COVER_RETRY_DELAY);
+        assert!(!app.should_prefetch_catalog_cover(&item, now));
+        assert!(app.should_prefetch_catalog_cover(
+            &item,
+            now + STORE_COVER_RETRY_DELAY + std::time::Duration::from_millis(1)
+        ));
+        let cover_dir = dir.path().join("icons").join("store");
+        std::fs::create_dir_all(&cover_dir).unwrap();
+        std::fs::write(cover_dir.join("opt-test-001.jpg"), b"cached").unwrap();
+        assert!(!app.should_prefetch_catalog_cover(
+            &item,
+            now + STORE_COVER_RETRY_DELAY + std::time::Duration::from_secs(1)
+        ));
+        let invalid = catalog::CatalogItem {
+            topic_id: "../escape".into(),
+            ..item
+        };
+        assert!(!app.should_prefetch_catalog_cover(&invalid, now));
     }
 
     #[test]

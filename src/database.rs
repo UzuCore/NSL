@@ -210,7 +210,8 @@ impl Database {
             title_id TEXT PRIMARY KEY, name TEXT, version INTEGER DEFAULT 0,
             release_date TEXT, num_players TEXT, rating TEXT, size INTEGER DEFAULT 0,
             region TEXT, icon_url TEXT, screenshots TEXT DEFAULT '[]', description TEXT, languages TEXT);
-        CREATE INDEX IF NOT EXISTS idx_titledb_base ON title_db(UPPER(SUBSTR(title_id,1,13))||'000');")?;
+        CREATE INDEX IF NOT EXISTS idx_titledb_base ON title_db(UPPER(SUBSTR(title_id,1,13))||'000');
+        CREATE INDEX IF NOT EXISTS idx_titledb_family ON title_db(UPPER(SUBSTR(title_id,1,12)));")?;
         // Existing 1.4.x databases may predate localized NACP columns.
         if let Ok(conn) = self.connect() {
             for col in ["nacp_ko", "nacp_en", "nacp_ja"] {
@@ -247,28 +248,27 @@ impl Database {
     pub fn files(&self, name_mode: &str) -> Result<Vec<GameFile>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
-        let raw = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                    r.get::<_, String>(7)?,
-                    Content {
-                        title_id: r.get(8)?,
-                        version: r.get(9)?,
-                        kind: r.get(10)?,
-                    },
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let raw = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+                r.get::<_, String>(7)?,
+                Content {
+                    title_id: r.get(8)?,
+                    version: r.get(9)?,
+                    kind: r.get(10)?,
+                },
+            ))
+        })?;
         let mut by_path: HashMap<String, Vec<Content>> = HashMap::new();
         let mut file_data = HashMap::new();
-        for (id, path, filename, size, file_type, ko, en, ja, c) in raw {
+        for record in raw {
+            let (id, path, filename, size, file_type, ko, en, ja, c) = record?;
             file_data.entry(path.clone()).or_insert((
                 id,
                 path.clone(),
@@ -284,7 +284,12 @@ impl Database {
             }
         }
         let mut titles = HashMap::new();
-        let mut tstmt = conn.prepare("SELECT title_id,COALESCE(name,''),COALESCE(version,0),COALESCE(region,''),COALESCE(description,''),COALESCE(screenshots,'[]'),COALESCE(languages,''),COALESCE(icon_url,'') FROM title_db")?;
+        // Only load metadata for installed titles and their potential DLC.
+        // A DLC id can differ in its 13th hex digit from its base (e.g. 6xxx
+        // versus 7xxx). Matching the first 12 digits retains every DLC while
+        // avoiding materializing unrelated descriptions/screenshots (~45 MB
+        // on the reference library) at each refresh.
+        let mut tstmt = conn.prepare("SELECT title_id,COALESCE(name,''),COALESCE(version,0),COALESCE(region,''),COALESCE(description,''),COALESCE(screenshots,'[]'),COALESCE(languages,''),COALESCE(icon_url,'') FROM title_db WHERE UPPER(SUBSTR(title_id,1,12)) IN (SELECT DISTINCT UPPER(SUBSTR(title_id,1,12)) FROM file_contents WHERE LENGTH(title_id)=16)")?;
         for row in tstmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -326,14 +331,16 @@ impl Database {
                 }
             }
         }
-        let mut db_dlcs: HashMap<String, Vec<String>> = HashMap::new();
+        // DLC lookups also test ownership, so use O(1) membership instead of
+        // linear scans over potentially hundreds of add-ons per game.
+        let mut db_dlcs: HashMap<String, HashSet<String>> = HashMap::new();
         for tid in titles.keys() {
             if let Ok(v) = u64::from_str_radix(tid, 16) {
                 if tid.len() == 16 && (v & 0x1fff) >= 0x1000 {
                     db_dlcs
                         .entry(format!("{:016X}", v & 0xFFFFFFFFFFFFE000))
                         .or_default()
-                        .push(tid.clone());
+                        .insert(tid.clone());
                 }
             }
         }

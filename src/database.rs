@@ -472,26 +472,52 @@ impl Database {
     pub fn upsert_files(&self, files: &[FileRecord]) -> Result<()> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
-        for f in files {
-            tx.execute("INSERT INTO game_files(path,filename,size,mtime,fast_hash,file_type,last_seen,scan_folder,nacp_ko,nacp_en,nacp_ja)
+        // Prepare each SQL statement only once per batch. A full scan can
+        // produce thousands of content rows, and cloning the whole Content
+        // vector (plus formatting the timestamp per file) was avoidable.
+        let last_seen = chrono::Utc::now().to_rfc3339();
+        {
+            let mut file_stmt = tx.prepare("INSERT INTO game_files(path,filename,size,mtime,fast_hash,file_type,last_seen,scan_folder,nacp_ko,nacp_en,nacp_ja)
                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(path) DO UPDATE SET
                 filename=excluded.filename,size=excluded.size,mtime=excluded.mtime,
                 fast_hash=excluded.fast_hash,file_type=excluded.file_type,last_seen=excluded.last_seen,scan_folder=excluded.scan_folder,
-                nacp_ko=excluded.nacp_ko,nacp_en=excluded.nacp_en,nacp_ja=excluded.nacp_ja",
-                params![f.path,f.filename,f.size,f.mtime,f.fast_hash,f.file_type,chrono::Utc::now().to_rfc3339(),f.scan_folder,f.nacp_ko,f.nacp_en,f.nacp_ja])?;
-            tx.execute("DELETE FROM file_contents WHERE path=?1", [&f.path])?;
-            let contents = if f.contents.is_empty() {
-                vec![crate::scanner::Content {
-                    title_id: None,
-                    version: 0,
-                    content_type: "unknown".into(),
-                    source: "none".into(),
-                }]
-            } else {
-                f.contents.clone()
-            };
-            for c in contents {
-                tx.execute("INSERT OR IGNORE INTO file_contents(path,title_id,version,content_type,source) VALUES(?1,?2,?3,?4,?5)",params![f.path,c.title_id,c.version,c.content_type,c.source])?;
+                nacp_ko=excluded.nacp_ko,nacp_en=excluded.nacp_en,nacp_ja=excluded.nacp_ja")?;
+            let mut clear_stmt = tx.prepare("DELETE FROM file_contents WHERE path=?1")?;
+            let mut content_stmt = tx.prepare("INSERT OR IGNORE INTO file_contents(path,title_id,version,content_type,source) VALUES(?1,?2,?3,?4,?5)")?;
+            for f in files {
+                file_stmt.execute(params![
+                    f.path,
+                    f.filename,
+                    f.size,
+                    f.mtime,
+                    f.fast_hash,
+                    f.file_type,
+                    last_seen,
+                    f.scan_folder,
+                    f.nacp_ko,
+                    f.nacp_en,
+                    f.nacp_ja
+                ])?;
+                clear_stmt.execute([&f.path])?;
+                if f.contents.is_empty() {
+                    content_stmt.execute(params![
+                        f.path,
+                        Option::<&str>::None,
+                        0,
+                        "unknown",
+                        "none"
+                    ])?;
+                } else {
+                    for c in &f.contents {
+                        content_stmt.execute(params![
+                            f.path,
+                            c.title_id.as_deref(),
+                            c.version,
+                            c.content_type,
+                            c.source
+                        ])?;
+                    }
+                }
             }
         }
         tx.commit()?;
@@ -859,6 +885,48 @@ mod tests {
         assert!(remaining.contains_key("F:\\archive\\b.nsp"));
         assert_eq!(db.delete_missing_files_within(&[], &[]).unwrap(), 0);
         assert!(db.known_files().unwrap().contains_key("F:\\archive\\b.nsp"));
+    }
+
+    #[test]
+    fn prepared_batch_upsert_preserves_empty_content_and_single_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("library.db")).unwrap();
+        db.init().unwrap();
+        let empty = file_record("C:\\games\\empty.nsp", "empty.nsp", Vec::new());
+        let multiple = file_record(
+            "C:\\games\\multi.nsp",
+            "multi.nsp",
+            vec![
+                content("0100D2C0115B6000", 0, "base"),
+                content("0100D2C0115B6800", 131072, "update"),
+            ],
+        );
+        db.upsert_files(&[empty, multiple.clone()]).unwrap();
+        let rows = db.cached_file_records().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows["C:\\games\\empty.nsp"].contents.len(), 1);
+        assert!(rows["C:\\games\\empty.nsp"].contents[0].title_id.is_none());
+        assert_eq!(
+            rows["C:\\games\\empty.nsp"].contents[0].content_type,
+            "unknown"
+        );
+        assert_eq!(rows["C:\\games\\multi.nsp"].contents.len(), 2);
+        let conn = db.connect().unwrap();
+        let distinct_timestamps: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT last_seen) FROM game_files",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_timestamps, 1);
+        db.upsert_files(&[multiple]).unwrap();
+        assert_eq!(
+            db.cached_file_records().unwrap()["C:\\games\\multi.nsp"]
+                .contents
+                .len(),
+            2
+        );
     }
 
     #[test]

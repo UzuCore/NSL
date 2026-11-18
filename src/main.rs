@@ -4366,13 +4366,18 @@ impl NslApp {
                         });
                     });
                     ui.separator();
+                    let log_row_height = ui.text_style_height(&egui::TextStyle::Monospace)
+                        + ui.spacing().item_spacing.y;
                     egui::ScrollArea::vertical()
                         .id_salt("operation_log")
                         .stick_to_bottom(true)
                         .auto_shrink([false, false])
                         .max_height(150.0)
-                        .show(ui, |ui| {
-                            for line in &self.log_lines {
+                        .show_rows(ui, log_row_height, self.log_lines.len(), |ui, row_range| {
+                            // Large scans can produce 2,000 messages. Keep the
+                            // log panel proportional to its visible rows rather
+                            // than laying out every message on each repaint.
+                            for line in &self.log_lines[row_range] {
                                 let color = if line.contains("❌") || line.contains("⚠") {
                                     if ui.visuals().dark_mode {
                                         egui::Color32::LIGHT_RED
@@ -4388,7 +4393,13 @@ impl NslApp {
                                 } else {
                                     ui.visuals().text_color()
                                 };
-                                ui.label(egui::RichText::new(line).monospace().color(color));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(line).monospace().color(color),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(line);
                             }
                         });
                     ui.separator();
@@ -6831,6 +6842,33 @@ mod runtime_tests {
     }
 
     #[test]
+    fn log_panel_renders_only_visible_rows_when_messages_grow() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.log_open = true;
+        let render = |app: &mut NslApp| -> usize {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 760.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            ctx.end_pass().shapes.len()
+        };
+        app.log_lines = (0..10).map(|i| format!("log {i:04}")).collect();
+        let small = render(&mut app);
+        app.log_lines = (0..2_000).map(|i| format!("log {i:04}")).collect();
+        let large = render(&mut app);
+        assert!(
+            large < small + 75,
+            "log was laid out in full: {small} -> {large} shapes"
+        );
+    }
+
+    #[test]
     fn escape_clears_both_edit_buffer_and_committed_filters() {
         // Regression from real Windows GUI QA: Esc emptied the search edit,
         // while its debounced query still filtered the library indefinitely.
@@ -7020,6 +7058,14 @@ mod runtime_tests {
     #[ignore = "requires the local game corpus and prod.keys"]
     fn full_scan_of_real_corpus_matches_existing_library() {
         let (mut app, dir) = seeded_app();
+        // Profile the bounded worker count without touching persistent user
+        // settings. Set NSL_TEST_SCAN_THREADS only for this ignored QA test.
+        if let Ok(threads) = std::env::var("NSL_TEST_SCAN_THREADS") {
+            app.config.settings.insert(
+                "max_scan_threads".into(),
+                serde_json::Value::String(threads),
+            );
+        }
         let base = dir.path().to_path_buf();
         app.folders = vec!["E:\\NSW".into()];
         app.config.scan_folders = app.folders.clone();
@@ -7084,6 +7130,22 @@ mod runtime_tests {
         assert_eq!(cached.len(), count);
         assert!(cached.values().all(|record| !record.fast_hash.is_empty()));
         assert!(cached.values().all(|record| !record.contents.is_empty()));
+        let localized = cached
+            .values()
+            .filter(|record| {
+                !record.nacp_ko.is_empty()
+                    || !record.nacp_en.is_empty()
+                    || !record.nacp_ja.is_empty()
+            })
+            .count();
+        let korean = cached
+            .values()
+            .filter(|record| !record.nacp_ko.is_empty())
+            .count();
+        assert!(localized >= 800, "NACP localization was lost: {localized}");
+        assert!(korean >= 530, "Korean names were lost: {korean}");
+        eprintln!("SCAN_LOCALES available={localized} korean={korean}");
+        eprintln!("SCAN_PROFILE {}", scanner::scan_profile::report());
     }
 
     /// Incremental pass must reuse the cache written by the full pass, keep the

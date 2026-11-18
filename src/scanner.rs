@@ -14,6 +14,90 @@ use wait_timeout::ChildExt;
 
 const FAST_CHUNK: usize = 64 * 1024;
 
+// Test-only timing identifies hot stages in the real-file regression without
+// logging game paths or adding any work to production builds.
+#[cfg(test)]
+pub(crate) mod scan_profile {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
+    };
+
+    pub static SCAN: Stage = Stage::new();
+    pub static CONTENTS: Stage = Stage::new();
+    pub static NACP: Stage = Stage::new();
+    pub static NSTOOL: Stage = Stage::new();
+    pub static HACTOOL: Stage = Stage::new();
+    pub static NSP_CONTENTS: Stage = Stage::new();
+    pub static NSP_NAMES: Stage = Stage::new();
+    pub static XCI: Stage = Stage::new();
+    pub static CNMT_RAW_OK: AtomicU64 = AtomicU64::new(0);
+    pub static CNMT_FALLBACK: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Stage {
+        count: AtomicU64,
+        elapsed_us: AtomicU64,
+    }
+    impl Stage {
+        const fn new() -> Self {
+            Self {
+                count: AtomicU64::new(0),
+                elapsed_us: AtomicU64::new(0),
+            }
+        }
+        pub fn start(&'static self) -> Guard {
+            Guard {
+                stage: self,
+                started: Instant::now(),
+            }
+        }
+        fn snapshot(&self) -> (u64, u64) {
+            (
+                self.count.load(Ordering::Relaxed),
+                self.elapsed_us.load(Ordering::Relaxed),
+            )
+        }
+    }
+    pub struct Guard {
+        stage: &'static Stage,
+        started: Instant,
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.stage.count.fetch_add(1, Ordering::Relaxed);
+            self.stage
+                .elapsed_us
+                .fetch_add(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+    pub fn report() -> String {
+        [
+            ("scan", &SCAN),
+            ("header", &CONTENTS),
+            ("nacp", &NACP),
+            ("nstool", &NSTOOL),
+            ("hactool", &HACTOOL),
+            ("nsp_contents", &NSP_CONTENTS),
+            ("nsp_names", &NSP_NAMES),
+            ("xci", &XCI),
+        ]
+        .into_iter()
+        .map(|(label, stage)| {
+            let (count, us) = stage.snapshot();
+            format!(
+                "{label}={count} calls / {:.3} aggregate seconds",
+                us as f64 / 1_000_000.0
+            )
+        })
+        .chain([
+            format!("cnmt_raw_ok={}", CNMT_RAW_OK.load(Ordering::Relaxed)),
+            format!("cnmt_fallback={}", CNMT_FALLBACK.load(Ordering::Relaxed)),
+        ])
+        .collect::<Vec<_>>()
+        .join(" | ")
+    }
+}
+
 pub struct ScanResult {
     pub fast_hash: String,
     pub contents: Vec<Content>,
@@ -65,6 +149,8 @@ fn xml_title_id_regex() -> &'static Regex {
 }
 
 fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
+    #[cfg(test)]
+    let _perf = scan_profile::CONTENTS.start();
     const NSP_OFFSETS: [u64; 6] = [0, 0x200, 0x400, 0x1000, 0x4000, 0x8000];
     const XCI_OFFSETS: [u64; 6] = [0x8000, 0x4000, 0, 0x200, 0x400, 0x1000];
     let size = match file.metadata() {
@@ -221,6 +307,8 @@ fn nacp_name_at(bytes: &[u8], index: usize) -> String {
 }
 
 fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
+    #[cfg(test)]
+    let _perf = scan_profile::NACP.start();
     let size = match file.metadata() {
         Ok(m) => m.len(),
         Err(_) => return Default::default(),
@@ -340,6 +428,8 @@ fn hactool_path() -> Option<std::path::PathBuf> {
 }
 
 fn run_hactool(args: &[String], target: &Path) -> Option<(bool, String)> {
+    #[cfg(test)]
+    let _perf = scan_profile::HACTOOL.start();
     let (engine, keys) = (hactool_path()?, prod_keys()?);
     let mut command = Command::new(engine);
     #[cfg(windows)]
@@ -382,12 +472,50 @@ fn run_hactool(args: &[String], target: &Path) -> Option<(bool, String)> {
     Some((status, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
+/// Extract commands only need the exit code and the generated file. Avoid
+/// spawning two pipe-reader threads per child process: a full scan runs many
+/// thousands of hactool commands. Output capture above remains available for
+/// the XCI --listnca command, which actually needs to parse stdout.
+fn run_hactool_quiet(args: &[String], target: &Path) -> bool {
+    #[cfg(test)]
+    let _perf = scan_profile::HACTOOL.start();
+    let (Some(engine), Some(keys)) = (hactool_path(), prod_keys()) else {
+        return false;
+    };
+    let mut command = Command::new(engine);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let Ok(mut child) = command
+        .arg("--disablekeywarns")
+        .arg("-k")
+        .arg(keys)
+        .args(args)
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    match child.wait_timeout(Duration::from_secs(20)) {
+        Ok(Some(status)) => status.success(),
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            false
+        }
+    }
+}
+
 pub(crate) fn extract_nca_section0(nca: &Path, output_dir: &Path) -> bool {
     if std::fs::create_dir_all(output_dir).is_err() {
         return false;
     }
     let args = vec![format!("--section0dir={}", output_dir.display())];
-    matches!(run_hactool(&args, nca), Some((true, _)))
+    run_hactool_quiet(&args, nca)
 }
 
 fn nacp_file_names(path: &Path) -> Option<(String, String, String)> {
@@ -489,6 +617,8 @@ fn is_cnmt_candidate_size(size: u64) -> bool {
 }
 
 fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
+    #[cfg(test)]
+    let _perf = scan_profile::NSP_NAMES.start();
     let mut entries = pfs_ncas(path)?;
     entries.retain(|entry| {
         !entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
@@ -506,8 +636,14 @@ fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
         }
         let section = work.path().join(format!("section_{index}"));
         std::fs::create_dir_all(&section).ok()?;
-        let args = vec![format!("--section0dir={}", section.display())];
-        if let Some((true, _)) = run_hactool(&args, &nca) {
+        // Most package NCAs are data/program archives, not Control NCAs.
+        // The bundled hactool can reject their extraction immediately by
+        // reading the NCA content type, avoiding unnecessary RomFS writes.
+        let args = vec![
+            "--xcontenttype=control".to_owned(),
+            format!("--section0dir={}", section.display()),
+        ];
+        if run_hactool_quiet(&args, &nca) {
             if let Some(names) = nacp_file_names(&section.join("control.nacp")) {
                 return Some(names);
             }
@@ -517,7 +653,13 @@ fn hactool_nsp_names(path: &Path) -> Option<(String, String, String)> {
 }
 
 fn parse_cnmt_path(path: &Path) -> Option<Content> {
-    let data = std::fs::read(path).ok()?;
+    let mut file = File::open(path).ok()?;
+    let mut data = [0u8; 13];
+    file.read_exact(&mut data).ok()?;
+    parse_cnmt_header(&data)
+}
+
+fn parse_cnmt_header(data: &[u8]) -> Option<Content> {
     if data.len() < 13 {
         return None;
     }
@@ -541,7 +683,87 @@ fn parse_cnmt_path(path: &Path) -> Option<Content> {
     })
 }
 
+/// The decrypted section of a Meta NCA is a PFS0 container. Read its CNMT
+/// header directly instead of asking hactool to materialize a directory tree
+/// for every individual NCA. Non-PFS sections still use the legacy fallback.
+fn cnmt_from_raw_section(path: &Path) -> Vec<Content> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return Vec::new();
+    };
+    if size < 16 {
+        return Vec::new();
+    }
+    let mut header = [0u8; 16];
+    if file.read_exact(&mut header).is_err() || &header[..4] != b"PFS0" {
+        return Vec::new();
+    }
+    let count = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+    let string_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+    if count == 0 || count > 16_384 || string_size > 64 * 1024 * 1024 {
+        return Vec::new();
+    }
+    let Some(table_size) = count.checked_mul(0x18) else {
+        return Vec::new();
+    };
+    let Some(data_start) = 16u64
+        .checked_add(table_size as u64)
+        .and_then(|value| value.checked_add(string_size as u64))
+    else {
+        return Vec::new();
+    };
+    if data_start > size {
+        return Vec::new();
+    }
+    let mut table = vec![0u8; table_size];
+    let mut strings = vec![0u8; string_size];
+    if file.read_exact(&mut table).is_err() || file.read_exact(&mut strings).is_err() {
+        return Vec::new();
+    }
+    let mut results = Vec::new();
+    for index in 0..count {
+        let p = index * 0x18;
+        let offset = u64::from_le_bytes(table[p..p + 8].try_into().unwrap());
+        let length = u64::from_le_bytes(table[p + 8..p + 16].try_into().unwrap());
+        let name_off = u32::from_le_bytes(table[p + 16..p + 20].try_into().unwrap()) as usize;
+        if name_off >= strings.len()
+            || !(13..=1_048_576).contains(&length)
+            || data_start
+                .checked_add(offset)
+                .and_then(|start| start.checked_add(length))
+                .is_none_or(|end| end > size)
+        {
+            continue;
+        }
+        let name = strings[name_off..]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        if !name.to_ascii_lowercase().ends_with(b".cnmt") {
+            continue;
+        }
+        let mut data = [0u8; 13];
+        if file.seek(SeekFrom::Start(data_start + offset)).is_ok()
+            && file.read_exact(&mut data).is_ok()
+        {
+            if let Some(content) = parse_cnmt_header(&data) {
+                if !results
+                    .iter()
+                    .any(|other: &Content| other.title_id == content.title_id)
+                {
+                    results.push(content);
+                }
+            }
+        }
+    }
+    results
+}
+
 fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
+    #[cfg(test)]
+    let _perf = scan_profile::NSP_CONTENTS.start();
     let Some(mut entries) = pfs_ncas(path) else {
         return Vec::new();
     };
@@ -569,34 +791,51 @@ fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
         if std::io::copy(&mut limited, &mut output).is_err() {
             continue;
         }
-        let section = work.path().join(format!("meta_section_{index}"));
-        if std::fs::create_dir_all(&section).is_err() {
-            continue;
-        }
-        let args = vec![format!("--section0dir={}", section.display())];
-        if !matches!(run_hactool(&args, &nca), Some((true, _))) {
-            continue;
-        }
-        for extracted in walkdir::WalkDir::new(&section)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            if extracted
-                .path()
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .map(|extension| extension.eq_ignore_ascii_case("cnmt"))
-                .unwrap_or(false)
+        let section_file = work.path().join(format!("meta_section_{index}.pfs0"));
+        let raw_args = vec![format!("--section0={}", section_file.display())];
+        let mut extracted = if run_hactool_quiet(&raw_args, &nca) {
+            cnmt_from_raw_section(&section_file)
+        } else {
+            Vec::new()
+        };
+        if !extracted.is_empty() {
+            #[cfg(test)]
+            scan_profile::CNMT_RAW_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            // Fallback for unsupported or future NCA section layouts.
+            #[cfg(test)]
+            scan_profile::CNMT_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let section = work.path().join(format!("meta_section_{index}"));
+            if std::fs::create_dir_all(&section).is_err() {
+                continue;
+            }
+            let args = vec![format!("--section0dir={}", section.display())];
+            if !run_hactool_quiet(&args, &nca) {
+                continue;
+            }
+            for item in walkdir::WalkDir::new(&section)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
             {
-                if let Some(content) = parse_cnmt_path(extracted.path()) {
-                    if !contents
-                        .iter()
-                        .any(|known: &Content| known.title_id == content.title_id)
-                    {
-                        contents.push(content);
+                if item
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("cnmt"))
+                {
+                    if let Some(content) = parse_cnmt_path(item.path()) {
+                        extracted.push(content);
                     }
                 }
+            }
+        }
+        for content in extracted {
+            if !contents
+                .iter()
+                .any(|known: &Content| known.title_id == content.title_id)
+            {
+                contents.push(content);
             }
         }
     }
@@ -623,7 +862,7 @@ fn hactool_xci_names(path: &Path) -> Option<(String, String, String)> {
         format!("--nca={target}"),
         format!("--outdir={}", output_dir.display()),
     ];
-    if !run_hactool(&extract_args, path)?.0 {
+    if !run_hactool_quiet(&extract_args, path) {
         return None;
     }
     let nca = output_dir.join(target);
@@ -647,7 +886,7 @@ fn hactool_xci_names(path: &Path) -> Option<(String, String, String)> {
     let section = work.path().join("section");
     std::fs::create_dir_all(&section).ok()?;
     let args = vec![format!("--section0dir={}", section.display())];
-    if !run_hactool(&args, &nca)?.0 {
+    if !run_hactool_quiet(&args, &nca) {
         return None;
     }
     nacp_file_names(&section.join("control.nacp"))
@@ -667,6 +906,8 @@ fn hactool_nacp_names(path: &Path) -> Option<(String, String, String)> {
 }
 
 pub(crate) fn run_nstool(path: &Path, extra: &[String]) -> Option<String> {
+    #[cfg(test)]
+    let _perf = scan_profile::NSTOOL.start();
     let (Some(engine), Some(keys)) = (nstool_path(), prod_keys()) else {
         return None;
     };
@@ -784,6 +1025,8 @@ pub fn fast_hash(path: &Path) -> Result<String> {
 }
 
 pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<ScanResult> {
+    #[cfg(test)]
+    let _perf = scan_profile::SCAN.start();
     let mut file = File::open(path)?;
     anyhow::ensure!(
         file.metadata()?.len() >= 16,
@@ -798,6 +1041,8 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
         .map(|v| v.eq_ignore_ascii_case("xci"))
         .unwrap_or(false)
     {
+        #[cfg(test)]
+        let _xci_perf = scan_profile::XCI.start();
         let (xci_contents, names) = crate::xci::scan(path);
         if !xci_contents.is_empty() {
             contents = xci_contents;
@@ -815,14 +1060,6 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
         }
         return finish_scan(path, filename, hash, contents, names);
     }
-    if !contents.iter().any(|c| c.source == "header_cnmt")
-        || nacp_ko.is_empty() && nacp_en.is_empty() && nacp_ja.is_empty()
-    {
-        let deep = nstool_scan(path);
-        if !deep.is_empty() {
-            contents = deep;
-        }
-    }
     let nsp = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -830,19 +1067,49 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
             extension.eq_ignore_ascii_case("nsp") || extension.eq_ignore_ascii_case("nsz")
         })
         .unwrap_or(false);
-    if nsp
-        && !contents
-            .iter()
-            .any(|content| content.source == "header_cnmt")
-    {
-        let deep = hactool_nsp_contents(path);
+    let header_has_cnmt = contents
+        .iter()
+        .any(|content| content.source == "header_cnmt");
+    // Hactool CNMT data superseded nstool's results in the legacy scan path.
+    // Run the authoritative step first and avoid a redundant nstool process
+    // when CNMT extraction succeeds. Keep the existing fallback when it does
+    // not, and preserve the older header-CNMT path unchanged.
+    let mut extracted_cnmt = false;
+    let mut names = (nacp_ko, nacp_en, nacp_ja);
+    let needs_names = names.0.is_empty() && names.1.is_empty() && names.2.is_empty();
+    let mut preloaded_names = None;
+    let mut preloaded_names_attempted = false;
+    if nsp && !header_has_cnmt {
+        // These two reads are independent. Rayon joins them inside the same
+        // bounded scan pool, avoiding extra OS threads and allowing a file
+        // with many CNMT archives to proceed alongside NACP extraction.
+        let deep = if needs_names {
+            let (metadata, found_names) =
+                rayon::join(|| hactool_nsp_contents(path), || hactool_nacp_names(path));
+            preloaded_names = found_names;
+            preloaded_names_attempted = true;
+            metadata
+        } else {
+            hactool_nsp_contents(path)
+        };
+        if !deep.is_empty() {
+            contents = deep;
+            extracted_cnmt = true;
+        }
+    }
+    if !extracted_cnmt && (!header_has_cnmt || needs_names) {
+        let deep = nstool_scan(path);
         if !deep.is_empty() {
             contents = deep;
         }
     }
-    let mut names = (nacp_ko, nacp_en, nacp_ja);
-    if names.0.is_empty() && names.1.is_empty() && names.2.is_empty() {
-        if let Some(found) = hactool_nacp_names(path) {
+    if needs_names {
+        let found_names = if preloaded_names_attempted {
+            preloaded_names
+        } else {
+            hactool_nacp_names(path)
+        };
+        if let Some(found) = found_names {
             names = found;
         }
     }
@@ -963,6 +1230,23 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, bytes).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn parses_raw_decrypted_cnmt_section_without_directory_extraction() {
+        let mut cnmt = Vec::new();
+        cnmt.extend_from_slice(&0x0100_D2C0_115B_6800u64.to_le_bytes());
+        cnmt.extend_from_slice(&131072u32.to_le_bytes());
+        cnmt.push(0x81);
+        let (_dir, path) = write_temp_file(&pfs0(&[("meta.cnmt", cnmt)]), "section0.pfs0");
+        let found = cnmt_from_raw_section(&path);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title_id.as_deref(), Some("0100D2C0115B6800"));
+        assert_eq!(found[0].version, 131072);
+        assert_eq!(found[0].content_type, "update");
+        assert_eq!(found[0].source, "header_hactool");
+        fs::write(&path, b"PFS0\x01").unwrap();
+        assert!(cnmt_from_raw_section(&path).is_empty());
     }
 
     #[test]

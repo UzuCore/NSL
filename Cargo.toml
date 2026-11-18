@@ -22,6 +22,9 @@ walkdir = "2"
 ureq = { version = "2.12", features = ["json"] }
 url = "2.5"
 wait-timeout = "0.2"
+librqbit = { version = "9", default-features = false, features = ["default-tls"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+futures = "0.3"
 
 [profile.release]
 lto = true

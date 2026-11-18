@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::io::Read;
 use std::time::Duration;
 
 fn google_translate(text: &str) -> Result<String> {
@@ -13,11 +14,15 @@ fn google_translate(text: &str) -> Result<String> {
         "https://translate.googleapis.com/translate_a/single?{}",
         query.finish()
     );
-    let body = ureq::get(&endpoint)
+    let mut body = String::new();
+    ureq::get(&endpoint)
         .set("User-Agent", "Mozilla/5.0")
         .timeout(Duration::from_secs(30))
         .call()?
-        .into_string()?;
+        .into_reader()
+        .take(8 * 1024 * 1024)
+        .read_to_string(&mut body)
+        .context("Google 번역 응답을 읽지 못했습니다")?;
     let value: Value =
         serde_json::from_str(&body).context("Google 번역 응답을 JSON으로 읽지 못했습니다")?;
     let parts = value
@@ -70,11 +75,15 @@ fn mymemory_translate(text: &str) -> Result<String> {
         query.append_pair("q", &chunk);
         query.append_pair("langpair", "autodetect|ko");
         let endpoint = format!("https://api.mymemory.translated.net/get?{}", query.finish());
-        let body = ureq::get(&endpoint)
+        let mut body = String::new();
+        ureq::get(&endpoint)
             .set("User-Agent", concat!("NSL/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(15))
             .call()?
-            .into_string()?;
+            .into_reader()
+            .take(8 * 1024 * 1024)
+            .read_to_string(&mut body)
+            .context("대체 번역 응답을 읽지 못했습니다")?;
         let value: Value =
             serde_json::from_str(&body).context("대체 번역 응답을 JSON으로 읽지 못했습니다")?;
         let status = value

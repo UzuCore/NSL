@@ -19,6 +19,10 @@
 /prod.keys
 /title.keys
 
+# Torrent downloads and resume state
+/downloads/
+/torrent-session/
+
 # Python artifacts
 __pycache__/
 *.pyc

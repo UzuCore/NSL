@@ -9,17 +9,31 @@ pub fn base_dir() -> PathBuf {
         .and_then(|p| p.parent().map(PathBuf::from))
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    if executable_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("dist-rust"))
-    {
-        if let Some(workspace_dir) = executable_dir.parent() {
-            if workspace_dir.join("library.db").is_file()
-                && workspace_dir.join("config.json").is_file()
-            {
-                return workspace_dir.to_path_buf();
-            }
+    resolve_data_dir(executable_dir)
+}
+
+/// Picks the folder that holds the app's data (`library.db`, `config.json`,
+/// `titledb/`).
+///
+/// A packaged build keeps everything beside `nsl.exe`. When the binary sits in
+/// `target/release` (or `dist-rust`), the real data lives one or two levels up
+/// in the project root, so look there first. Falling back to the executable
+/// folder keeps true portable installs working.
+fn resolve_data_dir(executable_dir: PathBuf) -> PathBuf {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = executable_dir.parent() {
+        // target/release -> target -> project root
+        if let Some(root) = parent.parent() {
+            candidates.push(root.to_path_buf());
+        }
+        candidates.push(parent.to_path_buf());
+    }
+    for candidate in candidates {
+        if candidate.join("library.db").is_file()
+            && candidate.join("config.json").is_file()
+            && candidate.join("titledb").is_dir()
+        {
+            return candidate;
         }
     }
     executable_dir
@@ -84,5 +98,46 @@ mod tests {
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(846), "846");
         assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+
+    /// Helper: build a fake data folder with the three markers.
+    fn fake_data_dir(root: &std::path::Path) {
+        std::fs::create_dir_all(root.join("titledb")).unwrap();
+        std::fs::write(root.join("library.db"), b"").unwrap();
+        std::fs::write(root.join("config.json"), b"{}").unwrap();
+    }
+
+    #[test]
+    fn release_binary_beside_target_uses_project_root_database() {
+        // Regression: running `target/release/nsl.exe` used to resolve the data
+        // folder to `target/release`, so the app scanned into a fresh empty
+        // database and reported only the handful of titles it could parse.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_data_dir(root);
+        let exe_dir = root.join("target").join("release");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        assert_eq!(resolve_data_dir(exe_dir), root);
+    }
+
+    #[test]
+    fn dist_rust_binary_uses_project_root_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fake_data_dir(root);
+        let exe_dir = root.join("dist-rust");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        assert_eq!(resolve_data_dir(exe_dir), root);
+    }
+
+    #[test]
+    fn portable_install_keeps_data_beside_the_executable() {
+        // A shipped folder has no populated parent, so the executable folder
+        // itself must be used.
+        let dir = tempfile::tempdir().unwrap();
+        let exe_dir = dir.path().join("NSL");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        fake_data_dir(&exe_dir);
+        assert_eq!(resolve_data_dir(exe_dir.clone()), exe_dir);
     }
 }

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod catalog;
 mod common;
 mod database;
 mod decompress;
@@ -10,6 +11,7 @@ mod theme;
 mod titledb;
 mod translate;
 mod updater;
+mod torrent;
 mod xci;
 
 use anyhow::Result;
@@ -27,6 +29,19 @@ use std::{
 
 const ICON_CACHE_MAX: usize = 300;
 const ICON_LOAD_BUDGET: usize = 32;
+
+/// Everything that changes the filtered/sorted library view. When this is
+/// unchanged between frames the previous computation is reused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FilterKey {
+    search: String,
+    kind: String,
+    folder: String,
+    sort_column: String,
+    sort_desc: bool,
+    rows_len: usize,
+    rows_generation: u64,
+}
 
 /// Process memory and CPU usage for the status bar meter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -283,6 +298,28 @@ struct NslApp {
     base_dir: PathBuf,
     stats: database::LibraryStats,
     rows: Vec<library::GameFile>,
+    /// Cached, filtered+sorted view of `rows` keyed by the inputs that produce
+    /// it. Recomputing 800 cloned GameFile structs every frame was the main
+    /// source of the library stutter, so the result is only rebuilt when a
+    /// filter, the sort order, or the row set changes.
+    filtered_rows: Vec<library::GameFile>,
+    filtered_key: Option<FilterKey>,
+    /// Cached tab labels (total/folder/missing counts). Recomputing them walked
+    /// all rows with two string allocations per row, every frame.
+    cached_tabs: Vec<(String, String)>,
+    cached_tabs_generation: u64,
+    /// Cached duplicate groups and missing-resource counts.
+    cached_stats_generation: u64,
+    cached_missing_updates: usize,
+    cached_missing_dlcs: usize,
+    cached_duplicates: Vec<(String, String, Vec<String>)>,
+    /// Screenshot file list for the selected row. Reading the directory every
+    /// frame was a blocking disk call on the UI thread.
+    cached_screenshot_paths: Vec<PathBuf>,
+    cached_screenshot_selection: Option<i64>,
+    /// Bumped whenever `rows` is replaced, so the cached filter view knows the
+    /// underlying set changed even if the length happens to match.
+    rows_generation: u64,
     folders: Vec<String>,
     config: database::Config,
     selected: Option<i64>,
@@ -290,6 +327,8 @@ struct NslApp {
     current_page: usize,
     search: String,
     search_focus: bool,
+    search_committed: String,
+    search_pending: Option<std::time::Instant>,
     kind_filter: String,
     folder_filter: String,
     view_mode: String,
@@ -316,6 +355,7 @@ struct NslApp {
     sort_column: String,
     sort_desc: bool,
     media_result: Option<Receiver<std::result::Result<(String, usize), String>>>,
+    media_progress: Option<Arc<media::MediaProgress>>,
     icon_textures: HashMap<String, egui::TextureHandle>,
     icon_lru: VecDeque<String>,
     icon_missing: HashSet<String>,
@@ -336,6 +376,20 @@ struct NslApp {
     update_info: Option<updater::ReleaseInfo>,
     update_prepare_result: Option<Receiver<std::result::Result<PathBuf, String>>>,
     update_ready: Option<PathBuf>,
+    catalog_state: catalog::CatalogState,
+    catalog_result: Option<Receiver<std::result::Result<usize, String>>>,
+    catalog_search: String,
+    catalog_search_committed: String,
+    catalog_search_pending: Option<std::time::Instant>,
+    catalog_page: usize,
+    catalog_selected: Option<String>,
+    catalog_cover_dir: PathBuf,
+    catalog_cover_textures: HashMap<String, egui::TextureHandle>,
+    catalog_cover_missing: HashSet<String>,
+    catalog_cover_queue: Option<Receiver<std::result::Result<usize, String>>>,
+    torrent_engine: Option<Arc<torrent::TorrentEngine>>,
+    torrent_progress: Vec<(String, torrent::TorrentProgress)>,
+    download_delete_confirm: Option<(String, String)>,
     cache_info: Option<String>,
     shortcuts_open: bool,
     about_open: bool,
@@ -349,6 +403,15 @@ struct NslApp {
     resource_sample: ResourceSample,
     resource_clock: Option<(std::time::Instant, u64)>,
     resource_refresh_at: Option<std::time::Instant>,
+}
+
+fn truncate_label(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
 }
 
 fn path_is_within(path: &str, folder: &str) -> bool {
@@ -519,6 +582,8 @@ impl NslApp {
             .unwrap_or(0);
         let folder_filter = if saved_folder_filter == "MISSING_UPDATES"
             || saved_folder_filter == "MISSING_DLCS"
+            || saved_folder_filter == "CATALOG"
+            || saved_folder_filter == "DOWNLOADS"
             || folders.contains(&saved_folder_filter)
         {
             saved_folder_filter
@@ -529,11 +594,23 @@ impl NslApp {
         let screenshot_dir = base_dir.join("screenshots");
         std::fs::create_dir_all(&icon_dir)?;
         std::fs::create_dir_all(&screenshot_dir)?;
+        std::fs::create_dir_all(icon_dir.join("store"))?;
         let mut app = Self {
             db,
             base_dir: base_dir.clone(),
             stats,
             rows: Vec::new(),
+            filtered_rows: Vec::new(),
+            filtered_key: None,
+            cached_tabs: Vec::new(),
+            cached_tabs_generation: u64::MAX,
+            cached_stats_generation: u64::MAX,
+            cached_missing_updates: 0,
+            cached_missing_dlcs: 0,
+            cached_duplicates: Vec::new(),
+            cached_screenshot_paths: Vec::new(),
+            cached_screenshot_selection: None,
+            rows_generation: 0,
             folders,
             config,
             selected: None,
@@ -541,6 +618,8 @@ impl NslApp {
             current_page: 0,
             search: String::new(),
             search_focus: false,
+            search_committed: String::new(),
+            search_pending: None,
             kind_filter: "base".into(),
             folder_filter,
             view_mode,
@@ -567,6 +646,7 @@ impl NslApp {
             sort_column: "name".into(),
             sort_desc: false,
             media_result: None,
+            media_progress: None,
             icon_textures: HashMap::new(),
             icon_lru: VecDeque::new(),
             icon_missing: HashSet::new(),
@@ -587,6 +667,20 @@ impl NslApp {
             update_info: None,
             update_prepare_result: None,
             update_ready: None,
+            catalog_state: catalog::CatalogState::default(),
+            catalog_result: None,
+            catalog_search: String::new(),
+            catalog_search_committed: String::new(),
+            catalog_search_pending: None,
+            catalog_page: 0,
+            catalog_selected: None,
+            catalog_cover_dir: base_dir.join("icons").join("store"),
+            catalog_cover_textures: HashMap::new(),
+            catalog_cover_missing: HashSet::new(),
+            catalog_cover_queue: None,
+            torrent_engine: None,
+            torrent_progress: Vec::new(),
+            download_delete_confirm: None,
             cache_info: None,
             shortcuts_open: false,
             about_open: false,
@@ -608,6 +702,17 @@ impl NslApp {
             && app.base_dir.join("titledb").join("titles.json").is_file()
         {
             app.start_local_titledb_import();
+        }
+        if let Some(state) = catalog::load(&app.base_dir) {
+            app.catalog_state = state;
+        }
+        match torrent::TorrentEngine::new(app.base_dir.join("downloads")) {
+            Ok(engine) => app.torrent_engine = Some(Arc::new(engine)),
+            Err(error) => {
+                let _ = app
+                    .log_sender
+                    .send(format!("⚠ 토렌트 엔진 시작 실패: {error}"));
+            }
         }
         Ok(app)
     }
@@ -975,6 +1080,560 @@ impl NslApp {
             let _ = tx.send(result);
         });
     }
+    /// Download the torrent catalog snapshot in the background.
+    fn start_catalog_download(&mut self) {
+        if self.catalog_result.is_some() {
+            return;
+        }
+        let base_dir = self.base_dir.clone();
+        let source_url = catalog::DEFAULT_CATALOG_URL.to_owned();
+        let (tx, rx) = mpsc::channel();
+        self.catalog_result = Some(rx);
+        self.status = "게임 카탈로그 다운로드 중…".into();
+        let log = self.log_sender.clone();
+        std::thread::spawn(move || {
+            let result = catalog::download(&base_dir, &source_url)
+                .map(|state| state.items.len())
+                .map_err(|e| e.to_string());
+            let _ = log.send(match &result {
+                Ok(count) => format!("✅ 카탈로그 다운로드 · {count}개 항목"),
+                Err(error) => format!("❌ 카탈로그 다운로드 실패 · {error}"),
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Make a catalog title safe to use as a download sub-folder name.
+    fn sanitize_folder_name(title: &str) -> String {
+        let cleaned: String = title
+            .chars()
+            .map(|c| match c {
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => ' ',
+                c if (c as u32) < 0x20 => ' ',
+                c => c,
+            })
+            .collect();
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = truncate_label(collapsed.trim(), 80);
+        let trimmed = trimmed.trim_end_matches(['.', ' ']).to_owned();
+        if trimmed.is_empty() {
+            "untitled".into()
+        } else {
+            trimmed
+        }
+    }
+
+    /// Start a torrent download for one catalog entry into its own sub-folder
+    /// under the app's `downloads` directory.
+    fn start_catalog_torrent(&mut self, item: &catalog::CatalogItem, downloads_root: PathBuf) {
+        let Some(engine) = self.torrent_engine.clone() else {
+            self.status = "토렌트 엔진을 사용할 수 없습니다".into();
+            return;
+        };
+        if item.magnet.is_empty() {
+            self.status = "이 항목에는 마그넷 링크가 없습니다".into();
+            return;
+        }
+        let folder_name = match item.base_title_id() {
+            Some(id) => id,
+            None => Self::sanitize_folder_name(&item.title),
+        };
+        let sub_folder = downloads_root.join(folder_name);
+        match engine.start_download(&item.title, &item.magnet, sub_folder) {
+            Ok(_) => {
+                self.status = format!("다운로드 시작: {}", truncate_label(&item.title, 60));
+                let _ = self.log_sender.send(format!(
+                    "⬇ 다운로드 시작 · {} ({})",
+                    truncate_label(&item.title, 60),
+                    item.size
+                ));
+                self.folder_filter = "DOWNLOADS".into();
+                self.current_page = 0;
+                self.config.settings.insert(
+                    "last_tab_key".into(),
+                    serde_json::Value::String("DOWNLOADS".into()),
+                );
+                let _ =
+                    database::save_config(&self.base_dir.join("config.json"), &self.config);
+            }
+            Err(error) => self.status = format!("다운로드 시작 실패: {error}"),
+        }
+    }
+
+    /// Store tab: browse the torrent catalog and start downloads.
+    fn catalog_panel_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.heading("스토어");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        self.catalog_result.is_none(),
+                        egui::Button::new("카탈로그 새로고침"),
+                    )
+                    .clicked()
+                {
+                    self.start_catalog_download();
+                }
+                if !self.torrent_progress.is_empty() && ui.button("다운로드").clicked() {
+                    self.folder_filter = "DOWNLOADS".into();
+                    self.current_page = 0;
+                    self.config.settings.insert(
+                        "last_tab_key".into(),
+                        serde_json::Value::String("DOWNLOADS".into()),
+                    );
+                    let _ = database::save_config(
+                        &self.base_dir.join("config.json"),
+                        &self.config,
+                    );
+                }
+            });
+        });
+        ui.separator();
+        if self.catalog_state.items.is_empty() {
+            ui.add_space(12.0);
+            ui.group(|ui| {
+                ui.heading("게임 카탈로그");
+                if self.catalog_result.is_some() {
+                    ui.label("카탈로그를 다운로드하는 중… (약 20MB, 최초 1회)");
+                } else {
+                    ui.label("카탈로그를 내려받아 게임 업데이트와 DLC를 바로 받을 수 있습니다.");
+                    if ui.button("카탈로그 다운로드").clicked() {
+                        self.start_catalog_download();
+                    }
+                }
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "항목 {}개 · 소스 갱신: {}",
+                self.catalog_state.items.len(),
+                self.catalog_state
+                    .updated_at
+                    .map(|t| chrono::DateTime::<chrono::Local>::from(t)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string())
+                    .unwrap_or_else(|| "-".into())
+            ));
+        });
+        ui.add_space(4.0);
+        let search_before = self.catalog_search.clone();
+        ui.add_sized(
+            [ui.available_width().min(420.0), 24.0],
+            egui::TextEdit::singleline(&mut self.catalog_search)
+                .id(egui::Id::new("catalog_search"))
+                .hint_text("카탈로그 검색 (게임 이름 또는 타이틀 ID)…"),
+        );
+        if self.catalog_search != search_before {
+            self.catalog_search_pending =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        }
+        let mut search_applied = false;
+        if let Some(deadline) = self.catalog_search_pending {
+            if std::time::Instant::now() >= deadline {
+                self.catalog_search_pending = None;
+                if self.catalog_search_committed != self.catalog_search {
+                    self.catalog_search_committed = self.catalog_search.clone();
+                    search_applied = true;
+                }
+            }
+        }
+        if search_applied {
+            self.catalog_page = 0;
+        }
+        if self.catalog_search_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        ui.add_space(4.0);
+        let query = self.catalog_search_committed.trim().to_lowercase();
+        let matching: Vec<&catalog::CatalogItem> = self
+            .catalog_state
+            .items
+            .iter()
+            .filter(|item| {
+                query.is_empty()
+                    || item.title.to_lowercase().contains(&query)
+                    || item
+                        .base_title_id()
+                        .is_some_and(|id| id.to_lowercase().contains(&query))
+            })
+            .take(2000)
+            .collect();
+        let page_size = 100usize;
+        let page_count = matching.len().div_ceil(page_size).max(1);
+        self.catalog_page = self.catalog_page.min(page_count - 1);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(self.catalog_page > 0, egui::Button::new("이전"))
+                .clicked()
+            {
+                self.catalog_page -= 1;
+            }
+            ui.label(format!(
+                "페이지 {} / {} · {}개 일치 (최대 2,000개 표시)",
+                self.catalog_page + 1,
+                page_count,
+                matching.len()
+            ));
+            if ui
+                .add_enabled(
+                    self.catalog_page + 1 < page_count,
+                    egui::Button::new("다음"),
+                )
+                .clicked()
+            {
+                self.catalog_page += 1;
+            }
+        });
+        ui.separator();
+        let page_items: Vec<&catalog::CatalogItem> = matching
+            .iter()
+            .skip(self.catalog_page * page_size)
+            .take(page_size)
+            .copied()
+            .collect();
+        let download_root = self.base_dir.join("downloads");
+        let selected_topic = self.catalog_selected.clone();
+        let page_items: Vec<catalog::CatalogItem> = page_items
+            .iter()
+            .map(|item| (*item).clone())
+            .collect();
+        let cover_jobs: Vec<(String, String)> = page_items
+            .iter()
+            .filter(|item| !item.cover.is_empty() && !item.topic_id.is_empty())
+            .filter(|item| {
+                !self.catalog_cover_missing.contains(&item.topic_id)
+                    && !self.catalog_cover_textures.contains_key(&item.topic_id)
+                    || !self
+                        .catalog_cover_dir
+                        .join(format!("{}.jpg", item.topic_id))
+                        .exists()
+            })
+            .map(|item| (item.topic_id.clone(), item.cover.clone()))
+            .collect();
+        self.start_cover_prefetch(cover_jobs);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("catalog_grid")
+                    .striped(true)
+                    .num_columns(6)
+                    .min_col_width(60.0)
+                    .show(ui, |ui| {
+                        let mut cover_budget = ICON_LOAD_BUDGET;
+                        for item in &page_items {
+                            self.ensure_catalog_cover(
+                                ui.ctx(),
+                                &item.topic_id,
+                                &mut cover_budget,
+                            );
+                            if let Some(cover) =
+                                self.catalog_cover_textures.get(&item.topic_id)
+                            {
+                                ui.add(egui::Image::new((cover.id(), egui::vec2(60.0, 60.0))));
+                            } else {
+                                ui.allocate_ui(egui::vec2(60.0, 60.0), |ui| {
+                                    ui.centered_and_justified(|ui| {
+                                        ui.label("🎮");
+                                    });
+                                });
+                            }
+                            let selected = selected_topic
+                                .as_deref()
+                                .is_some_and(|id| item.topic_id == id);
+                            let name = truncate_label(&item.title, 70);
+                            if ui.selectable_label(selected, &name).clicked() {
+                                self.catalog_selected = Some(item.topic_id.clone());
+                            }
+                            ui.label(truncate_label(
+                                &item.title_id.clone().unwrap_or_default(),
+                                18,
+                            ));
+                            ui.label(&item.size);
+                            ui.label(truncate_label(&item.image_format, 24));
+                            let button = ui.add_enabled(true, egui::Button::new("다운로드"));
+                            if button.clicked() {
+                                self.start_catalog_torrent(item, download_root.clone());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        ui.label(format!(
+            "저장 위치: {}\\<게임 폴더>",
+            download_root.display()
+        ));
+        ui.label(
+            egui::RichText::new(
+                "게임 파일은 받은 뒤 스캔 폴더로 옮기면 라이브러리에 추가됩니다.",
+            )
+            .color(egui::Color32::GRAY),
+        );
+    }
+
+    /// Load a store cover into the texture cache if it is on disk.
+    fn ensure_catalog_cover(&mut self, ctx: &egui::Context, topic_id: &str, budget: &mut usize) {
+        if topic_id.is_empty() || self.catalog_cover_textures.contains_key(topic_id) {
+            return;
+        }
+        if *budget == 0 || self.catalog_cover_missing.contains(topic_id) {
+            return;
+        }
+        let path = self.catalog_cover_dir.join(format!("{topic_id}.jpg"));
+        let Ok(img) = image::open(&path) else {
+            self.catalog_cover_missing.insert(topic_id.to_owned());
+            return;
+        };
+        *budget -= 1;
+        if let Some(texture) = texture_from_image(ctx, "store_cover", img, 120) {
+            self.catalog_cover_textures
+                .insert(topic_id.to_owned(), texture);
+        }
+    }
+
+    /// Queue covers for every visible catalog item that has no local file.
+    fn start_cover_prefetch(&mut self, items: Vec<(String, String)>) {
+        if self.catalog_cover_queue.is_some() || items.is_empty() {
+            return;
+        }
+        let dir = self.catalog_cover_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        self.catalog_cover_queue = Some(rx);
+        std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(20))
+                .build();
+            let mut fetched = 0usize;
+            for (topic_id, url) in items {
+                let target = dir.join(format!("{topic_id}.jpg"));
+                if target.exists() {
+                    continue;
+                }
+                match agent.get(&url).call() {
+                    Ok(response) => {
+                        let mut bytes = Vec::new();
+                        let mut reader = response.into_reader();
+                        if reader.read_to_end(&mut bytes).is_ok()
+                            && bytes.len() <= 16 * 1024 * 1024
+                            && image::load_from_memory(&bytes).is_ok()
+                        {
+                            let tmp = dir.join(format!("{topic_id}.jpg.tmp"));
+                            if std::fs::write(&tmp, &bytes).is_ok() {
+                                let _ = std::fs::rename(&tmp, &target);
+                                fetched += 1;
+                            }
+                        }
+                    }
+                    Err(_) => continue,
+                }
+            }
+            let _ = tx.send(Ok(fetched));
+        });
+    }
+
+    /// The 중지/재개 · 삭제 button cluster shown on every download row.
+    fn download_row_buttons(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &str,
+        progress: &torrent::TorrentProgress,
+    ) {
+        let Some(engine) = &self.torrent_engine else {
+            return;
+        };
+        let is_done = progress.finished || progress.error.is_some();
+        if !is_done {
+            if progress.paused {
+                if ui.small_button("재개").clicked() {
+                    engine.resume(key);
+                    self.status = "다운로드 재개 요청됨".into();
+                }
+            } else if ui.small_button("중지").clicked() {
+                engine.pause(key);
+                self.status = "다운로드 일시정지 요청됨".into();
+            }
+            let delete_files_too = self
+                .config
+                .settings
+                .get("download_delete_files")
+                .and_then(|v| v.as_str())
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let label = if delete_files_too {
+                "삭제 (파일 포함)"
+            } else {
+                "삭제"
+            };
+            if ui.small_button(label).clicked() {
+                if delete_files_too {
+                    self.download_delete_confirm =
+                        Some((key.to_owned(), progress.name.clone()));
+                } else {
+                    engine.cancel(key, false);
+                    self.status = "다운로드 삭제 요청됨 · 받은 파일은 유지됩니다".into();
+                    let _ = self.log_sender.send(format!(
+                        "🗑 다운로드 삭제 · {}",
+                        truncate_label(&progress.name, 60)
+                    ));
+                }
+            }
+        } else if ui.small_button("목록에서 지우기").clicked() {
+            engine.dismiss(key);
+        }
+    }
+
+    /// Dedicated downloads tab.
+    fn downloads_panel_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("다운로드");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("스토어 열기").clicked() {
+                    self.folder_filter = "CATALOG".into();
+                    self.current_page = 0;
+                    self.config.settings.insert(
+                        "last_tab_key".into(),
+                        serde_json::Value::String("CATALOG".into()),
+                    );
+                    let _ = database::save_config(
+                        &self.base_dir.join("config.json"),
+                        &self.config,
+                    );
+                }
+            });
+        });
+        let save_dir = self.base_dir.join("downloads");
+        ui.label(format!(
+            "저장 위치: {}\\<게임 폴더>",
+            save_dir.display()
+        ));
+        ui.separator();
+        if self.torrent_progress.is_empty() {
+            ui.add_space(12.0);
+            ui.group(|ui| {
+                ui.heading("진행 중인 다운로드가 없습니다");
+                ui.label("스토어 탭에서 게임 업데이트나 DLC를 받으면 여기에 표시됩니다.");
+                if ui.button("스토어로 이동").clicked() {
+                    self.folder_filter = "CATALOG".into();
+                    self.current_page = 0;
+                    self.config.settings.insert(
+                        "last_tab_key".into(),
+                        serde_json::Value::String("CATALOG".into()),
+                    );
+                    let _ = database::save_config(
+                        &self.base_dir.join("config.json"),
+                        &self.config,
+                    );
+                }
+            });
+            return;
+        }
+        let active = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+            .count();
+        let paused = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, p)| p.paused && !p.finished)
+            .count();
+        let finished = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, p)| p.finished)
+            .count();
+        let failed = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, p)| p.error.is_some())
+            .count();
+        let total_speed: u64 = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+            .map(|(_, p)| p.download_speed_bps)
+            .sum();
+        ui.horizontal(|ui| {
+            if active > 0 {
+                ui.label(format!(
+                    "진행 중 {active}개 · 합계 {}/s",
+                    common::format_size(total_speed)
+                ));
+            }
+            if paused > 0 {
+                ui.label(format!("일시정지 {paused}개"));
+            }
+            if finished > 0 {
+                ui.label(format!("완료 {finished}개"));
+            }
+            if failed > 0 {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("실패 {failed}개"));
+            }
+        });
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let entries = self.torrent_progress.clone();
+                for (key, progress) in &entries {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            let label = if progress.name.is_empty() {
+                                key.as_str()
+                            } else {
+                                &progress.name
+                            };
+                            ui.heading(truncate_label(label, 70));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    self.download_row_buttons(ui, key, progress);
+                                },
+                            );
+                        });
+                        if progress.total_bytes > 0 {
+                            let fraction = progress.progress_bytes as f32
+                                / progress.total_bytes.max(1) as f32;
+                            if progress.finished {
+                                ui.add(
+                                    egui::ProgressBar::new(1.0)
+                                        .desired_height(22.0)
+                                        .fill(egui::Color32::from_rgb(46, 160, 67))
+                                        .text(format!(
+                                            "완료 {}",
+                                            common::format_size(progress.total_bytes)
+                                        )),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                                        .desired_height(22.0)
+                                        .text(format!(
+                                            "{} / {} · {}/s",
+                                            common::format_size(progress.progress_bytes),
+                                            common::format_size(progress.total_bytes),
+                                            common::format_size(progress.download_speed_bps),
+                                        )),
+                                );
+                            }
+                        } else {
+                            ui.label("크기 확인 중… (메타데이터 받는 중)");
+                        }
+                        ui.horizontal(|ui| {
+                            ui.label(&progress.state);
+                            if let Some(error) = &progress.error {
+                                ui.colored_label(
+                                    egui::Color32::LIGHT_RED,
+                                    truncate_label(error, 80),
+                                );
+                            }
+                        });
+                    });
+                    ui.add_space(6.0);
+                }
+            });
+    }
+
     fn start_titledb_download(&mut self) {
         if self.titledb_result.is_some() {
             return;
@@ -1091,12 +1750,15 @@ impl NslApp {
         let log = self.log_sender.clone();
         let (tx, rx) = mpsc::channel();
         self.media_result = Some(rx);
-        self.status = format!("{label} 다운로드 중…");
+        let progress = Arc::new(media::MediaProgress::default());
+        progress.begin(items.len());
+        self.media_progress = Some(progress.clone());
+        self.status = format!("{label} 다운로드 중… 0 / {}", items.len());
         std::thread::spawn(move || {
             let n = if screenshots {
-                media::download_screenshots(&cache, &items)
+                media::download_screenshots(&cache, &items, &progress)
             } else {
-                media::download_icons(&cache, &items)
+                media::download_icons(&cache, &items, &progress)
             };
             let _ = log.send(format!("✅ {label} 작업 완료 · {n}개 저장"));
             let _ = tx.send(Ok((label, n)));
@@ -1323,6 +1985,164 @@ impl NslApp {
         };
         Ok(old.with_file_name(name))
     }
+    /// Folder tab labels, rebuilt only when the row set or folders change.
+    fn library_tabs_cached(&mut self) -> &[(String, String)] {
+        if self.cached_tabs_generation == self.rows_generation
+            && !self.cached_tabs.is_empty()
+        {
+            return &self.cached_tabs;
+        }
+        let base_count = self.rows.iter().filter(|row| row.has_base).count();
+        let mut tabs = vec![(String::new(), format!("전체 ({base_count})"))];
+        for folder in &self.folders {
+            let count = self
+                .rows
+                .iter()
+                .filter(|row| row.has_base && path_is_within(&row.path, folder))
+                .count();
+            let name = PathBuf::from(folder)
+                .file_name()
+                .map(|v| v.to_string_lossy().into_owned())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| folder.clone());
+            tabs.push((folder.clone(), format!("{name} ({count})")));
+        }
+        tabs.push((
+            "MISSING_UPDATES".into(),
+            format!("미보유 업데이트 ({})", self.cached_missing_updates),
+        ));
+        tabs.push((
+            "MISSING_DLCS".into(),
+            format!("미보유 DLC ({})", self.cached_missing_dlcs),
+        ));
+        tabs.push(("CATALOG".into(), "스토어".into()));
+        tabs.push((
+            "DOWNLOADS".into(),
+            if self.torrent_progress.is_empty() {
+                "다운로드".into()
+            } else {
+                format!("다운로드 ({})", self.torrent_progress.len())
+            },
+        ));
+        self.cached_tabs = tabs;
+        self.cached_tabs_generation = self.rows_generation;
+        &self.cached_tabs
+    }
+
+    /// Missing-update / missing-DLC counts and duplicate groups, computed once
+    /// per row generation instead of every frame.
+    fn refresh_library_stats(&mut self) {
+        if self.cached_stats_generation == self.rows_generation {
+            return;
+        }
+        self.cached_missing_updates = self
+            .rows
+            .iter()
+            .filter(|row| row.has_base && self.row_is_missing_update(row))
+            .count();
+        self.cached_missing_dlcs = self
+            .rows
+            .iter()
+            .filter(|row| row.has_base && self.row_has_missing_dlc(row))
+            .count();
+        self.cached_duplicates = self.duplicate_title_groups();
+        self.cached_stats_generation = self.rows_generation;
+    }
+
+    /// Screenshot files for the selected game, resolved only when the
+    /// selection changes.
+    fn selected_screenshot_paths_cached(&mut self) -> Vec<PathBuf> {
+        if self.cached_screenshot_selection == self.selected {
+            return self.cached_screenshot_paths.clone();
+        }
+        self.cached_screenshot_selection = self.selected;
+        let paths: Vec<PathBuf> = self
+            .selected
+            .and_then(|id| self.rows.iter().find(|r| r.id == id))
+            .map(|row| {
+                let dir = self.screenshot_dir.join(&row.title_id);
+                let mut files = std::fs::read_dir(dir)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| {
+                        p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| {
+                                ["jpg", "jpeg", "png", "webp"]
+                                    .contains(&e.to_ascii_lowercase().as_str())
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>();
+                files.sort();
+                files.into_iter().take(6).collect()
+            })
+            .unwrap_or_default();
+        self.cached_screenshot_paths = paths.clone();
+        paths
+    }
+
+    /// Filtered + sorted library view, rebuilt only when an input changes.
+    ///
+    /// The naive version cloned and sorted all 800+ `GameFile` rows on every
+    /// frame, which allocated ~16k strings per frame and made the library view
+    /// stutter. This keeps the computation off the hot path.
+    fn library_rows_cached(&mut self) -> &[library::GameFile] {
+        let key = FilterKey {
+            search: self.search_committed.clone(),
+            kind: self.kind_filter.clone(),
+            folder: self.folder_filter.clone(),
+            sort_column: self.sort_column.clone(),
+            sort_desc: self.sort_desc,
+            rows_len: self.rows.len(),
+            rows_generation: self.rows_generation,
+        };
+        if self.filtered_key.as_ref() == Some(&key) {
+            return &self.filtered_rows;
+        }
+        let mut matching = library::visible(&self.rows, &self.search_committed)
+            .filter(|row| self.row_matches_current_filter(row))
+            .cloned()
+            .collect::<Vec<_>>();
+        matching.sort_by(|a, b| {
+            let ordering = match self.sort_column.as_str() {
+                "id" => a.title_id.cmp(&b.title_id),
+                "type" => a.content_type.cmp(&b.content_type),
+                "version" => a.version.cmp(&b.version),
+                "latest_ver" => a.latest_version.cmp(&b.latest_version),
+                "dlc" => a.dlc_count.cmp(&b.dlc_count),
+                "size" => a.size.cmp(&b.size),
+                "path" => a.path.to_lowercase().cmp(&b.path.to_lowercase()),
+                "status" => {
+                    let status = |row: &library::GameFile| {
+                        if row.latest_version == 0 {
+                            0
+                        } else if row.version.max(row.update_version) < row.latest_version {
+                            1
+                        } else {
+                            2
+                        }
+                    };
+                    status(a).cmp(&status(b))
+                }
+                _ => a
+                    .title_name
+                    .to_lowercase()
+                    .cmp(&b.title_name.to_lowercase()),
+            };
+            if self.sort_desc {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        });
+        self.filtered_rows = matching;
+        self.filtered_key = Some(key);
+        &self.filtered_rows
+    }
+
     fn row_matches_current_filter(&self, row: &library::GameFile) -> bool {
         let exception_update = self
             .config
@@ -1379,12 +2199,6 @@ impl NslApp {
             _ => true,
         }
     }
-    fn missing_update_count(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| row.has_base && self.row_is_missing_update(row))
-            .count()
-    }
     fn row_is_missing_update(&self, row: &library::GameFile) -> bool {
         let excluded = self
             .config
@@ -1410,12 +2224,6 @@ impl NslApp {
                 .split(',')
                 .any(|value| value.trim().eq_ignore_ascii_case(id))
         })
-    }
-    fn missing_dlc_count(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| row.has_base && self.row_has_missing_dlc(row))
-            .count()
     }
     fn duplicate_title_groups(&self) -> Vec<(String, String, Vec<String>)> {
         let mut grouped: HashMap<String, Vec<&library::GameFile>> = HashMap::new();
@@ -1461,7 +2269,7 @@ impl NslApp {
         }
         let mut changes = Vec::new();
         let mut unprocessable = 0usize;
-        for row in library::visible(&self.rows, &self.search) {
+        for row in library::visible(&self.rows, &self.search_committed) {
             if !self.row_matches_current_filter(row) {
                 continue;
             }
@@ -1759,6 +2567,10 @@ impl NslApp {
             (
                 "제외 설정",
                 "미보유 목록(누락된 업데이트 / DLC)에서 제외할 ID를 입력합니다. 여러 개는 줄바꿈으로 구분하세요.",
+            ),
+            (
+                "다운로드",
+                "스토어 토렌트 다운로드의 저장 위치와 삭제 동작을 설정합니다.",
             ),
         ];
         egui::Frame::none()
@@ -2392,7 +3204,7 @@ impl NslApp {
                                 serde_json::Value::String(source),
                             );
                         }
-                        _ => {
+                        5 => {
                             let width = ui.available_width();
                             ui.add_space(8.0);
                             let input_height = ((ui.available_height() - 180.0) / 2.0).max(120.0);
@@ -2455,6 +3267,101 @@ impl NslApp {
                                 }
                             }
                         }
+                        6 => {
+                            let mut delete_files = self
+                                .config
+                                .settings
+                                .get("download_delete_files")
+                                .and_then(|v| v.as_str())
+                                .map(|v| v == "1")
+                                .unwrap_or(false);
+                            ui.heading("삭제 동작");
+                            ui.add_space(4.0);
+                            if ui
+                                .checkbox(
+                                    &mut delete_files,
+                                    "다운로드 탭의 「삭제」에서 받은 파일도 함께 삭제",
+                                )
+                                .changed()
+                            {
+                                self.config.settings.insert(
+                                    "download_delete_files".into(),
+                                    serde_json::Value::String(
+                                        if delete_files { "1" } else { "0" }.into(),
+                                    ),
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "끔(기본): 토렌트만 제거하고 받은 파일은 그대로 둡니다.\n\
+                                     씀: 받은 파일까지 완전히 삭제합니다. 되돌릴 수 없으니 주의하세요.",
+                                )
+                                .color(egui::Color32::GRAY),
+                            );
+                            ui.add_space(16.0);
+                            ui.heading("저장 위치");
+                            ui.add_space(4.0);
+                            let save_dir = self.base_dir.join("downloads");
+                            ui.label(save_dir.display().to_string());
+                            if ui.button("폴더 열기").clicked() {
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(&save_dir)
+                                    .spawn();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "모든 스토어 다운로드는 이 폴더 아래의 게임별 폴더에 저장됩니다.",
+                                )
+                                .color(egui::Color32::GRAY),
+                            );
+                            ui.add_space(16.0);
+                            ui.heading("세션 데이터");
+                            ui.add_space(4.0);
+                            let session_dir = torrent::TorrentEngine::session_state_path(
+                                &self.base_dir.join("downloads"),
+                            );
+                            ui.label(session_dir.display().to_string());
+                            ui.label(
+                                egui::RichText::new(
+                                    "이어받기 정보와 토렌트 메타데이터가 저장되는 곳입니다.\n\
+                                     지우면 진행 중인 다운로드가 처음부터 다시 받아집니다.",
+                                )
+                                .color(egui::Color32::GRAY),
+                            );
+                            ui.add_space(4.0);
+                            if ui
+                                .add_enabled(
+                                    self.torrent_progress.is_empty(),
+                                    egui::Button::new("세션 데이터 삭제"),
+                                )
+                                .clicked()
+                            {
+                                match torrent::TorrentEngine::clear_session_state(
+                                    &self.base_dir.join("downloads"),
+                                ) {
+                                    Ok(freed) => {
+                                        self.status = format!(
+                                            "세션 데이터 삭제 완료 ({})",
+                                            common::format_size(freed)
+                                        );
+                                        let _ = self.log_sender.send(format!(
+                                            "🧹 세션 데이터 삭제 · {}",
+                                            session_dir.display()
+                                        ));
+                                    }
+                                    Err(e) => self.status = e.to_string(),
+                                }
+                            }
+                            if !self.torrent_progress.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "진행 중인 다운로드가 있어 지금은 삭제할 수 없습니다.",
+                                    )
+                                    .color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                     ui.add_space(24.0);
                 },
@@ -2815,6 +3722,13 @@ impl NslApp {
             (self.update_prepare_result.is_some(), "업데이트 다운로드"),
             (self.orphan_cleanup_result.is_some(), "미디어 캐시 정리"),
             (self.translate_result.is_some(), "설명 번역"),
+            (self.catalog_result.is_some(), "카탈로그 다운로드"),
+            (
+                self.torrent_progress
+                    .iter()
+                    .any(|(_, p)| !p.finished && p.error.is_none() && !p.paused),
+                "토렌트 다운로드",
+            ),
         ]
         .into_iter()
         .filter_map(|(active, label)| active.then_some(label))
@@ -2824,6 +3738,13 @@ impl NslApp {
             self.log_open = true;
         }
         self.was_working = is_working;
+        if self
+            .torrent_progress
+            .iter()
+            .any(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
         let close_requested = ctx.input(|input| input.viewport().close_requested());
         if close_requested && !self.exit_confirmed && !active_tasks.is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2899,12 +3820,13 @@ impl NslApp {
             match done {
                 Ok(rows) => {
                     self.rows = rows;
+                    self.rows_generation = self.rows_generation.wrapping_add(1);
                     match self.db.stats() {
                         Ok(stats) => self.stats = stats,
                         Err(error) => self.status = format!("DB 통계를 읽지 못했습니다: {error}"),
                     }
                     if self.view_mode == "grid" && self.selected.is_none() {
-                        self.selected = library::visible(&self.rows, &self.search)
+                        self.selected = library::visible(&self.rows, &self.search_committed)
                             .filter(|row| self.row_matches_current_filter(row))
                             .min_by(|a, b| {
                                 a.title_name
@@ -2934,6 +3856,78 @@ impl NslApp {
             }
         } else if self.bulk_rename_result.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let catalog_done = self
+            .catalog_result
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(done) = catalog_done {
+            self.catalog_result = None;
+            match done {
+                Ok(count) => {
+                    self.status = format!("카탈로그 {count}개 항목 준비 완료");
+                    if let Some(state) = catalog::load(&self.base_dir) {
+                        self.catalog_state = state;
+                        self.catalog_page = 0;
+                    }
+                }
+                Err(e) => self.status = e,
+            }
+        } else if self.catalog_result.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        let cover_done = self
+            .catalog_cover_queue
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok());
+        if let Some(done) = cover_done {
+            self.catalog_cover_queue = None;
+            match done {
+                Ok(fetched) if fetched > 0 => {
+                    self.catalog_cover_missing.clear();
+                    self.status = format!("스토어 커버 {fetched}개 받음");
+                    ctx.request_repaint();
+                }
+                Ok(_) => {}
+                Err(e) => self.status = e,
+            }
+        } else if self.catalog_cover_queue.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if let Some(engine) = &self.torrent_engine {
+            let was_active = self
+                .torrent_progress
+                .iter()
+                .any(|(_, p)| !p.finished && p.error.is_none() && !p.paused);
+            let (snapshot, completions) = engine.poll();
+            let now_active = snapshot
+                .iter()
+                .any(|(_, p)| !p.finished && p.error.is_none() && !p.paused);
+            if was_active && !now_active {
+                self.start_reload();
+            }
+            for (key, result) in completions {
+                let label = snapshot
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, p)| p.name.clone())
+                    .unwrap_or_else(|| key.clone());
+                match result {
+                    Ok(()) => {
+                        let _ = self
+                            .log_sender
+                            .send(format!("✅ 다운로드 완료 · {}", truncate_label(&label, 60)));
+                        self.status = format!("다운로드 완료: {}", truncate_label(&label, 60));
+                    }
+                    Err(error) => {
+                        let _ = self.log_sender.send(format!(
+                            "❌ 다운로드 실패 · {} · {error}",
+                            truncate_label(&label, 60)
+                        ));
+                    }
+                }
+            }
+            self.torrent_progress = snapshot;
         }
         let update_check_done = self
             .update_check_result
@@ -2996,11 +3990,13 @@ impl NslApp {
         let media_done = self.media_result.as_ref().and_then(|rx| rx.try_recv().ok());
         if let Some(done) = media_done {
             self.media_result = None;
+            self.media_progress = None;
             match done {
                 Ok((label, n)) => {
                     self.status = format!("{label} 다운로드 완료 · {n}장 저장");
                     self.invalidate_icons();
                     self.screenshot_textures.clear();
+                    self.cached_screenshot_selection = None;
                     self.start_pending_media();
                 }
                 Err(e) => self.status = e,
@@ -3073,30 +4069,8 @@ impl NslApp {
             self.ensure_icon_texture(ctx, &key, &mut budget);
             self.touch_icon(&key);
         }
-        let selected_screenshot_paths: Vec<PathBuf> = self
-            .selected
-            .and_then(|id| self.rows.iter().find(|r| r.id == id))
-            .map(|row| {
-                let dir = self.screenshot_dir.join(&row.title_id);
-                let mut files = std::fs::read_dir(dir)
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| {
-                        p.extension()
-                            .and_then(|e| e.to_str())
-                            .map(|e| {
-                                ["jpg", "jpeg", "png", "webp"]
-                                    .contains(&e.to_ascii_lowercase().as_str())
-                            })
-                            .unwrap_or(false)
-                    })
-                    .collect::<Vec<_>>();
-                files.sort();
-                files.into_iter().take(6).collect()
-            })
-            .unwrap_or_default();
+        self.refresh_library_stats();
+        let selected_screenshot_paths = self.selected_screenshot_paths_cached();
         for path in &selected_screenshot_paths {
             let key = path.to_string_lossy().into_owned();
             if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -3115,7 +4089,19 @@ impl NslApp {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             top_bar(self, ui, ctx, &active_tasks);
         });
-        if self.search != search_before || self.kind_filter != filter_before {
+        if self.search != search_before {
+            self.search_pending =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+        }
+        if let Some(deadline) = self.search_pending {
+            if std::time::Instant::now() >= deadline {
+                self.search_pending = None;
+                if self.search_committed != self.search {
+                    self.search_committed = self.search.clone();
+                }
+            }
+        }
+        if self.search_committed != search_before || self.kind_filter != filter_before {
             self.current_page = 0;
         }
         if self.kind_filter != filter_before && !self.folder_filter.is_empty() {
@@ -3129,11 +4115,14 @@ impl NslApp {
         if self.folder_filter != folder_filter_before {
             self.current_page = 0;
         }
-        if self.search != search_before
+        if self.search_committed != search_before
             || self.kind_filter != filter_before
             || self.folder_filter != folder_filter_before
         {
             self.selected = None;
+        }
+        if self.search_pending.is_some() || self.catalog_search_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         let bottom_height = if self.log_open { 205.0 } else { 26.0 };
         let mut close_log = false;
@@ -3185,6 +4174,45 @@ impl NslApp {
                 }
                 ui.horizontal(|ui| {
                     ui.label(self.status.as_str());
+                    let active = self
+                        .torrent_progress
+                        .iter()
+                        .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+                        .count();
+                    if active > 0 {
+                        let total_speed: u64 = self
+                            .torrent_progress
+                            .iter()
+                            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+                            .map(|(_, p)| p.download_speed_bps)
+                            .sum();
+                        let done: u64 = self
+                            .torrent_progress
+                            .iter()
+                            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+                            .map(|(_, p)| p.progress_bytes)
+                            .sum();
+                        let total: u64 = self
+                            .torrent_progress
+                            .iter()
+                            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
+                            .map(|(_, p)| p.total_bytes)
+                            .sum();
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⬇ {active}개 다운로드 중 · {} / {} · {}/s",
+                                common::format_size(done),
+                                if total > 0 {
+                                    common::format_size(total)
+                                } else {
+                                    "—".into()
+                                },
+                                common::format_size(total_speed),
+                            ))
+                            .color(ui.visuals().hyperlink_color),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(self.resource_usage_text())
@@ -3280,29 +4308,7 @@ impl NslApp {
                         );
                     }
                 }
-                let base_count = self.rows.iter().filter(|row| row.has_base).count();
-                let mut folder_tabs = vec![(String::new(), format!("전체 ({base_count})"))];
-                for folder in &self.folders {
-                    let count = self
-                        .rows
-                        .iter()
-                        .filter(|row| row.has_base && path_is_within(&row.path, folder))
-                        .count();
-                    let name = PathBuf::from(folder)
-                        .file_name()
-                        .map(|v| v.to_string_lossy().into_owned())
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| folder.clone());
-                    folder_tabs.push((folder.clone(), format!("{name} ({count})")));
-                }
-                folder_tabs.push((
-                    "MISSING_UPDATES".into(),
-                    format!("미보유 업데이트 ({})", self.missing_update_count()),
-                ));
-                folder_tabs.push((
-                    "MISSING_DLCS".into(),
-                    format!("미보유 DLC ({})", self.missing_dlc_count()),
-                ));
+                let folder_tabs = self.library_tabs_cached().to_vec();
                 egui::ScrollArea::horizontal()
                     .id_salt("directory_tabs")
                     .show(ui, |ui| {
@@ -3336,6 +4342,29 @@ impl NslApp {
                         });
                     });
                 ui.separator();
+                // Media download progress (icons / screenshots). Shown above the
+                // library so a long batch pass is never invisible.
+                if let Some(progress) = &self.media_progress {
+                    let (completed, total, saved) = progress.snapshot();
+                    let fraction = if total == 0 {
+                        0.0
+                    } else {
+                        completed as f32 / total as f32
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "아이콘/스크린샷 {completed} / {total} · 새로 저장 {saved}개"
+                        ));
+                        ui.add(
+                            egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                                .desired_width(ui.available_width().min(320.0))
+                                .text(format!("{:.0}%", fraction * 100.0)),
+                        );
+                    });
+                    if fraction < 1.0 {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                    }
+                }
                 let library_focus_id = ui.make_persistent_id("library_keyboard_navigation");
                 let library_focus_rect = ui.available_rect_before_wrap();
                 let _library_focus_anchor = ui.interact(
@@ -3343,65 +4372,77 @@ impl NslApp {
                     library_focus_id,
                     egui::Sense::focusable_noninteractive(),
                 );
+                if self.folder_filter == "CATALOG" {
+                    self.catalog_panel_ui(ui, ctx);
+                    return;
+                }
+                if self.folder_filter == "DOWNLOADS" {
+                    self.downloads_panel_ui(ui);
+                    return;
+                }
                 let (grid_columns, grid_card_width, grid_thumbnail_size) =
                     library_grid_dimensions(ui.available_width());
                 if self.rows.is_empty() {
-                    ui.group(|ui| {
-                        ui.heading("시작하기");
-                        ui.label(
-                            "1. prod.keys를 프로그램 폴더 또는 %USERPROFILE%\\.switch에 둡니다.",
-                        );
-                        ui.label("2. 타이틀 DB를 다운로드하거나 로컬 DB를 매칭합니다.");
-                        ui.label("3. 설정에서 스캔 폴더를 추가한 뒤 전체 스캔을 실행합니다.");
-                        ui.label(if scanner::has_prod_keys() {
-                            "prod.keys 발견됨".to_owned()
-                        } else {
-                            "prod.keys 없음".to_owned()
+                    // Full-screen centered welcome, matching the Python build
+                    // instead of a small inline box above an empty list.
+                    let full = ui.available_rect_before_wrap();
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(full), |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space((full.height() * 0.28).max(40.0));
+                            ui.heading(
+                                egui::RichText::new("Nintendo Switch Library")
+                                    .size(28.0)
+                                    .strong(),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("라이브러리가 비어 있습니다")
+                                    .size(16.0),
+                            );
+                            ui.add_space(24.0);
+                            ui.label(
+                                "1. prod.keys를 프로그램 폴더 또는 %USERPROFILE%\\.switch에 둡니다.",
+                            );
+                            ui.label("2. 타이틀 DB를 다운로드하거나 로컬 DB를 매칭합니다.");
+                            ui.label("3. 설정에서 스캔 폴더를 추가한 뒤 전체 스캔을 실행합니다.");
+                            ui.add_space(16.0);
+                            let has_keys = scanner::has_prod_keys();
+                            if has_keys {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(46, 160, 67),
+                                    "prod.keys 발견됨",
+                                );
+                            } else {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(207, 34, 46),
+                                    "prod.keys 없음",
+                                );
+                            }
+                            ui.add_space(20.0);
+                            ui.horizontal(|ui| {
+                                let total = ui.available_width();
+                                ui.add_space((total * 0.5 - 140.0).max(0.0));
+                                if ui.button("설정 열기").clicked() {
+                                    self.settings_open = true;
+                                }
+                                if ui.button("타이틀 DB 다운로드").clicked() {
+                                    self.start_titledb_download();
+                                }
+                                if ui.button("빠른 스캔").clicked() {
+                                    self.start_scan(true);
+                                }
+                            });
                         });
                     });
+                    return;
                 }
-                let mut matching = library::visible(&self.rows, &self.search)
-                    .filter(|row| self.row_matches_current_filter(row))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                matching.sort_by(|a, b| {
-                    let ordering = match self.sort_column.as_str() {
-                        "id" => a.title_id.cmp(&b.title_id),
-                        "type" => a.content_type.cmp(&b.content_type),
-                        "version" => a.version.cmp(&b.version),
-                        "latest_ver" => a.latest_version.cmp(&b.latest_version),
-                        "dlc" => a.dlc_count.cmp(&b.dlc_count),
-                        "size" => a.size.cmp(&b.size),
-                        "path" => a.path.to_lowercase().cmp(&b.path.to_lowercase()),
-                        "status" => {
-                            let status = |row: &library::GameFile| {
-                                if row.latest_version == 0 {
-                                    0
-                                } else if row.version.max(row.update_version) < row.latest_version {
-                                    1
-                                } else {
-                                    2
-                                }
-                            };
-                            status(a).cmp(&status(b))
-                        }
-                        _ => a
-                            .title_name
-                            .to_lowercase()
-                            .cmp(&b.title_name.to_lowercase()),
-                    };
-                    if self.sort_desc {
-                        ordering.reverse()
-                    } else {
-                        ordering
-                    }
-                });
+                let matching = self.library_rows_cached().to_vec();
                 let paging_on = self
                     .config
                     .settings
                     .get("paging_on")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("0")
+                    .unwrap_or("1")
                     == "1";
                 let page_size = self
                     .config
@@ -3410,7 +4451,7 @@ impl NslApp {
                     .and_then(|v| v.as_str())
                     .and_then(|v| v.parse::<usize>().ok())
                     .filter(|v| *v > 0)
-                    .unwrap_or(500)
+                    .unwrap_or(200)
                     .min(99_999);
                 let page_count = matching.len().div_ceil(page_size).max(1);
                 self.current_page = self.current_page.min(page_count - 1);
@@ -3522,33 +4563,39 @@ impl NslApp {
                         }
                     });
                 }
+                // `matching` is already filtered+sorted by the cache. Only the
+                // visible page is cloned into owned rows for rendering.
                 let page_start = if paging_on {
                     self.current_page * page_size
                 } else {
                     0
                 };
-                let page_items = matching
+                let page_items: Vec<library::GameFile> = matching
                     .iter()
                     .skip(page_start)
                     .take(if paging_on { page_size } else { usize::MAX })
                     .cloned()
-                    .collect::<Vec<_>>();
+                    .collect();
                 if self.view_mode == "grid" {
+                    // Virtualized grid: only rows inside the viewport are built.
+                    // Building every card (800+ icons) each frame was the main
+                    // cause of the library stutter.
+                    let row_height = grid_thumbnail_size + 38.0 + 12.0;
+                    let total_rows = page_items.len().div_ceil(grid_columns.max(1));
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
+                        .show_rows(ui, row_height, total_rows, |ui, row_range| {
                             egui::Frame::none()
                                 .fill(ui.visuals().faint_bg_color)
                                 .inner_margin(egui::Margin::ZERO)
                                 .show(ui, |ui| {
-                                    egui::Grid::new("library_cards")
-                                        .num_columns(grid_columns)
-                                        .min_col_width(grid_card_width)
-                                        .max_col_width(grid_card_width)
-                                        .spacing(egui::vec2(0.0, 0.0))
-                                        .show(ui, |ui| {
-                                            let mut icon_budget = ICON_LOAD_BUDGET;
-                                            for (index, row) in page_items.iter().enumerate() {
+                                    let mut icon_budget = ICON_LOAD_BUDGET;
+                                    for row_index in row_range {
+                                        let start = row_index * grid_columns;
+                                        let end = (start + grid_columns).min(page_items.len());
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 0.0;
+                                            for row in page_items.iter().skip(start).take(end - start) {
                                                 self.ensure_icon_texture(
                                                     ctx,
                                                     &row.title_id,
@@ -3656,11 +4703,9 @@ impl NslApp {
                                                         None,
                                                     );
                                                 }
-                                                if (index + 1) % grid_columns == 0 {
-                                                    ui.end_row();
-                                                }
                                             }
                                         });
+                                    }
                                 });
                         });
                 } else {
@@ -3965,7 +5010,7 @@ impl NslApp {
                             });
                     });
                 }
-                let duplicate_groups = self.duplicate_title_groups();
+                let duplicate_groups = self.cached_duplicates.clone();
                 if !duplicate_groups.is_empty() {
                     ui.collapsing(
                         format!("중복 베이스 게임 {}개", duplicate_groups.len()),
@@ -4242,6 +5287,39 @@ impl NslApp {
                             }
                             if ui.button("취소").clicked() {
                                 self.rename_preview = None;
+                            }
+                        });
+                    });
+                },
+            );
+        }
+        if let Some((key, name)) = self.download_delete_confirm.clone() {
+            show_centered_popup(
+                ctx,
+                "download_delete_confirm",
+                "다운로드 삭제 확인",
+                None,
+                |window| window,
+                |ui| {
+                    ui.label(format!("「{}」", truncate_label(&name, 60)));
+                    ui.label(
+                        "이 다운로드를 삭제하면서 받은 파일까지 완전히 삭제합니다. 되돌릴 수 없습니다.",
+                    );
+                    popup_footer(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.button("파일까지 삭제").clicked() {
+                                self.download_delete_confirm = None;
+                                if let Some(engine) = &self.torrent_engine {
+                                    engine.cancel(&key, true);
+                                }
+                                self.status = "다운로드 및 파일 삭제 요청됨".into();
+                                let _ = self.log_sender.send(format!(
+                                    "🗑 다운로드 + 파일 삭제 · {}",
+                                    truncate_label(&name, 60)
+                                ));
+                            }
+                            if ui.button("취소").clicked() {
+                                self.download_delete_confirm = None;
                             }
                         });
                     });

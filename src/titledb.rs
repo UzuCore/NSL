@@ -286,15 +286,31 @@ pub fn download_full(dir: &Path, source: &str) -> Result<Vec<Entry>> {
         ),
     ];
     for (name, url) in endpoints {
-        let response=ureq::get(url).set("User-Agent","Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36").set("Accept","application/json, text/plain, */*").call();
+        let response = ureq::get(url)
+            .set(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+            )
+            .set("Accept", "application/json, text/plain, */*")
+            .call();
         match response {
             Ok(resp) => {
-                let body = resp.into_string()?;
-                let _: Value = serde_json::from_str(&body)
-                    .with_context(|| format!("{name} 응답이 올바른 JSON이 아닙니다"))?;
+                // `into_string()` caps at 10 MiB, but titles.json is ~165 MiB
+                // and KR.ko.json ~55 MiB, so stream the body to disk directly
+                // and validate it from the file instead of buffering in memory.
                 let tmp = dir.join(format!("{name}.tmp"));
-                fs::write(&tmp, body)?;
-                let target = dir.join(name);
+                {
+                    let mut reader = resp.into_reader();
+                    let mut file = fs::File::create(&tmp)
+                        .with_context(|| format!("{name} 파일을 만들지 못했습니다"))?;
+                    std::io::copy(&mut reader, &mut file)
+                        .with_context(|| format!("{name} 다운로드 중 오류"))?;
+                }
+                let bytes = fs::read(&tmp)
+                    .with_context(|| format!("{name} 파일을 읽지 못했습니다"))?;
+                serde_json::from_slice::<Value>(&bytes)
+                    .with_context(|| format!("{name} 응답이 올바른 JSON이 아닙니다"))?;
+                drop(bytes);                let target = dir.join(name);
                 if target.exists() {
                     fs::remove_file(&target)?
                 }

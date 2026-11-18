@@ -54,7 +54,8 @@ pub fn decompress(src: &Path, work_root: &Path) -> Result<PathBuf> {
     );
     anyhow::ensure!(src.is_file(), "원본 파일을 찾을 수 없습니다");
     std::fs::create_dir_all(work_root)?;
-    cleanup_workspaces(work_root);
+    // Never erase previous conversion workspaces here: a running emulator may
+    // still have the decompressed output open. Cleanup must be explicit.
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let workspace = work_root.join(format!("NSL_Workspace_{stamp}"));
     std::fs::create_dir_all(&workspace)?;

@@ -20,14 +20,30 @@ pub fn base_dir() -> PathBuf {
 /// in the project root, so look there first. Falling back to the executable
 /// folder keeps true portable installs working.
 fn resolve_data_dir(executable_dir: PathBuf) -> PathBuf {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(parent) = executable_dir.parent() {
-        // target/release -> target -> project root
-        if let Some(root) = parent.parent() {
-            candidates.push(root.to_path_buf());
+    // Only known development build paths borrow the project-root database.
+    // A portable installation must never adopt an unrelated parent library.
+    let candidates: Vec<PathBuf> = match executable_dir.file_name().and_then(|v| v.to_str()) {
+        Some("dist-rust") => executable_dir
+            .parent()
+            .map(PathBuf::from)
+            .into_iter()
+            .collect(),
+        Some("release")
+            if executable_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|v| v.to_str())
+                == Some("target") =>
+        {
+            executable_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .map(PathBuf::from)
+                .into_iter()
+                .collect()
         }
-        candidates.push(parent.to_path_buf());
-    }
+        _ => Vec::new(),
+    };
     for candidate in candidates {
         if candidate.join("library.db").is_file()
             && candidate.join("config.json").is_file()
@@ -139,5 +155,14 @@ mod tests {
         std::fs::create_dir_all(&exe_dir).unwrap();
         fake_data_dir(&exe_dir);
         assert_eq!(resolve_data_dir(exe_dir.clone()), exe_dir);
+    }
+
+    #[test]
+    fn nested_portable_install_does_not_take_parent_database() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_data_dir(dir.path());
+        let portable = dir.path().join("MyApp");
+        std::fs::create_dir_all(&portable).unwrap();
+        assert_eq!(resolve_data_dir(portable.clone()), portable);
     }
 }

@@ -196,23 +196,14 @@ fn save_icon(data: &[u8], target: &Path) -> bool {
     let image = image
         .resize_exact(120, 120, image::imageops::FilterType::Lanczos3)
         .to_rgb8();
-    if let Some(parent) = target.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return false;
-        }
-    }
-    let temp = target.with_extension("png.tmp");
-    if image
-        .save_with_format(&temp, image::ImageFormat::Png)
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    if image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut bytes, image::ImageFormat::Png)
         .is_err()
     {
         return false;
     }
-    if target.exists() && std::fs::remove_file(target).is_err() {
-        let _ = std::fs::remove_file(temp);
-        return false;
-    }
-    std::fs::rename(temp, target).is_ok()
+    crate::database::atomic_write(target, &bytes.into_inner()).is_ok()
 }
 
 fn package_index(file: &mut File, path: &Path, size: u64) -> Option<Index> {

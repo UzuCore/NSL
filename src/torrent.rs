@@ -10,7 +10,7 @@ type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
@@ -34,8 +34,35 @@ pub struct TorrentProgress {
 
 /// `(job key, progress)` pairs as delivered to the UI.
 pub type ProgressList = Vec<(String, TorrentProgress)>;
-/// `(job key, final result)` for jobs that finished since the last poll.
-pub type CompletionList = Vec<(String, anyhow::Result<(), String>)>;
+/// Keep user commands separate from actual transfer completion.
+pub enum EngineNotice {
+    Download {
+        key: String,
+        result: Result<(), String>,
+    },
+    Command {
+        key: String,
+        action: &'static str,
+        result: Result<(), String>,
+    },
+}
+pub type CompletionList = Vec<EngineNotice>;
+
+fn safe_sub_folder(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn is_restorable_folder(output: &Path, default: &Path) -> bool {
+    let expected = default
+        .canonicalize()
+        .unwrap_or_else(|_| default.to_path_buf());
+    let actual = output
+        .canonicalize()
+        .unwrap_or_else(|_| output.to_path_buf());
+    // The torrent uses a dedicated child folder, not the session root.
+    actual.starts_with(expected)
+}
 
 /// Controls the engine executes against a torrent session.
 pub enum EngineCommand {
@@ -65,8 +92,7 @@ pub struct TorrentEngine {
     command_tx: mpsc::Sender<EngineCommand>,
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
-    handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
-    done_rx: Mutex<mpsc::Receiver<(String, anyhow::Result<(), String>)>>,
+    done_rx: Mutex<mpsc::Receiver<EngineNotice>>,
     counter: Arc<AtomicU64>,
 }
 
@@ -76,15 +102,23 @@ fn spawn_engine(
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
-    done_tx: mpsc::Sender<(String, Result<(), String>)>,
+    done_tx: mpsc::Sender<EngineNotice>,
 ) -> Result<()> {
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<std::result::Result<(), String>>(1);
     std::thread::Builder::new()
         .name("torrent-engine".into())
         .spawn(move || -> anyhow::Result<()> {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
-                .build()?;
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                    return Err(error.into());
+                }
+            };
             // Session state lives in the app folder (not inside `downloads`)
             // so the user can wipe the whole download tree without losing
             // resume data, and without seeing dot-folders among game files.
@@ -92,35 +126,36 @@ fn spawn_engine(
                 .parent()
                 .map(|parent| parent.join("torrent-session"))
                 .unwrap_or_else(|| default_folder.join(".rqbit-session"));
-            let expected_output =
-                default_folder.canonicalize().unwrap_or_else(|_| default_folder.clone());
             let session = runtime.block_on(Session::new_with_opts(
-                default_folder,
+                default_folder.clone(),
                 SessionOptions {
                     persistence: Some(SessionPersistenceConfig::Json {
                         folder: Some(persistence_folder),
                     }),
                     ..Default::default()
                 },
-            ))?;
+            ));
+            let session = match session {
+                Ok(session) => session,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!("토렌트 세션 초기화 실패: {error:#}")));
+                    return Err(error);
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
             // Torrents restored from the persisted session (a previous run)
             // resume downloading automatically but have no tracked job, so the
             // UI would show an empty download list. Adopt each of them into a
             // watch loop right away.
-            let restored: Vec<ManagedTorrentHandle> = session.with_torrents(|torrents| {
-                torrents.map(|(_, handle)| handle.clone()).collect()
-            });
+            let restored: Vec<ManagedTorrentHandle> = session
+                .with_torrents(|torrents| torrents.map(|(_, handle)| handle.clone()).collect());
             let mut stale_ids: Vec<librqbit::api::TorrentIdOrHash> = Vec::new();
             for handle in restored {
                 // A session saved by an older build may point at a scan folder
                 // (or a since-deleted path). Drop those entries so the user can
                 // re-download into the current downloads directory instead of
                 // seeing a stale 100% row with no files behind it.
-                let stale = !handle
-                    .output_folder()
-                    .canonicalize()
-                    .map(|p| p == expected_output)
-                    .unwrap_or(true);
+                let stale = !is_restorable_folder(handle.output_folder(), &default_folder);
                 if stale {
                     stale_ids.push(librqbit::api::TorrentIdOrHash::Id(handle.id()));
                     continue;
@@ -133,9 +168,23 @@ fn spawn_engine(
                 let cancels = cancels.clone();
                 let handles = handles.clone();
                 let session = session.clone();
-                runtime.spawn(watch_torrent(
-                    session, key, handle, progress, cancels, handles,
-                ));
+                let done_tx = done_tx.clone();
+                runtime.spawn(async move {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    if let Some(result) = watch_torrent(
+                        session,
+                        key.clone(),
+                        handle,
+                        progress,
+                        cancels,
+                        handles,
+                        cancel,
+                    )
+                    .await
+                    {
+                        let _ = done_tx.send(EngineNotice::Download { key, result });
+                    }
+                });
             }
             // Purge stale session entries (old output folders) off the runtime.
             if !stale_ids.is_empty() {
@@ -156,17 +205,25 @@ fn spawn_engine(
                 let handles = loop_handles.clone();
                 let done_tx = done_tx.clone();
                 runtime.spawn(async move {
-                    let result = match command {
+                    let notice = match command {
                         EngineCommand::Add(job) => {
                             run_job(session, job, progress, cancels, handles).await
                         }
                         EngineCommand::Pause(key) => {
-                            let outcome = pause_torrent(&session, &handles, &key, true).await;
-                            (key, outcome)
+                            let result = pause_torrent(&session, &handles, &key, true).await;
+                            Some(EngineNotice::Command {
+                                key,
+                                action: "pause",
+                                result,
+                            })
                         }
                         EngineCommand::Resume(key) => {
-                            let outcome = pause_torrent(&session, &handles, &key, false).await;
-                            (key, outcome)
+                            let result = pause_torrent(&session, &handles, &key, false).await;
+                            Some(EngineNotice::Command {
+                                key,
+                                action: "resume",
+                                result,
+                            })
                         }
                         EngineCommand::Cancel(key, delete_files) => {
                             // Signal the watch loop first so it exits; then
@@ -177,19 +234,38 @@ fn spawn_engine(
                                     flag.store(true, Ordering::Relaxed);
                                 }
                             }
-                            let outcome =
+                            let result =
                                 remove_torrent(&session, &handles, &key, delete_files).await;
-                            (key, outcome)
+                            if result.is_ok() {
+                                if let Ok(mut map) = progress.lock() {
+                                    map.remove(&key);
+                                }
+                                if let Ok(mut map) = cancels.lock() {
+                                    map.remove(&key);
+                                }
+                                if let Ok(mut map) = handles.lock() {
+                                    map.remove(&key);
+                                }
+                            }
+                            Some(EngineNotice::Command {
+                                key,
+                                action: "remove",
+                                result,
+                            })
                         }
                     };
-                    // The receiver may be gone during shutdown; that is fine.
-                    let _ = done_tx.send(result);
+                    if let Some(notice) = notice {
+                        let _ = done_tx.send(notice);
+                    }
                 });
             }
             Ok(())
         })
         .map_err(|e| anyhow::anyhow!("토렌트 엔진 스레드를 시작하지 못했습니다: {e}"))?;
-    Ok(())
+    let ready = ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .context("토렌트 엔진 초기화 응답 시간 초과")?;
+    ready.map_err(anyhow::Error::msg)
 }
 
 async fn pause_torrent(
@@ -223,6 +299,11 @@ async fn remove_torrent(
     let id = match handle {
         Some(handle) => TorrentIdOrHash::Id(handle.id()),
         None => {
+            // A magnet can still be fetching metadata: the shared cancel flag
+            // stops its future, with no managed torrent to delete yet.
+            if key.starts_with('t') {
+                return Ok(());
+            }
             // Restored torrents adopted as r{session id}; parse the id back.
             let restored_id = key
                 .strip_prefix('r')
@@ -248,11 +329,11 @@ async fn watch_torrent(
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
-) {
+    cancel: Arc<AtomicBool>,
+) -> Option<Result<(), String>> {
     if let Ok(mut map) = handles.lock() {
         map.insert(key.clone(), handle.clone());
     }
-    let cancel = Arc::new(AtomicBool::new(false));
     if let Ok(mut map) = cancels.lock() {
         map.insert(key.clone(), cancel.clone());
     }
@@ -267,10 +348,9 @@ async fn watch_torrent(
             if let Ok(mut map) = cancels.lock() {
                 map.remove(&key);
             }
-            if let Ok(mut map) = handles.lock() {
-                map.remove(&key);
-            }
-            return;
+            // Do not remove the managed handle here: the Cancel command still
+            // needs its session id to delete persistence and optional files.
+            return None;
         }
         let stats = handle.stats();
         let paused = handle.is_paused();
@@ -300,19 +380,24 @@ async fn watch_torrent(
             error: stats.error.clone(),
             download_speed_bps: if paused { 0 } else { live_speed_bps },
         };
-        let finished = update.finished || update.error.is_some();
+        let completed = update.finished;
+        let error = update.error.clone();
         if let Ok(mut map) = progress.lock() {
             map.insert(key.clone(), update);
         }
-        if finished {
+        if completed || error.is_some() {
             // Release the file locks so emulators can open the freshly
             // downloaded files immediately (rqbit keeps them open for seeding
             // otherwise, and the emulator then fails with permission denied).
-            let _ = session.pause(&handle).await;
+            let pause_result = session.pause(&handle).await;
             if let Ok(mut map) = cancels.lock() {
                 map.remove(&key);
             }
-            return;
+            return Some(match error {
+                Some(error) => Err(error),
+                None => pause_result
+                    .map_err(|e| format!("완료된 토렌트를 일시정지하지 못했습니다: {e:#}")),
+            });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -324,10 +409,28 @@ async fn run_job(
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
-) -> (String, Result<(), String>) {
+) -> Option<EngineNotice> {
     let key = job.key.clone();
-    let result = match add_torrent(&session, &job).await {
+    let added = tokio::select! {
+        result = add_torrent(&session, &job) => result,
+        _ = async {
+            while !job.cancel.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        } => return None,
+    };
+    let result = match added {
         Ok(handle) => {
+            if job.cancel.load(Ordering::Relaxed) {
+                return session
+                    .delete(TorrentIdOrHash::Id(handle.id()), false)
+                    .await
+                    .err()
+                    .map(|error| EngineNotice::Download {
+                        key,
+                        result: Err(format!("취소한 다운로드의 세션 정리 실패: {error:#}")),
+                    });
+            }
             // Hand the torrent over to the shared watch loop so pause/resume
             // and cancel keep working after the magnet handshake.
             watch_torrent(
@@ -337,9 +440,9 @@ async fn run_job(
                 progress,
                 cancels,
                 handles,
+                job.cancel,
             )
-            .await;
-            Ok(())
+            .await
         }
         Err(error) => {
             let text = format!("{error:#}");
@@ -353,10 +456,10 @@ async fn run_job(
             if let Ok(mut map) = progress.lock() {
                 map.insert(key.clone(), final_state);
             }
-            Err(text)
+            Some(Err(text))
         }
     };
-    (key, result)
+    result.map(|result| EngineNotice::Download { key, result })
 }
 
 async fn add_torrent(
@@ -402,7 +505,10 @@ impl TorrentEngine {
             return Ok(0);
         }
         let mut freed = 0u64;
-        for entry in walkdir::WalkDir::new(&path).into_iter().filter_map(|e| e.ok()) {
+        for entry in walkdir::WalkDir::new(&path)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if entry.file_type().is_file() {
                 freed += entry.metadata().map(|m| m.len()).unwrap_or(0);
             }
@@ -431,19 +537,21 @@ impl TorrentEngine {
             command_tx,
             progress,
             cancels,
-            handles,
             done_rx: Mutex::new(done_rx),
             counter: Arc::new(AtomicU64::new(1)),
         })
     }
 
     /// Queue a magnet for download. Returns the progress key.
-    pub fn start_download(
-        &self,
-        label: &str,
-        magnet: &str,
-        sub_folder: PathBuf,
-    ) -> Result<String> {
+    pub fn start_download(&self, label: &str, magnet: &str, sub_folder: PathBuf) -> Result<String> {
+        anyhow::ensure!(
+            safe_sub_folder(&sub_folder),
+            "다운로드 하위 폴더가 안전하지 않습니다"
+        );
+        anyhow::ensure!(
+            magnet.starts_with("magnet:?"),
+            "올바른 마그넷 링크가 아닙니다"
+        );
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
         let key = format!("t{seq}");
         let job = TorrentJob {
@@ -477,16 +585,12 @@ impl TorrentEngine {
 
     /// Pause a running download. Downloaded bytes are kept.
     pub fn pause(&self, key: &str) {
-        let _ = self
-            .command_tx
-            .send(EngineCommand::Pause(key.to_owned()));
+        let _ = self.command_tx.send(EngineCommand::Pause(key.to_owned()));
     }
 
     /// Resume a paused download.
     pub fn resume(&self, key: &str) {
-        let _ = self
-            .command_tx
-            .send(EngineCommand::Resume(key.to_owned()));
+        let _ = self.command_tx.send(EngineCommand::Resume(key.to_owned()));
     }
 
     /// Ask a running job to stop. The engine removes the torrent from the
@@ -500,15 +604,8 @@ impl TorrentEngine {
 
     /// Remove a finished/failed entry from the visible list only.
     pub fn dismiss(&self, key: &str) {
-        if let Ok(mut map) = self.progress.lock() {
-            map.remove(key);
-        }
-        if let Ok(mut cancels) = self.cancels.lock() {
-            cancels.remove(key);
-        }
-        if let Ok(mut handles) = self.handles.lock() {
-            handles.remove(key);
-        }
+        // Remove persistence too, otherwise dismissed jobs return on restart.
+        self.cancel(key, false);
     }
 
     /// Drain completion events and snapshot live progress for the UI.
@@ -517,11 +614,7 @@ impl TorrentEngine {
     pub fn poll(&self) -> (ProgressList, CompletionList) {
         let mut completions = Vec::new();
         loop {
-            let received = self
-                .done_rx
-                .lock()
-                .ok()
-                .and_then(|rx| rx.try_recv().ok());
+            let received = self.done_rx.lock().ok().and_then(|rx| rx.try_recv().ok());
             match received {
                 Some(event) => completions.push(event),
                 None => break,
@@ -560,13 +653,28 @@ mod tests {
         // by zero as soon as the first speed sample was due. The fixed
         // formula divides in f64 space, so any positive elapsed time yields
         // a finite speed.
-        let compute = |delta: u64, elapsed: f64| -> u64 {
-            (delta as f64 / elapsed.max(0.001)) as u64
-        };
+        let compute =
+            |delta: u64, elapsed: f64| -> u64 { (delta as f64 / elapsed.max(0.001)) as u64 };
         assert_eq!(compute(1_000_000, 0.5), 2_000_000);
         assert_eq!(compute(0, 0.5), 0);
         assert_eq!(compute(500, 2.0), 250);
         // A sub-millisecond elapsed value must not blow up either.
         assert!(compute(1, 0.0000001) > 0);
+    }
+
+    #[test]
+    fn resume_accepts_children_but_rejects_external_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("downloads");
+        let child = root.join("BASE-HASH");
+        let outside = temp.path().join("unrelated");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        assert!(is_restorable_folder(&root, &root));
+        assert!(is_restorable_folder(&child, &root));
+        assert!(!is_restorable_folder(&outside, &root));
+        assert!(safe_sub_folder(Path::new("BASE-HASH")));
+        assert!(!safe_sub_folder(Path::new("../escape")));
+        assert!(!safe_sub_folder(&child));
     }
 }

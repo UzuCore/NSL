@@ -2,7 +2,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView, ImageFormat};
 use rayon::prelude::*;
 use std::{
     io::{Cursor, Read},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -10,13 +10,8 @@ use std::{
     time::Duration,
 };
 
-/// Streaming download helper with an explicit byte cap.
-///
-/// `ureq`'s `into_string()` stops at 10 MiB, which silently broke the title
-/// database (~165 MiB) and would also break any large asset. Everything that
-/// downloads into memory goes through here so the limit is explicit and large
-/// enough, while still refusing runaway responses.
-pub const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+/// Images must be bounded before buffering, not just before decoding.
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 fn read_capped(reader: impl Read, cap: u64) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -35,24 +30,33 @@ fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
         .set("User-Agent", "Mozilla/5.0")
         .timeout(Duration::from_secs(15))
         .call()?;
-    let bytes = read_capped(response.into_reader(), MAX_DOWNLOAD_BYTES)?;
+    let bytes = read_capped(response.into_reader(), MAX_IMAGE_BYTES)?;
     anyhow::ensure!(bytes.len() > 1000, "image response too small");
     Ok(bytes)
 }
 /// Screenshots/icons are small; refuse anything absurd before decoding so a
 /// hostile or broken URL cannot exhaust memory inside the image decoder.
-const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
-
 fn image_bytes(data: &[u8], width: u32, format: ImageFormat) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
         (data.len() as u64) <= MAX_IMAGE_BYTES,
         "이미지가 너무 큽니다 ({} MB)",
         data.len() / (1024 * 1024)
     );
+    // Reject decompression bombs before allocating a decoded pixel buffer.
+    let header = image::ImageReader::new(Cursor::new(data)).with_guessed_format()?;
+    let (header_width, header_height) = header.into_dimensions()?;
+    anyhow::ensure!(
+        header_width > 0
+            && header_height > 0
+            && header_width <= 8192
+            && header_height <= 8192
+            && u64::from(header_width) * u64::from(header_height) <= 24_000_000,
+        "이미지 해상도가 허용 범위를 초과합니다"
+    );
     let img = image::load_from_memory(data)?;
     let (w, h) = img.dimensions();
     anyhow::ensure!(w > 0 && h > 0, "invalid image dimensions");
-    let target_h = ((h as f64 * width as f64 / w as f64).round() as u32).max(1);
+    let target_h = ((h as f64 * width as f64 / w as f64).round() as u32).clamp(1, 4096);
     let resized: DynamicImage = img
         .resize_exact(width, target_h, FilterType::Lanczos3)
         .to_rgb8()
@@ -66,15 +70,7 @@ fn write_image(path: &Path, bytes: &[u8], width: u32, format: ImageFormat) -> an
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut temp = PathBuf::from(path);
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("jpg");
-    temp.set_extension(format!("{ext}.tmp"));
-    std::fs::write(&temp, output)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    std::fs::rename(temp, path)?;
-    Ok(())
+    crate::database::atomic_write(path, &output)
 }
 
 /// Live progress for a media download pass, shared between the worker threads

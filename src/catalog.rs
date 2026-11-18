@@ -131,12 +131,7 @@ pub fn save(base_dir: &Path, state: &CatalogState) -> Result<()> {
         source_url: state.source_url.clone(),
         items: state.items.clone(),
     };
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec(&payload)?)?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(tmp, path)?;
+    crate::database::atomic_write(&path, &serde_json::to_vec(&payload)?)?;
     Ok(())
 }
 
@@ -168,10 +163,7 @@ pub fn load(base_dir: &Path) -> Option<CatalogState> {
 /// torrent carries the newest update for an owned game; kept public so the
 /// integration tests can pin the folding behavior.
 #[allow(dead_code)]
-pub fn items_for_base<'a>(
-    items: &'a [CatalogItem],
-    base_title_id: &str,
-) -> Vec<&'a CatalogItem> {
+pub fn items_for_base<'a>(items: &'a [CatalogItem], base_title_id: &str) -> Vec<&'a CatalogItem> {
     items
         .iter()
         .filter(|item| {
@@ -264,10 +256,9 @@ mod tests {
 
     #[test]
     fn parse_drops_rows_without_magnets() {
-        let items = parse_items(
-            r#"[{"title":"A","magnet":"magnet:?xt=urn:btih:A"},{"title":"B"}]"#,
-        )
-        .unwrap();
+        let items =
+            parse_items(r#"[{"title":"A","magnet":"magnet:?xt=urn:btih:A"},{"title":"B"}]"#)
+                .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "A");
     }
@@ -307,8 +298,9 @@ mod tests {
     fn parse_tolerates_missing_optional_fields() {
         // The catalog has rows with only a title, magnet, and no title id
         // (homebrew entries); they must not break the parser.
-        let items = parse_items(r#"[{"title":"Homebrew Tool","magnet":"magnet:?xt=urn:btih:ABCD"}]"#)
-            .unwrap();
+        let items =
+            parse_items(r#"[{"title":"Homebrew Tool","magnet":"magnet:?xt=urn:btih:ABCD"}]"#)
+                .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].base_title_id(), None);
         assert_eq!(items[0].size, "");

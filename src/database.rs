@@ -1,8 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -111,7 +112,8 @@ pub struct Config {
 pub type KnownFile = (Option<f64>, i64, String);
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LibraryStats {    pub file_count: i64,
+pub struct LibraryStats {
+    pub file_count: i64,
     pub total_size: i64,
     pub base_count: i64,
     pub update_count: i64,
@@ -120,15 +122,55 @@ pub struct LibraryStats {    pub file_count: i64,
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {
+    let backup = path.with_extension("json.bak");
     if !path.exists() {
+        if backup.exists() {
+            return serde_json::from_slice(&std::fs::read(&backup)?)
+                .with_context(|| format!("설정 백업을 읽을 수 없습니다: {}", backup.display()));
+        }
         return Ok(Config::default());
     }
     let bytes = std::fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes).unwrap_or_default())
+    match serde_json::from_slice(&bytes) {
+        Ok(config) => Ok(config),
+        Err(error) => {
+            // Never silently reset a user's settings when a write was interrupted.
+            if let Ok(bytes) = std::fs::read(&backup) {
+                if let Ok(config) = serde_json::from_slice(&bytes) {
+                    return Ok(config);
+                }
+            }
+            Err(error).with_context(|| format!("설정 파일이 손상되었습니다: {}", path.display()))
+        }
+    }
 }
 
 pub fn save_config(path: &Path, config: &Config) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        // Back up only valid data: a corrupt primary must not replace its
+        // last good backup on the first save after recovery.
+        let old = std::fs::read(path)?;
+        if serde_json::from_slice::<Config>(&old).is_ok() {
+            let backup = path.with_extension("json.bak");
+            atomic_write(&backup, &old)?;
+        }
+    }
+    atomic_write(path, &serde_json::to_vec_pretty(config)?)?;
+    Ok(())
+}
+
+/// Flush a same-directory temporary file, then atomically replace the target.
+/// `NamedTempFile::persist` replaces an existing target on Windows as well.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
@@ -450,34 +492,32 @@ impl Database {
     }
     pub fn load_titles(&self, entries: &[crate::titledb::Entry]) -> Result<()> {
         let mut conn = self.connect()?;
-        conn.execute("DELETE FROM title_db", [])?;
-        for chunk in entries.chunks(5000) {
-            let tx = conn.transaction()?;
-            {
-                let mut stmt = tx.prepare("INSERT OR REPLACE INTO title_db(title_id,name,version,release_date,num_players,rating,size,region,icon_url,screenshots,description,languages) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")?;
-                for e in chunk {
-                    stmt.execute(params![
-                        e.title_id,
-                        e.name,
-                        e.version,
-                        e.release_date,
-                        e.num_players,
-                        e.rating,
-                        e.size,
-                        e.region,
-                        e.icon_url,
-                        if e.screenshots.is_empty() {
-                            "[]"
-                        } else {
-                            &e.screenshots
-                        },
-                        e.description,
-                        e.languages
-                    ])?;
-                }
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM title_db", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO title_db(title_id,name,version,release_date,num_players,rating,size,region,icon_url,screenshots,description,languages) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")?;
+            for e in entries {
+                stmt.execute(params![
+                    e.title_id,
+                    e.name,
+                    e.version,
+                    e.release_date,
+                    e.num_players,
+                    e.rating,
+                    e.size,
+                    e.region,
+                    e.icon_url,
+                    if e.screenshots.is_empty() {
+                        "[]"
+                    } else {
+                        &e.screenshots
+                    },
+                    e.description,
+                    e.languages
+                ])?;
             }
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
     pub fn clear_titles(&self) -> Result<()> {
@@ -767,7 +807,11 @@ mod tests {
             .iter()
             .any(|c| c.title_id.as_deref() == Some("0100D2C0115B6000")));
         assert!(db.known_files().unwrap().contains_key(renamed));
-        assert_eq!(db.delete_missing_files_within(&[renamed.into()], &["C:\\games".into()]).unwrap(), 0);
+        assert_eq!(
+            db.delete_missing_files_within(&[renamed.into()], &["C:\\games".into()])
+                .unwrap(),
+            0
+        );
         assert_eq!(db.delete_missing_files_within(&[], &[]).unwrap(), 0);
         assert_eq!(
             db.delete_missing_files_within(&["C:\\games\\kept.nsp".into()], &["C:\\games".into()])
@@ -827,5 +871,66 @@ mod tests {
         assert_eq!(restored.scan_folders, vec!["C:\\games"]);
         assert_eq!(restored.settings.get("theme").unwrap(), "dark");
         assert_eq!(restored.extra.get("future_setting").unwrap(), true);
+    }
+
+    #[test]
+    fn broken_config_recovers_backup_without_resetting_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.settings.insert("theme".into(), "dark".into());
+        save_config(&path, &config).unwrap();
+        save_config(&path, &config).unwrap();
+        std::fs::write(&path, b"{truncated").unwrap();
+        assert_eq!(
+            load_config(&path).unwrap().settings.get("theme").unwrap(),
+            "dark"
+        );
+        std::fs::write(path.with_extension("json.bak"), b"invalid too").unwrap();
+        assert!(load_config(&path).is_err());
+    }
+
+    #[test]
+    fn title_db_import_failure_rolls_back_all_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("library.db")).unwrap();
+        db.init().unwrap();
+        db.load_titles(&[crate::titledb::Entry {
+            title_id: "ORIGINAL".into(),
+            name: "Kept".into(),
+            ..Default::default()
+        }])
+        .unwrap();
+        db.connect()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER prevent_bad BEFORE INSERT ON title_db
+             WHEN NEW.title_id = 'BLOCKED' BEGIN SELECT RAISE(ABORT, 'simulated failure'); END;",
+            )
+            .unwrap();
+        let updated = vec![
+            crate::titledb::Entry {
+                title_id: "NEW".into(),
+                ..Default::default()
+            },
+            crate::titledb::Entry {
+                title_id: "BLOCKED".into(),
+                ..Default::default()
+            },
+        ];
+        assert!(db.load_titles(&updated).is_err());
+        let conn = db.connect().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM title_db", [], |r| r.get(0))
+            .unwrap();
+        let original: String = conn
+            .query_row(
+                "SELECT name FROM title_db WHERE title_id='ORIGINAL'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(original, "Kept");
     }
 }

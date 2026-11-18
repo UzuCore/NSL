@@ -50,30 +50,18 @@ foreach ($file in $titleDbFiles) {
     Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $staging ('titledb\' + $file.Name))
 }
 
-# A fresh, empty database so first launch does not inherit anyone's library.
-$emptyDb = Join-Path $staging 'library.db'
-$sqlite = Get-Command sqlite3.exe -ErrorAction SilentlyContinue
-if ($sqlite) {
-    $schema = @(
-        'CREATE TABLE IF NOT EXISTS game_files (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE NOT NULL, filename TEXT NOT NULL, size INTEGER DEFAULT 0, mtime REAL, fast_hash TEXT, file_type TEXT, last_seen TEXT, scan_folder TEXT, nacp_ko TEXT DEFAULT '''', nacp_en TEXT DEFAULT '''', nacp_ja TEXT DEFAULT '''');',
-        'CREATE TABLE IF NOT EXISTS file_contents (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL, title_id TEXT, version INTEGER DEFAULT 0, content_type TEXT DEFAULT ''unknown'', source TEXT DEFAULT ''filename'', UNIQUE(path, title_id, content_type));',
-        'CREATE INDEX IF NOT EXISTS idx_fc_path ON file_contents(path);',
-        'CREATE INDEX IF NOT EXISTS idx_fc_title_id ON file_contents(title_id);',
-        'CREATE TABLE IF NOT EXISTS title_db (title_id TEXT PRIMARY KEY, name TEXT, version INTEGER DEFAULT 0, release_date TEXT, num_players TEXT, rating TEXT, size INTEGER DEFAULT 0, region TEXT, icon_url TEXT, screenshots TEXT DEFAULT ''[]'', description TEXT, languages TEXT);',
-        'CREATE INDEX IF NOT EXISTS idx_titledb_base ON title_db(UPPER(SUBSTR(title_id,1,13))||''000'');'
-    )
-    & $sqlite.Source $emptyDb ($schema -join "`n")
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Could not create the empty packaged library.db.'
-    }
-} else {
-    Write-Warning 'sqlite3.exe not found; packaged library.db will be created on first launch instead.'
-}
+# The app creates its own empty database on first launch. A packaged database
+# would overwrite an existing user's entire library during an in-place update.
 
 $manifest = [ordered]@{
     application = 'NSL-Rust'
     version = $version
     platform = 'windows-x86_64'
+    sha256 = [ordered]@{
+        'nsl.exe' = (Get-FileHash -LiteralPath (Join-Path $staging 'nsl.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+        'bin/nstool.exe' = (Get-FileHash -LiteralPath (Join-Path $staging 'bin/nstool.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+        'bin/hactool.exe' = (Get-FileHash -LiteralPath (Join-Path $staging 'bin/hactool.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
 } | ConvertTo-Json
 $utf8 = [System.Text.UTF8Encoding]::new($false)
 [System.IO.File]::WriteAllText((Join-Path $staging 'nsl-rust-manifest.json'), $manifest, $utf8)
@@ -106,7 +94,7 @@ try {
 } finally {
     $zip.Dispose()
 }
-foreach ($forbiddenName in @('prod.keys', 'title.keys', 'config.json', 'nsl-keys.json')) {
+foreach ($forbiddenName in @('prod.keys', 'title.keys', 'config.json', 'nsl-keys.json', 'library.db', 'library.db-wal', 'library.db-shm')) {
     if ($names -contains $forbiddenName) {
         throw "Release archive contains forbidden local file: $forbiddenName"
     }

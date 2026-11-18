@@ -1,6 +1,12 @@
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufReader, Read},
+    path::Path,
+    time::Duration,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Entry {
@@ -94,7 +100,9 @@ enum ContentKind {
 const MAX_PLAUSIBLE_VERSION: i64 = 0x4000_0000;
 
 fn plausible_version(value: i64) -> Option<i64> {
-    (1..=MAX_PLAUSIBLE_VERSION).contains(&value).then_some(value)
+    (1..=MAX_PLAUSIBLE_VERSION)
+        .contains(&value)
+        .then_some(value)
 }
 
 fn parse_titles(v: Value) -> HashMap<String, Entry> {
@@ -109,12 +117,7 @@ fn parse_titles(v: Value) -> HashMap<String, Entry> {
                 let Some(o) = info.as_object() else { continue };
                 let name = first(o, &["name", "title", "Name"]);
                 let id = first(o, &["id", "titleId", "title_id"]);
-                let id = if id.is_empty() {
-                    tid
-                } else {
-                    id
-                }
-                .to_ascii_uppercase();
+                let id = if id.is_empty() { tid } else { id }.to_ascii_uppercase();
                 if id.is_empty() {
                     continue;
                 }
@@ -226,7 +229,7 @@ pub fn load_local(dir: &Path) -> Result<Vec<Entry>> {
                         .max()
                         .unwrap_or(0);
                     if let Some(e) = titles.get_mut(&tid.to_ascii_uppercase()) {
-                        e.version = latest
+                        e.version = e.version.max(latest)
                     } else {
                         titles.insert(
                             tid.to_ascii_uppercase(),
@@ -287,6 +290,7 @@ pub fn download_full(dir: &Path, source: &str) -> Result<Vec<Entry>> {
     ];
     for (name, url) in endpoints {
         let response = ureq::get(url)
+            .timeout(Duration::from_secs(120))
             .set(
                 "User-Agent",
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
@@ -295,26 +299,20 @@ pub fn download_full(dir: &Path, source: &str) -> Result<Vec<Entry>> {
             .call();
         match response {
             Ok(resp) => {
-                // `into_string()` caps at 10 MiB, but titles.json is ~165 MiB
-                // and KR.ko.json ~55 MiB, so stream the body to disk directly
-                // and validate it from the file instead of buffering in memory.
-                let tmp = dir.join(format!("{name}.tmp"));
-                {
-                    let mut reader = resp.into_reader();
-                    let mut file = fs::File::create(&tmp)
-                        .with_context(|| format!("{name} 파일을 만들지 못했습니다"))?;
-                    std::io::copy(&mut reader, &mut file)
-                        .with_context(|| format!("{name} 다운로드 중 오류"))?;
-                }
-                let bytes = fs::read(&tmp)
-                    .with_context(|| format!("{name} 파일을 읽지 못했습니다"))?;
-                serde_json::from_slice::<Value>(&bytes)
-                    .with_context(|| format!("{name} 응답이 올바른 JSON이 아닙니다"))?;
-                drop(bytes);                let target = dir.join(name);
-                if target.exists() {
-                    fs::remove_file(&target)?
-                }
-                fs::rename(tmp, target)?;
+                // Stage on the same volume, validate, then atomically replace.
+                // An interrupted transfer must keep the previous title DB.
+                const MAX_TITLE_DB_BYTES: u64 = 512 * 1024 * 1024;
+                let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+                let written = std::io::copy(
+                    &mut resp.into_reader().take(MAX_TITLE_DB_BYTES + 1),
+                    &mut tmp,
+                )
+                .with_context(|| format!("{name} 다운로드 실패"))?;
+                anyhow::ensure!(written <= MAX_TITLE_DB_BYTES, "{name} 파일이 너무 큽니다");
+                tmp.as_file().sync_all()?;
+                serde_json::from_reader::<_, Value>(BufReader::new(tmp.reopen()?))
+                    .with_context(|| format!("{name} JSON 검증 실패"))?;
+                tmp.persist(dir.join(name)).map_err(|error| error.error)?;
             }
             Err(e) if name == "KR.ko.json" => {
                 eprintln!("한국어 타이틀 목록 다운로드 생략: {e}");

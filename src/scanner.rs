@@ -20,7 +20,6 @@ pub struct ScanResult {
     pub nacp_ko: String,
     pub nacp_en: String,
     pub nacp_ja: String,
-    
 }
 #[derive(Clone, Debug)]
 pub struct Content {
@@ -269,7 +268,11 @@ fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
             let off = u64::from_le_bytes(table[p..p + 8].try_into().unwrap());
             let len = u64::from_le_bytes(table[p + 8..p + 16].try_into().unwrap());
             let no = u32::from_le_bytes(table[p + 16..p + 20].try_into().unwrap()) as usize;
-            if no >= sl || len < NACP_REQUIRED_LEN as u64 || len > 0x10000 || data + off + len > size {
+            if no >= sl
+                || len < NACP_REQUIRED_LEN as u64
+                || len > 0x10000
+                || data + off + len > size
+            {
                 continue;
             }
             let end = strings[no..]
@@ -405,7 +408,6 @@ fn nacp_file_names(path: &Path) -> Option<(String, String, String)> {
         Some((ko, en, ja))
     }
 }
-
 
 #[derive(Clone)]
 struct PfsNca {
@@ -546,8 +548,7 @@ fn hactool_nsp_contents(path: &Path) -> Vec<Content> {
     // CNMT NCAs are tiny (a few KB to a few hundred KB), so requiring 1 MiB
     // silently skipped every metadata archive in the library.
     entries.retain(|entry| {
-        entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
-            && is_cnmt_candidate_size(entry.size)
+        entry.name.to_ascii_lowercase().ends_with(".cnmt.nca") && is_cnmt_candidate_size(entry.size)
     });
     let Ok(mut source) = File::open(path) else {
         return Vec::new();
@@ -664,7 +665,6 @@ fn hactool_nacp_names(path: &Path) -> Option<(String, String, String)> {
         _ => None,
     }
 }
-
 
 pub(crate) fn run_nstool(path: &Path, extra: &[String]) -> Option<String> {
     let (Some(engine), Some(keys)) = (nstool_path(), prod_keys()) else {
@@ -785,6 +785,11 @@ pub fn fast_hash(path: &Path) -> Result<String> {
 
 pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<ScanResult> {
     let mut file = File::open(path)?;
+    anyhow::ensure!(
+        file.metadata()?.len() >= 16,
+        "파일이 비어 있거나 패키지 헤더가 손상됨: {}",
+        path.display()
+    );
     let mut contents = container_contents(&mut file, path);
     let (nacp_ko, nacp_en, nacp_ja) = container_nacp(&mut file, path);
     if path
@@ -890,7 +895,10 @@ fn finish_scan(
             .find(|tid| tid.starts_with("01") && tid.len() >= 13)
         {
             let derived = format!("{}000", &first[..13]);
-            if !contents.iter().any(|c| c.title_id.as_deref() == Some(derived.as_str())) {
+            if !contents
+                .iter()
+                .any(|c| c.title_id.as_deref() == Some(derived.as_str()))
+            {
                 contents.push(Content {
                     title_id: Some(derived),
                     version: 0,
@@ -906,7 +914,6 @@ fn finish_scan(
         nacp_ko: names.0,
         nacp_en: names.1,
         nacp_ja: names.2,
-
     })
 }
 
@@ -1009,7 +1016,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn derives_base_record_for_multi_game_xci_bundles() {
         let path = Path::new("Bundle [0100D2C0115B6800][v65536].xci");
@@ -1061,10 +1067,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!result
-            .contents
-            .iter()
-            .any(|c| c.source == "derived_base"));
+        assert!(!result.contents.iter().any(|c| c.source == "derived_base"));
     }
 
     #[test]
@@ -1089,6 +1092,15 @@ mod tests {
         assert_eq!(content_type("0100D2C0115B6000"), "base");
         assert_eq!(content_type("0100D2C0115B6800"), "update");
         assert_eq!(content_type("0100D2C0115B7001"), "dlc");
+    }
+
+    #[test]
+    fn empty_package_is_an_error_not_a_successful_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.nsp");
+        std::fs::write(&path, []).unwrap();
+        let hash = fast_hash(&path).unwrap();
+        assert!(scan_file_hashed(&path, "broken.nsp", hash).is_err());
     }
 
     #[test]

@@ -9,9 +9,9 @@ mod media;
 mod scanner;
 mod theme;
 mod titledb;
+mod torrent;
 mod translate;
 mod updater;
-mod torrent;
 mod xci;
 
 use anyhow::Result;
@@ -19,6 +19,7 @@ use eframe::egui;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -29,6 +30,7 @@ use std::{
 
 const ICON_CACHE_MAX: usize = 300;
 const ICON_LOAD_BUDGET: usize = 32;
+const STORE_COVER_CACHE_MAX: usize = 128;
 
 /// Everything that changes the filtered/sorted library view. When this is
 /// unchanged between frames the previous computation is reused.
@@ -39,6 +41,8 @@ struct FilterKey {
     folder: String,
     sort_column: String,
     sort_desc: bool,
+    exception_update: String,
+    exception_dlc: String,
     rows_len: usize,
     rows_generation: u64,
 }
@@ -51,7 +55,9 @@ struct ResourceSample {
 }
 
 #[cfg(windows)]
-fn process_resource_sample(previous: Option<(std::time::Instant, u64)>) -> Option<(ResourceSample, (std::time::Instant, u64))> {
+fn process_resource_sample(
+    previous: Option<(std::time::Instant, u64)>,
+) -> Option<(ResourceSample, (std::time::Instant, u64))> {
     #[repr(C)]
     #[derive(Default)]
     struct MemoryCounters {
@@ -138,8 +144,8 @@ struct ScanProgress {
     total: AtomicUsize,
 }
 
-/// Files applied to the database, stale rows removed, and whether the pass was cancelled.
-type ScanOutcome = (usize, usize, bool);
+/// Files scanned, stale rows removed, cancellation and recoverable errors.
+type ScanOutcome = (usize, usize, bool, usize);
 
 fn paint_selectable_cell(
     ui: &egui::Ui,
@@ -302,7 +308,7 @@ struct NslApp {
     /// it. Recomputing 800 cloned GameFile structs every frame was the main
     /// source of the library stutter, so the result is only rebuilt when a
     /// filter, the sort order, or the row set changes.
-    filtered_rows: Vec<library::GameFile>,
+    filtered_rows: Arc<Vec<library::GameFile>>,
     filtered_key: Option<FilterKey>,
     /// Cached tab labels (total/folder/missing counts). Recomputing them walked
     /// all rows with two string allocations per row, every frame.
@@ -310,6 +316,7 @@ struct NslApp {
     cached_tabs_generation: u64,
     /// Cached duplicate groups and missing-resource counts.
     cached_stats_generation: u64,
+    cached_stats_exceptions: (String, String),
     cached_missing_updates: usize,
     cached_missing_dlcs: usize,
     cached_duplicates: Vec<(String, String, Vec<String>)>,
@@ -340,6 +347,8 @@ struct NslApp {
     scan_result: Option<Receiver<std::result::Result<ScanOutcome, String>>>,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_progress: Option<Arc<ScanProgress>>,
+    headless_mode: bool,
+    last_scan_errors: usize,
     titledb_result: Option<Receiver<std::result::Result<usize, String>>>,
     titledb_info: Option<String>,
     clear_titledb_confirm: bool,
@@ -380,11 +389,14 @@ struct NslApp {
     catalog_result: Option<Receiver<std::result::Result<usize, String>>>,
     catalog_search: String,
     catalog_search_committed: String,
+    catalog_search_cache: Option<String>,
+    catalog_matching_indices: Vec<usize>,
     catalog_search_pending: Option<std::time::Instant>,
     catalog_page: usize,
     catalog_selected: Option<String>,
     catalog_cover_dir: PathBuf,
     catalog_cover_textures: HashMap<String, egui::TextureHandle>,
+    catalog_cover_lru: VecDeque<String>,
     catalog_cover_missing: HashSet<String>,
     catalog_cover_queue: Option<Receiver<std::result::Result<usize, String>>>,
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
@@ -468,7 +480,8 @@ fn cached_record_for_path<'a>(
 /// new data gets populated; afterwards cache hits are trusted again.
 const SCAN_SCHEMA_VERSION: &str = "2";
 
-fn texture_from_image(    ctx: &egui::Context,
+fn texture_from_image(
+    ctx: &egui::Context,
     name: &str,
     image: image::DynamicImage,
     max_edge: u32,
@@ -600,11 +613,12 @@ impl NslApp {
             base_dir: base_dir.clone(),
             stats,
             rows: Vec::new(),
-            filtered_rows: Vec::new(),
+            filtered_rows: Arc::new(Vec::new()),
             filtered_key: None,
             cached_tabs: Vec::new(),
             cached_tabs_generation: u64::MAX,
             cached_stats_generation: u64::MAX,
+            cached_stats_exceptions: (String::new(), String::new()),
             cached_missing_updates: 0,
             cached_missing_dlcs: 0,
             cached_duplicates: Vec::new(),
@@ -631,6 +645,8 @@ impl NslApp {
             scan_result: None,
             scan_cancel: None,
             scan_progress: None,
+            headless_mode: false,
+            last_scan_errors: 0,
             titledb_result: None,
             titledb_info: None,
             clear_titledb_confirm: false,
@@ -671,11 +687,14 @@ impl NslApp {
             catalog_result: None,
             catalog_search: String::new(),
             catalog_search_committed: String::new(),
+            catalog_search_cache: None,
+            catalog_matching_indices: Vec::new(),
             catalog_search_pending: None,
             catalog_page: 0,
             catalog_selected: None,
             catalog_cover_dir: base_dir.join("icons").join("store"),
             catalog_cover_textures: HashMap::new(),
+            catalog_cover_lru: VecDeque::new(),
             catalog_cover_missing: HashSet::new(),
             catalog_cover_queue: None,
             torrent_engine: None,
@@ -705,6 +724,39 @@ impl NslApp {
         }
         if let Some(state) = catalog::load(&app.base_dir) {
             app.catalog_state = state;
+        }
+        // Clearing persisted torrent metadata while rqbit is running races its
+        // background writes. Perform an explicitly requested reset BEFORE the
+        // engine starts on the next launch; downloaded files are untouched.
+        if app
+            .config
+            .settings
+            .get("clear_torrent_session_on_next_launch")
+            .and_then(|v| v.as_str())
+            == Some("1")
+        {
+            match torrent::TorrentEngine::clear_session_state(&app.base_dir.join("downloads")) {
+                Ok(freed) => {
+                    app.config
+                        .settings
+                        .remove("clear_torrent_session_on_next_launch");
+                    if let Err(error) =
+                        database::save_config(&app.base_dir.join("config.json"), &app.config)
+                    {
+                        let _ = app
+                            .log_sender
+                            .send(format!("세션 초기화 설정 저장 실패: {error}"));
+                    }
+                    let _ = app
+                        .log_sender
+                        .send(format!("토렌트 이전 세션 초기화 완료: {} bytes", freed));
+                }
+                Err(error) => {
+                    let _ = app
+                        .log_sender
+                        .send(format!("토렌트 세션 초기화 실패: {error}"));
+                }
+            }
         }
         match torrent::TorrentEngine::new(app.base_dir.join("downloads")) {
             Ok(engine) => app.torrent_engine = Some(Arc::new(engine)),
@@ -820,18 +872,20 @@ impl NslApp {
                 let mut skipped = 0usize;
                 let mut candidates = Vec::new();
                 let mut scanned_roots: Vec<String> = Vec::new();
+                let mut scan_errors = 0usize;
                 'folders: for folder in &folders {
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
                     let root = PathBuf::from(folder);
-                    if !root.exists() {
+                    if !root.is_dir() {
                         let _ = log.send(format!(
                             "⚠ 폴더에 접근할 수 없습니다 · {folder} (기록은 유지됩니다)"
                         ));
                         continue;
                     }
-                    scanned_roots.push(normalize_scan_path(&root));
+                    // An unreadable child must not be treated as a deleted game.
+                    let mut complete = true;
                     let ignored = [
                         "saves",
                         "save",
@@ -847,7 +901,7 @@ impl NslApp {
                         "temp",
                         "tmp",
                     ];
-                    for entry in walkdir::WalkDir::new(&root)
+                    for item in walkdir::WalkDir::new(&root)
                         .follow_links(false)
                         .into_iter()
                         .filter_entry(|e| {
@@ -860,8 +914,17 @@ impl NslApp {
                                         .as_str(),
                                 )
                         })
-                        .filter_map(Result::ok)
                     {
+                        let entry = match item {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                complete = false;
+                                scan_errors += 1;
+                                let _ =
+                                    log.send(format!("스캔 접근 오류 (기존 기록 보존): {error}"));
+                                continue;
+                            }
+                        };
                         if cancel.load(Ordering::Relaxed) {
                             break 'folders;
                         }
@@ -877,7 +940,17 @@ impl NslApp {
                         if !["nsp", "nsz", "xci", "xcz"].contains(&ext.as_str()) {
                             continue;
                         }
-                        let Ok(meta) = entry.metadata() else { continue };
+                        let meta = match entry.metadata() {
+                            Ok(meta) => meta,
+                            Err(error) => {
+                                complete = false;
+                                scan_errors += 1;
+                                let _ = log.send(format!(
+                                    "스캔 메타데이터 오류 (기존 기록 보존): {error}"
+                                ));
+                                continue;
+                            }
+                        };
                         let path = normalize_scan_path(entry.path());
                         let mtime = meta
                             .modified()
@@ -885,7 +958,7 @@ impl NslApp {
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs_f64());
                         existing.push(path.clone());
-                        if incremental {
+                        if incremental && !force_reanalyze {
                             if let Some((old_mtime, old_size, _)) = known.get(&path) {
                                 if *old_size == meta.len() as i64
                                     && old_mtime
@@ -909,6 +982,14 @@ impl NslApp {
                             normalize_scan_path(&root),
                         ));
                     }
+                    if complete {
+                        scanned_roots.push(normalize_scan_path(&root));
+                    } else {
+                        let _ = log.send(format!(
+                            "일부 폴더를 읽지 못해 이전 기록 삭제를 생략: {}",
+                            root.display()
+                        ));
+                    }
                 }
                 progress
                     .total
@@ -920,6 +1001,7 @@ impl NslApp {
                     skipped
                 ));
                 if !candidates.is_empty() {
+                    let analysis_errors = AtomicUsize::new(0);
                     let threads = if scan_threads == 0 {
                         default_threads.max(1)
                     } else {
@@ -947,14 +1029,21 @@ impl NslApp {
                                 let cache_complete = cached_record.is_some() && !force_reanalyze;
                                 let result = if cancel.load(Ordering::Relaxed) {
                                     (None, false)
-                                } else if cached_record.is_some() && same_metadata && cache_complete
+                                } else if incremental
+                                    && cached_record.is_some()
+                                    && same_metadata
+                                    && cache_complete
                                 {
                                     (None, true)
                                 } else if let Ok(hash) = scanner::fast_hash(source) {
                                     if let (Some(old), Some((_, _, old_hash))) =
                                         (cached_record, known.get(path))
                                     {
-                                        if !old_hash.is_empty() && *old_hash == hash && cache_complete {
+                                        if incremental
+                                            && !old_hash.is_empty()
+                                            && *old_hash == hash
+                                            && cache_complete
+                                        {
                                             let mut record = old.clone();
                                             record.path = path.clone();
                                             record.filename = filename.clone();
@@ -1034,6 +1123,7 @@ impl NslApp {
                                         let _ = log.send(format!("⚡ 캐시 사용 · {filename}"));
                                     }
                                     (None, false) if !cancel.load(Ordering::Relaxed) => {
+                                        analysis_errors.fetch_add(1, Ordering::Relaxed);
                                         let _ = log.send(format!("⚠ 분석 실패 · {filename}"));
                                     }
                                     _ => {}
@@ -1049,10 +1139,11 @@ impl NslApp {
                             discovered.push(record);
                         }
                     }
+                    scan_errors += analysis_errors.load(Ordering::Relaxed);
                 }
                 let count = discovered.len();
                 if folders.is_empty() {
-                    return Ok((0, 0, false));
+                    return Ok((0, 0, false, scan_errors));
                 }
                 db.upsert_files(&discovered)?;
                 let was_cancelled = cancel.load(Ordering::Relaxed);
@@ -1071,7 +1162,7 @@ impl NslApp {
                         ""
                     }
                 ));
-                Ok((count + skipped, removed, was_cancelled))
+                Ok((count + skipped, removed, was_cancelled, scan_errors))
             })()
             .map_err(|e| e.to_string());
             if let Err(error) = &result {
@@ -1125,7 +1216,7 @@ impl NslApp {
 
     /// Start a torrent download for one catalog entry into its own sub-folder
     /// under the app's `downloads` directory.
-    fn start_catalog_torrent(&mut self, item: &catalog::CatalogItem, downloads_root: PathBuf) {
+    fn start_catalog_torrent(&mut self, item: &catalog::CatalogItem) {
         let Some(engine) = self.torrent_engine.clone() else {
             self.status = "토렌트 엔진을 사용할 수 없습니다".into();
             return;
@@ -1138,7 +1229,19 @@ impl NslApp {
             Some(id) => id,
             None => Self::sanitize_folder_name(&item.title),
         };
-        let sub_folder = downloads_root.join(folder_name);
+        // librqbit's `sub_folder` must be relative to its default download root.
+        // A stable torrent suffix prevents update/DLC entries overwriting one another.
+        let suffix = item
+            .info_hash()
+            .map(|hash| {
+                hash.chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .take(12)
+                    .collect::<String>()
+            })
+            .filter(|hash| !hash.is_empty())
+            .unwrap_or_else(|| Self::sanitize_folder_name(&item.topic_id));
+        let sub_folder = PathBuf::from(format!("{folder_name}-{suffix}"));
         match engine.start_download(&item.title, &item.magnet, sub_folder) {
             Ok(_) => {
                 self.status = format!("다운로드 시작: {}", truncate_label(&item.title, 60));
@@ -1153,8 +1256,7 @@ impl NslApp {
                     "last_tab_key".into(),
                     serde_json::Value::String("DOWNLOADS".into()),
                 );
-                let _ =
-                    database::save_config(&self.base_dir.join("config.json"), &self.config);
+                let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
             }
             Err(error) => self.status = format!("다운로드 시작 실패: {error}"),
         }
@@ -1181,10 +1283,7 @@ impl NslApp {
                         "last_tab_key".into(),
                         serde_json::Value::String("DOWNLOADS".into()),
                     );
-                    let _ = database::save_config(
-                        &self.base_dir.join("config.json"),
-                        &self.config,
-                    );
+                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
                 }
             });
         });
@@ -1246,21 +1345,29 @@ impl NslApp {
         }
         ui.add_space(4.0);
         let query = self.catalog_search_committed.trim().to_lowercase();
-        let matching: Vec<&catalog::CatalogItem> = self
-            .catalog_state
-            .items
-            .iter()
-            .filter(|item| {
-                query.is_empty()
-                    || item.title.to_lowercase().contains(&query)
-                    || item
-                        .base_title_id()
-                        .is_some_and(|id| id.to_lowercase().contains(&query))
-            })
-            .take(2000)
-            .collect();
+        if self.catalog_search_cache.as_ref() != Some(&query) {
+            self.catalog_matching_indices = self
+                .catalog_state
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| {
+                    query.is_empty()
+                        || item.title.to_lowercase().contains(&query)
+                        || item
+                            .base_title_id()
+                            .is_some_and(|id| id.to_lowercase().contains(&query))
+                })
+                .map(|(index, _)| index)
+                .collect();
+            self.catalog_search_cache = Some(query);
+        }
         let page_size = 100usize;
-        let page_count = matching.len().div_ceil(page_size).max(1);
+        let page_count = self
+            .catalog_matching_indices
+            .len()
+            .div_ceil(page_size)
+            .max(1);
         self.catalog_page = self.catalog_page.min(page_count - 1);
         ui.horizontal(|ui| {
             if ui
@@ -1273,7 +1380,7 @@ impl NslApp {
                 "페이지 {} / {} · {}개 일치 (최대 2,000개 표시)",
                 self.catalog_page + 1,
                 page_count,
-                matching.len()
+                self.catalog_matching_indices.len()
             ));
             if ui
                 .add_enabled(
@@ -1286,21 +1393,19 @@ impl NslApp {
             }
         });
         ui.separator();
-        let page_items: Vec<&catalog::CatalogItem> = matching
+        let page_items: Vec<catalog::CatalogItem> = self
+            .catalog_matching_indices
             .iter()
             .skip(self.catalog_page * page_size)
             .take(page_size)
-            .copied()
+            .map(|&index| self.catalog_state.items[index].clone())
             .collect();
         let download_root = self.base_dir.join("downloads");
         let selected_topic = self.catalog_selected.clone();
-        let page_items: Vec<catalog::CatalogItem> = page_items
-            .iter()
-            .map(|item| (*item).clone())
-            .collect();
         let cover_jobs: Vec<(String, String)> = page_items
             .iter()
             .filter(|item| !item.cover.is_empty() && !item.topic_id.is_empty())
+            .filter(|item| Self::safe_catalog_topic_id(&item.topic_id))
             .filter(|item| {
                 !self.catalog_cover_missing.contains(&item.topic_id)
                     && !self.catalog_cover_textures.contains_key(&item.topic_id)
@@ -1322,14 +1427,8 @@ impl NslApp {
                     .show(ui, |ui| {
                         let mut cover_budget = ICON_LOAD_BUDGET;
                         for item in &page_items {
-                            self.ensure_catalog_cover(
-                                ui.ctx(),
-                                &item.topic_id,
-                                &mut cover_budget,
-                            );
-                            if let Some(cover) =
-                                self.catalog_cover_textures.get(&item.topic_id)
-                            {
+                            self.ensure_catalog_cover(ui.ctx(), &item.topic_id, &mut cover_budget);
+                            if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
                                 ui.add(egui::Image::new((cover.id(), egui::vec2(60.0, 60.0))));
                             } else {
                                 ui.allocate_ui(egui::vec2(60.0, 60.0), |ui| {
@@ -1353,7 +1452,7 @@ impl NslApp {
                             ui.label(truncate_label(&item.image_format, 24));
                             let button = ui.add_enabled(true, egui::Button::new("다운로드"));
                             if button.clicked() {
-                                self.start_catalog_torrent(item, download_root.clone());
+                                self.start_catalog_torrent(item);
                             }
                             ui.end_row();
                         }
@@ -1364,16 +1463,19 @@ impl NslApp {
             download_root.display()
         ));
         ui.label(
-            egui::RichText::new(
-                "게임 파일은 받은 뒤 스캔 폴더로 옮기면 라이브러리에 추가됩니다.",
-            )
-            .color(egui::Color32::GRAY),
+            egui::RichText::new("게임 파일은 받은 뒤 스캔 폴더로 옮기면 라이브러리에 추가됩니다.")
+                .color(egui::Color32::GRAY),
         );
     }
 
     /// Load a store cover into the texture cache if it is on disk.
     fn ensure_catalog_cover(&mut self, ctx: &egui::Context, topic_id: &str, budget: &mut usize) {
-        if topic_id.is_empty() || self.catalog_cover_textures.contains_key(topic_id) {
+        if !Self::safe_catalog_topic_id(topic_id) {
+            return;
+        }
+        if self.catalog_cover_textures.contains_key(topic_id) {
+            self.catalog_cover_lru.retain(|key| key != topic_id);
+            self.catalog_cover_lru.push_back(topic_id.to_owned());
             return;
         }
         if *budget == 0 || self.catalog_cover_missing.contains(topic_id) {
@@ -1388,7 +1490,21 @@ impl NslApp {
         if let Some(texture) = texture_from_image(ctx, "store_cover", img, 120) {
             self.catalog_cover_textures
                 .insert(topic_id.to_owned(), texture);
+            self.catalog_cover_lru.push_back(topic_id.to_owned());
+            while self.catalog_cover_lru.len() > STORE_COVER_CACHE_MAX {
+                if let Some(oldest) = self.catalog_cover_lru.pop_front() {
+                    self.catalog_cover_textures.remove(&oldest);
+                }
+            }
         }
+    }
+
+    fn safe_catalog_topic_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 80
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }
 
     /// Queue covers for every visible catalog item that has no local file.
@@ -1405,6 +1521,9 @@ impl NslApp {
                 .build();
             let mut fetched = 0usize;
             for (topic_id, url) in items {
+                if !Self::safe_catalog_topic_id(&topic_id) {
+                    continue;
+                }
                 let target = dir.join(format!("{topic_id}.jpg"));
                 if target.exists() {
                     continue;
@@ -1413,7 +1532,10 @@ impl NslApp {
                     Ok(response) => {
                         let mut bytes = Vec::new();
                         let mut reader = response.into_reader();
-                        if reader.read_to_end(&mut bytes).is_ok()
+                        if (&mut reader)
+                            .take(16 * 1024 * 1024 + 1)
+                            .read_to_end(&mut bytes)
+                            .is_ok()
                             && bytes.len() <= 16 * 1024 * 1024
                             && image::load_from_memory(&bytes).is_ok()
                         {
@@ -1466,8 +1588,7 @@ impl NslApp {
             };
             if ui.small_button(label).clicked() {
                 if delete_files_too {
-                    self.download_delete_confirm =
-                        Some((key.to_owned(), progress.name.clone()));
+                    self.download_delete_confirm = Some((key.to_owned(), progress.name.clone()));
                 } else {
                     engine.cancel(key, false);
                     self.status = "다운로드 삭제 요청됨 · 받은 파일은 유지됩니다".into();
@@ -1494,18 +1615,12 @@ impl NslApp {
                         "last_tab_key".into(),
                         serde_json::Value::String("CATALOG".into()),
                     );
-                    let _ = database::save_config(
-                        &self.base_dir.join("config.json"),
-                        &self.config,
-                    );
+                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
                 }
             });
         });
         let save_dir = self.base_dir.join("downloads");
-        ui.label(format!(
-            "저장 위치: {}\\<게임 폴더>",
-            save_dir.display()
-        ));
+        ui.label(format!("저장 위치: {}\\<게임 폴더>", save_dir.display()));
         ui.separator();
         if self.torrent_progress.is_empty() {
             ui.add_space(12.0);
@@ -1519,10 +1634,7 @@ impl NslApp {
                         "last_tab_key".into(),
                         serde_json::Value::String("CATALOG".into()),
                     );
-                    let _ = database::save_config(
-                        &self.base_dir.join("config.json"),
-                        &self.config,
-                    );
+                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
                 }
             });
             return;
@@ -1592,8 +1704,8 @@ impl NslApp {
                             );
                         });
                         if progress.total_bytes > 0 {
-                            let fraction = progress.progress_bytes as f32
-                                / progress.total_bytes.max(1) as f32;
+                            let fraction =
+                                progress.progress_bytes as f32 / progress.total_bytes.max(1) as f32;
                             if progress.finished {
                                 ui.add(
                                     egui::ProgressBar::new(1.0)
@@ -1963,7 +2075,12 @@ impl NslApp {
         for bad in ['\\', '/', '*', '?', ':', '"', '<', '>', '|'] {
             title = title.replace(bad, "");
         }
-        title = title.trim().trim_end_matches([' ', '.']).to_owned();
+        title = title
+            .trim()
+            .trim_end_matches([' ', '.'])
+            .chars()
+            .take(100)
+            .collect();
         if title.is_empty() {
             anyhow::bail!("게임 이름을 결정할 수 없습니다")
         }
@@ -1981,15 +2098,17 @@ impl NslApp {
             if !dlcs.is_empty() {
                 tags.push(format!("{}DLC", dlcs.len()));
             }
-            format!("{title} [{}].{ext}", tags.join("+"))
+            format!(
+                "{title} [{}][{}].{ext}",
+                tid.to_ascii_uppercase(),
+                tags.join("+")
+            )
         };
         Ok(old.with_file_name(name))
     }
     /// Folder tab labels, rebuilt only when the row set or folders change.
     fn library_tabs_cached(&mut self) -> &[(String, String)] {
-        if self.cached_tabs_generation == self.rows_generation
-            && !self.cached_tabs.is_empty()
-        {
+        if self.cached_tabs_generation == self.rows_generation && !self.cached_tabs.is_empty() {
             return &self.cached_tabs;
         }
         let base_count = self.rows.iter().filter(|row| row.has_base).count();
@@ -2032,9 +2151,27 @@ impl NslApp {
     /// Missing-update / missing-DLC counts and duplicate groups, computed once
     /// per row generation instead of every frame.
     fn refresh_library_stats(&mut self) {
-        if self.cached_stats_generation == self.rows_generation {
+        let exceptions = (
+            self.config
+                .settings
+                .get("exception_update")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            self.config
+                .settings
+                .get("exception_dlc")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+        );
+        if self.cached_stats_generation == self.rows_generation
+            && self.cached_stats_exceptions == exceptions
+        {
             return;
         }
+        self.cached_stats_exceptions = exceptions;
+        self.cached_tabs_generation = u64::MAX;
         self.cached_missing_updates = self
             .rows
             .iter()
@@ -2089,18 +2226,32 @@ impl NslApp {
     /// The naive version cloned and sorted all 800+ `GameFile` rows on every
     /// frame, which allocated ~16k strings per frame and made the library view
     /// stutter. This keeps the computation off the hot path.
-    fn library_rows_cached(&mut self) -> &[library::GameFile] {
+    fn library_rows_cached(&mut self) -> Arc<Vec<library::GameFile>> {
         let key = FilterKey {
             search: self.search_committed.clone(),
             kind: self.kind_filter.clone(),
             folder: self.folder_filter.clone(),
             sort_column: self.sort_column.clone(),
             sort_desc: self.sort_desc,
+            exception_update: self
+                .config
+                .settings
+                .get("exception_update")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
+            exception_dlc: self
+                .config
+                .settings
+                .get("exception_dlc")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_owned(),
             rows_len: self.rows.len(),
             rows_generation: self.rows_generation,
         };
         if self.filtered_key.as_ref() == Some(&key) {
-            return &self.filtered_rows;
+            return self.filtered_rows.clone();
         }
         let mut matching = library::visible(&self.rows, &self.search_committed)
             .filter(|row| self.row_matches_current_filter(row))
@@ -2138,9 +2289,9 @@ impl NslApp {
                 ordering
             }
         });
-        self.filtered_rows = matching;
+        self.filtered_rows = Arc::new(matching);
         self.filtered_key = Some(key);
-        &self.filtered_rows
+        self.filtered_rows.clone()
     }
 
     fn row_matches_current_filter(&self, row: &library::GameFile) -> bool {
@@ -3329,28 +3480,27 @@ impl NslApp {
                                 .color(egui::Color32::GRAY),
                             );
                             ui.add_space(4.0);
-                            if ui
-                                .add_enabled(
-                                    self.torrent_progress.is_empty(),
-                                    egui::Button::new("세션 데이터 삭제"),
-                                )
-                                .clicked()
-                            {
-                                match torrent::TorrentEngine::clear_session_state(
-                                    &self.base_dir.join("downloads"),
-                                ) {
-                                    Ok(freed) => {
-                                        self.status = format!(
-                                            "세션 데이터 삭제 완료 ({})",
-                                            common::format_size(freed)
-                                        );
-                                        let _ = self.log_sender.send(format!(
-                                            "🧹 세션 데이터 삭제 · {}",
-                                            session_dir.display()
-                                        ));
-                                    }
-                                    Err(e) => self.status = e.to_string(),
+                            let reset_pending = self.config.settings
+                                .get("clear_torrent_session_on_next_launch")
+                                .and_then(|v| v.as_str()) == Some("1");
+                            if ui.button(if reset_pending {
+                                "다음 시작 세션 초기화 예약 취소"
+                            } else {
+                                "다음 시작 시 토렌트 세션 초기화"
+                            }).clicked() {
+                                if reset_pending {
+                                    self.config.settings.remove("clear_torrent_session_on_next_launch");
+                                    self.status = "토렌트 세션 초기화 예약을 취소했습니다".into();
+                                } else {
+                                    self.config.settings.insert(
+                                        "clear_torrent_session_on_next_launch".into(),
+                                        serde_json::Value::String("1".into()),
+                                    );
+                                    self.status = "다음 실행 전 엔진 시작 시 세션을 안전하게 초기화합니다 (파일 보존)".into();
                                 }
+                            }
+                            if reset_pending {
+                                ui.label("다음 실행 시 세션 메타데이터만 초기화됩니다. 다운로드한 파일은 유지됩니다.");
                             }
                             if !self.torrent_progress.is_empty() {
                                 ui.label(
@@ -3756,7 +3906,8 @@ impl NslApp {
             self.scan_cancel = None;
             self.scan_progress = None;
             match done {
-                Ok((n, removed, cancelled)) => {
+                Ok((n, removed, cancelled, scan_errors)) => {
+                    self.last_scan_errors = scan_errors;
                     self.status = if cancelled {
                         format!("스캔 중지됨 · {n}개 파일 반영 · 기존 파일 기록은 유지")
                     } else {
@@ -3764,30 +3915,34 @@ impl NslApp {
                     };
                     // Remember the scan schema that produced these records so the
                     // forced re-analysis happens only once.
-                    if !cancelled {
+                    if !cancelled && scan_errors == 0 {
                         self.config.settings.insert(
                             "scan_schema".into(),
                             serde_json::Value::String(SCAN_SCHEMA_VERSION.into()),
                         );
-                        let _ = database::save_config(
-                            &self.base_dir.join("config.json"),
-                            &self.config,
-                        );
+                        let _ =
+                            database::save_config(&self.base_dir.join("config.json"), &self.config);
                     }
-                    self.pending_icon_prefetch = self
-                        .config
-                        .settings
-                        .get("scan_icon")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("1")
-                        == "1";
-                    self.pending_screenshot_prefetch = self
-                        .config
-                        .settings
-                        .get("scan_screenshot")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("1")
-                        == "1";
+                    self.pending_icon_prefetch = !self.headless_mode
+                        && self
+                            .config
+                            .settings
+                            .get("scan_icon")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("1")
+                            == "1";
+                    self.pending_screenshot_prefetch = !self.headless_mode
+                        && self
+                            .config
+                            .settings
+                            .get("scan_screenshot")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("1")
+                            == "1";
+                    if scan_errors > 0 {
+                        self.status =
+                            format!("스캔 완료, 읽기/분석 오류 {scan_errors}개 (기존 기록 보존)");
+                    }
                     self.start_reload();
                 }
                 Err(e) => self.status = e,
@@ -3820,6 +3975,7 @@ impl NslApp {
             match done {
                 Ok(rows) => {
                     self.rows = rows;
+                    self.cached_screenshot_selection = None;
                     self.rows_generation = self.rows_generation.wrapping_add(1);
                     match self.db.stats() {
                         Ok(stats) => self.stats = stats,
@@ -3869,6 +4025,8 @@ impl NslApp {
                     if let Some(state) = catalog::load(&self.base_dir) {
                         self.catalog_state = state;
                         self.catalog_page = 0;
+                        self.catalog_search_cache = None;
+                        self.catalog_matching_indices.clear();
                     }
                 }
                 Err(e) => self.status = e,
@@ -3906,7 +4064,23 @@ impl NslApp {
             if was_active && !now_active {
                 self.start_reload();
             }
-            for (key, result) in completions {
+            for notice in completions {
+                let (key, result) = match notice {
+                    torrent::EngineNotice::Download { key, result } => (key, result),
+                    torrent::EngineNotice::Command {
+                        key,
+                        action,
+                        result,
+                    } => {
+                        if let Err(error) = result {
+                            self.status = format!("다운로드 {action} 명령 실패: {error}");
+                            let _ = self
+                                .log_sender
+                                .send(format!("다운로드 명령 실패 ({key}): {error}"));
+                        }
+                        continue;
+                    }
+                };
                 let label = snapshot
                     .iter()
                     .find(|(k, _)| *k == key)
@@ -3926,6 +4100,9 @@ impl NslApp {
                         ));
                     }
                 }
+            }
+            if self.torrent_progress.len() != snapshot.len() {
+                self.cached_tabs_generation = u64::MAX;
             }
             self.torrent_progress = snapshot;
         }
@@ -4436,7 +4613,7 @@ impl NslApp {
                     });
                     return;
                 }
-                let matching = self.library_rows_cached().to_vec();
+                let matching = self.library_rows_cached();
                 let paging_on = self
                     .config
                     .settings
@@ -4570,12 +4747,9 @@ impl NslApp {
                 } else {
                     0
                 };
-                let page_items: Vec<library::GameFile> = matching
-                    .iter()
-                    .skip(page_start)
-                    .take(if paging_on { page_size } else { usize::MAX })
-                    .cloned()
-                    .collect();
+                let page_end = (page_start + if paging_on { page_size } else { matching.len() })
+                    .min(matching.len());
+                let page_items: &[library::GameFile] = &matching[page_start..page_end];
                 if self.view_mode == "grid" {
                     // Virtualized grid: only rows inside the viewport are built.
                     // Building every card (800+ icons) each frame was the main
@@ -4711,9 +4885,9 @@ impl NslApp {
                 } else {
                     let list_width = ui.available_width();
                     let name_width = (list_width - 480.0).max(240.0);
-                    egui::ScrollArea::both().show(ui, |ui| {
+                    egui::ScrollArea::horizontal().show(ui, |ui| {
                         ui.set_min_width(list_width);
-                        egui::Grid::new("library")
+                        egui::Grid::new("library_header")
                             .striped(true)
                             .spacing(egui::vec2(0.0, 0.0))
                             .show(ui, |ui| {
@@ -4774,7 +4948,24 @@ impl NslApp {
                                     }
                                 }
                                 ui.end_row();
-                                for row in &page_items {
+                            });
+                        // Only create table widgets for visible rows. A disabled
+                        // paging setting must not render thousands at once.
+                        let mut list_scroll = egui::ScrollArea::vertical()
+                            .id_salt("library_list_rows")
+                            .auto_shrink([false, false]);
+                        if keyboard_selection_changed {
+                            if let Some(position) = page_items.iter().position(|row| self.selected == Some(row.id)) {
+                                list_scroll = list_scroll.vertical_scroll_offset(position as f32 * 24.0);
+                            }
+                        }
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        list_scroll.show_rows(ui, 24.0, page_items.len(), |ui, row_range| {
+                            egui::Grid::new("library_rows")
+                                .striped(true)
+                                .spacing(egui::vec2(0.0, 0.0))
+                                .show(ui, |ui| {
+                                for row in &page_items[row_range] {
                                     let selected = self.selected == Some(row.id);
                                     let response = selectable_table_text_cell(
                                         ui,
@@ -5008,6 +5199,7 @@ impl NslApp {
                                     ui.end_row();
                                 }
                             });
+                        });
                     });
                 }
                 let duplicate_groups = self.cached_duplicates.clone();
@@ -5218,8 +5410,7 @@ impl NslApp {
         });
         if self.config.settings != settings_before || self.folders != folders_before {
             self.config.scan_folders = self.folders.clone();
-            if let Err(e) =
-                database::save_config(&self.base_dir.join("config.json"), &self.config)
+            if let Err(e) = database::save_config(&self.base_dir.join("config.json"), &self.config)
             {
                 self.status = format!("설정 저장 실패: {e}");
             }
@@ -5705,10 +5896,7 @@ impl NslApp {
                                 "DB: {}",
                                 self.base_dir.join("library.db").display()
                             ));
-                            ui.label(format!(
-                                "캐시: {}",
-                                self.base_dir.join("caches").display()
-                            ));
+                            ui.label(format!("캐시: {}", self.base_dir.join("caches").display()));
                         });
                     });
                     popup_footer(ui, |ui| close = ui.button("확인").clicked());
@@ -6035,10 +6223,8 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                             "view_mode".into(),
                             serde_json::Value::String(app.view_mode.clone()),
                         );
-                        let _ = database::save_config(
-                            &app.base_dir.join("config.json"),
-                            &app.config,
-                        );
+                        let _ =
+                            database::save_config(&app.base_dir.join("config.json"), &app.config);
                     }
                     if ui.button("설정").clicked() {
                         app.settings_open = !app.settings_open;
@@ -6110,16 +6296,8 @@ fn run_headless_scan(mut app: NslApp, incremental: bool) -> i32 {
         eprintln!("error: prod.keys not found next to the executable or in %USERPROFILE%\\.switch");
         return 1;
     }
-    // A CLI scan must not kick off icon/screenshot prefetching afterwards; the
-    // scan-completion handler re-reads these settings.
-    app.config.settings.insert(
-        "scan_icon".into(),
-        serde_json::Value::String("0".into()),
-    );
-    app.config.settings.insert(
-        "scan_screenshot".into(),
-        serde_json::Value::String("0".into()),
-    );
+    // A headless scan must not alter the user's media download preferences.
+    app.headless_mode = true;
     app.start_scan(incremental);
     app.pending_icon_prefetch = false;
     app.pending_screenshot_prefetch = false;
@@ -6135,10 +6313,7 @@ fn run_headless_scan(mut app: NslApp, incremental: bool) -> i32 {
         });
         app.ui_frame(&ctx);
         let _ = ctx.end_pass();
-        if app.scan_result.is_none()
-            && app.reload_result.is_none()
-            && app.scan_progress.is_none()
-        {
+        if app.scan_result.is_none() && app.reload_result.is_none() && app.scan_progress.is_none() {
             break;
         }
         if started.elapsed() > std::time::Duration::from_secs(6 * 60 * 60) {
@@ -6147,11 +6322,7 @@ fn run_headless_scan(mut app: NslApp, incremental: bool) -> i32 {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    let failures = app
-        .log_lines
-        .iter()
-        .filter(|line| line.contains("분석 실패") || line.contains("스캔 오류"))
-        .count();
+    let failures = app.last_scan_errors;
     let stats = match app.db.stats() {
         Ok(stats) => stats,
         Err(error) => {
@@ -6178,7 +6349,8 @@ fn run_headless_scan(mut app: NslApp, incremental: bool) -> i32 {
     }
 }
 
-fn load_window_icon() -> Option<egui::IconData> {    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
+fn load_window_icon() -> Option<egui::IconData> {
+    const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
     let image = image::load_from_memory_with_format(ICON_BYTES, image::ImageFormat::Ico).ok()?;
     let rgba = image.to_rgba8();
     if rgba.width() == 0 || rgba.height() == 0 {
@@ -6460,6 +6632,94 @@ mod runtime_tests {
     }
 
     #[test]
+    fn incremental_scan_reanalyzes_unchanged_files_on_schema_change() {
+        let (mut app, dir) = seeded_app();
+        let folder = dir.path().join("synthetic-games");
+        std::fs::create_dir_all(&folder).unwrap();
+        let filename = "Test [0100D2C0115B6000][v123].nsp";
+        let path = folder.join(filename);
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+        let normalized = normalize_scan_path(&path);
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64());
+        app.db
+            .upsert_files(&[database::FileRecord {
+                path: normalized.clone(),
+                filename: filename.into(),
+                size: metadata.len() as i64,
+                mtime,
+                file_type: "nsp".into(),
+                scan_folder: normalize_scan_path(&folder),
+                fast_hash: scanner::fast_hash(&path).unwrap(),
+                nacp_ko: String::new(),
+                nacp_en: String::new(),
+                nacp_ja: String::new(),
+                contents: vec![scanner::Content {
+                    title_id: Some("0100D2C0115B6000".into()),
+                    version: 999,
+                    content_type: "base".into(),
+                    source: "old_schema".into(),
+                }],
+            }])
+            .unwrap();
+        app.folders = vec![normalize_scan_path(&folder)];
+        app.config.settings.insert("scan_schema".into(), "0".into());
+        app.headless_mode = true;
+        app.start_scan(true);
+        let ctx = egui::Context::default();
+        assert!(run_until_idle(&mut app, &ctx));
+        let contents = app.db.file_contents(&normalized).unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0].version, 123,
+            "unchanged metadata must not bypass schema upgrade"
+        );
+    }
+
+    #[test]
+    fn missing_dlc_exclusion_invalidates_stats_and_list_cache() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        let id = "0100D2C0115B7001";
+        let base = app.rows.iter_mut().find(|row| row.has_base).unwrap();
+        base.missing_dlcs = vec![(id.into(), "DLC".into())];
+        app.rows_generation += 1;
+        app.folder_filter = "MISSING_DLCS".into();
+        app.refresh_library_stats();
+        assert_eq!(app.cached_missing_dlcs, 1);
+        assert_eq!(app.library_rows_cached().len(), 1);
+        app.config
+            .settings
+            .insert("exception_dlc".into(), id.into());
+        app.refresh_library_stats();
+        assert_eq!(app.cached_missing_dlcs, 0);
+        assert_eq!(app.library_rows_cached().len(), 0);
+    }
+
+    #[test]
+    fn store_catalog_does_not_truncate_at_two_thousand_entries() {
+        let (mut app, _dir) = seeded_app();
+        app.catalog_state.items = (0..2_101)
+            .map(|i| catalog::CatalogItem {
+                title: format!("Catalog item {i}"),
+                magnet: format!("magnet:?xt=urn:btih:{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.folder_filter = "CATALOG".into();
+        run_app_ticks(&mut app, 2);
+        assert_eq!(app.catalog_matching_indices.len(), 2_101);
+        app.catalog_page = 21;
+        run_app_ticks(&mut app, 1);
+        assert_eq!(app.catalog_page, 21);
+    }
+
+    #[test]
     fn headless_app_loads_library_and_renders_every_screen() {
         let (mut app, _dir) = seeded_app();
         let ctx = run_app_ticks(&mut app, 2);
@@ -6527,7 +6787,10 @@ mod runtime_tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(app.titledb_result.is_none(), "title database import stalled");
+        assert!(
+            app.titledb_result.is_none(),
+            "title database import stalled"
+        );
         assert_eq!(app.db.stats().unwrap().title_db_count, 1);
 
         // A second construction must not re-import an already populated table.
@@ -6623,7 +6886,9 @@ mod runtime_tests {
             });
             app.ui_frame(&ctx);
             let _ = ctx.end_pass();
-            if app.scan_result.is_none() && app.reload_result.is_none() && app.scan_progress.is_none()
+            if app.scan_result.is_none()
+                && app.reload_result.is_none()
+                && app.scan_progress.is_none()
             {
                 finished = true;
                 break;
@@ -6639,22 +6904,33 @@ mod runtime_tests {
             .iter()
             .filter(|line| line.contains("분석 실패"))
             .count();
-        assert_eq!(failures, 0, "no file may fail analysis; status: {}", app.status);
+        assert_eq!(
+            failures, 0,
+            "no file may fail analysis; status: {}",
+            app.status
+        );
         assert!(
             count > 700,
             "expected the full library, scanned only {count} rows"
         );
-        assert_eq!(stats.base_count, 800, "base rows must match the reference library");
-        assert_eq!(stats.update_count, 710, "update rows must match the reference library");
-        assert_eq!(stats.dlc_count, 3137, "dlc rows must match the reference library");
+        assert_eq!(
+            stats.base_count, 800,
+            "base rows must match the reference library"
+        );
+        assert_eq!(
+            stats.update_count, 710,
+            "update rows must match the reference library"
+        );
+        assert_eq!(
+            stats.dlc_count, 3137,
+            "dlc rows must match the reference library"
+        );
 
         // Every discovered file must carry a fast hash so the next pass can reuse it.
         let cached = app.db.cached_file_records().unwrap();
         assert_eq!(cached.len(), count);
         assert!(cached.values().all(|record| !record.fast_hash.is_empty()));
-        assert!(cached
-            .values()
-            .all(|record| !record.contents.is_empty()));
+        assert!(cached.values().all(|record| !record.contents.is_empty()));
     }
 
     /// Incremental pass must reuse the cache written by the full pass, keep the
@@ -6711,7 +6987,9 @@ mod runtime_tests {
             });
             app.ui_frame(ctx);
             let _ = ctx.end_pass();
-            if app.scan_result.is_none() && app.reload_result.is_none() && app.scan_progress.is_none()
+            if app.scan_result.is_none()
+                && app.reload_result.is_none()
+                && app.scan_progress.is_none()
             {
                 return true;
             }

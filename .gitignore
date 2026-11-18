@@ -12,10 +12,15 @@
 /library.db-shm
 /library.db-wal
 /config.json
+/config.json.bak
+/config.json.tmp
+/temp/
+/workspaces/
 /caches/
 /icons/
 /screenshots/
 /titledb/*.json
+/titledb/*.json.tmp
 /prod.keys
 /title.keys
 

@@ -31,11 +31,11 @@ The package contains only:
 - `nsl.exe`
 - `bin/nstool.exe`, `bin/hactool.exe`
 - `titledb/*.json` (whichever local title database files exist)
-- an empty `library.db` with the production schema
+- no `library.db`: NSL creates an empty database on first launch, so an update can never overwrite a user's collection
 - `nsl-rust-manifest.json`
 - empty `icons/` and `screenshots/` folders
 
-Packaging refuses to continue if the archive would contain `prod.keys`, `title.keys`, a populated database, or any local configuration, so a developer machine's library cannot leak into a release. Attach the ZIP to the corresponding GitHub release to enable the in-app updater. The updater ignores the Python `.exe`/ZIP assets and validates the Rust package manifest before staging replacement. The original PyInstaller build files remain available for the Python application.
+Packaging refuses to continue if the archive would contain `prod.keys`, `title.keys`, **any database**, or any local configuration. The Rust updater accepts only the project's HTTPS GitHub release URL and checks the per-binary SHA-256 hashes in the package manifest. It atomically replaces **only `nsl.exe`, `bin/nstool.exe`, `bin/hactool.exe` and the manifest**, retaining settings, SQLite database, local title database, download session and caches. The update helper attempts rollback if a replacement fails. Attach the ZIP to the corresponding GitHub release to enable in-app updating. This checksum guards package integrity but is not a publisher signature.
 
 ## Port coverage
 
@@ -72,16 +72,17 @@ The standard suite covers:
 - Windows path normalization and cached-record reuse without localized NACP names
 - a headless egui run of the real application: library load, grid/list switching, all six settings categories, all four detail tabs, dialogs, search by name/filename/title id, and the folder/DLC filter paths
 
-Two checks are ignored by default because they need the local corpus:
+Three checks are ignored by default because they need the local corpus:
 
 ```powershell
 cargo test scans_small_real_nsp_and_nsz_against_library_records -- --ignored
 cargo test full_scan_of_real_corpus_matches_existing_library -- --ignored
+cargo test incremental_scan_reuses_cache_after_full_scan -- --ignored
 ```
 
 The first compares the smallest registered NSP and NSZ on-disk fast hashes and parsed title id, version, and content type against the existing library. The second performs a real full scan of every scan folder into a scratch database and asserts the exact reference totals (800 base, 710 update, 3,137 DLC content rows across 846 files) with zero analysis failures and a populated fast hash/cache entry for every file.
 
-### Release checklist results
+### Historical Rust port checklist (prior to November 18 hardening)
 
 - `cargo build --release`: clean, no warnings.
 - `cargo clippy --all-targets`: no warnings.
@@ -96,3 +97,12 @@ The first compares the smallest registered NSP and NSZ on-disk fast hashes and p
 - An idle instance reports `RAM: ~150 MB | CPU: ~0%`, confirming the icon missing-cache avoids the per-frame retry loop.
 
 The Rust port still differs in presentation details, including the Python app's rich log formatting and theme-card settings page; settings are combined into a scrollable drawer.
+
+### Reliability and performance hardening (November 18, 2026)
+
+- Full-folder scan pruning is disabled for roots containing unreadable descendants; empty/truncated packages fail analysis instead of being reported as successful. Schema changes also trigger re-analysis during incremental scans.
+- The headless scanner no longer persists disabled screenshot/icon download preferences. Title DB replacement uses one SQLite transaction; JSON config, catalog, title DB JSON files, and image caches are replaced atomically.
+- Torrents use validated per-infohash subfolders, restore completed/paused jobs from child folders on restart, distinguish command acknowledgements from verified transfer completion, propagate transfer errors, and support cancelling the magnet metadata handshake. Clearing torrent session metadata is scheduled for the next launch before the engine starts, never while it is writing.
+- The library render cache shares data with an `Arc` rather than cloning every result per frame; the list view and grid view virtualize visible rows. Store search indexes every catalog entry (no 2,000-row cap) and cover textures have a 128-entry LRU limit.
+- Image downloads use a 32 MB network limit and a predecode pixel cap. Converting a new NSZ/XCZ no longer silently deletes previously converted files while a game may still be running.
+- Unit tests cover automatic-update safeguards, config recovery, transactional DB rollback, schema re-analysis, corrupt archives, and download path containment. See `QA_FIXES_2026-11-18.md` for current execution results and unverified external tests.

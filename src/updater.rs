@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::{
-    fs, io,
+    collections::HashMap,
+    fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -39,6 +42,29 @@ struct PackageManifest {
     application: String,
     version: String,
     platform: String,
+    sha256: HashMap<String, String>,
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut reader = io::BufReader::new(fs::File::open(path)?);
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn trusted_release_url(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.path().starts_with("/UzuCore/NSL/releases/download/")
+    })
 }
 
 fn http_agent(timeout: Duration) -> ureq::Agent {
@@ -90,6 +116,10 @@ pub fn check_latest() -> Result<ReleaseInfo> {
 }
 
 pub fn download_and_prepare(url: &str, expected_version: &str, base_dir: &Path) -> Result<PathBuf> {
+    anyhow::ensure!(
+        trusted_release_url(url),
+        "update URL is not a trusted NSL GitHub release"
+    );
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -106,14 +136,20 @@ pub fn download_and_prepare(url: &str, expected_version: &str, base_dir: &Path) 
         .call()
         .context("Rust update download failed")?;
     let mut file = fs::File::create(&archive)?;
-    io::copy(&mut response.into_reader(), &mut file).context("could not save update archive")?;
+    const MAX_PACKAGE_SIZE: u64 = 512 * 1024 * 1024;
+    let downloaded = io::copy(
+        &mut response.into_reader().take(MAX_PACKAGE_SIZE + 1),
+        &mut file,
+    )
+    .context("could not save update archive")?;
+    anyhow::ensure!(
+        downloaded <= MAX_PACKAGE_SIZE,
+        "update archive exceeds 512 MB"
+    );
     drop(file);
 
     let script = task_dir.join("extract.ps1");
-    fs::write(
-        &script,
-        "param([string]$ArchivePath, [string]$DestinationPath)\n$ErrorActionPreference = 'Stop'\nExpand-Archive -LiteralPath $ArchivePath -DestinationPath $DestinationPath -Force\n",
-    )?;
+    fs::write(&script, include_str!("../scripts/extract-update.ps1"))?;
     let mut command = Command::new("powershell.exe");
     #[cfg(windows)]
     {
@@ -165,6 +201,20 @@ pub fn download_and_prepare(url: &str, expected_version: &str, base_dir: &Path) 
             anyhow::bail!("update package is incomplete: missing {relative}");
         }
     }
+    for relative in ["nsl.exe", "bin/nstool.exe", "bin/hactool.exe"] {
+        let expected = manifest
+            .sha256
+            .get(relative)
+            .with_context(|| format!("update manifest is missing SHA-256 for {relative}"))?;
+        anyhow::ensure!(
+            expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid SHA-256 for {relative}"
+        );
+        anyhow::ensure!(
+            hash_file(&extraction.join(relative))?.eq_ignore_ascii_case(expected),
+            "update package integrity check failed for {relative}"
+        );
+    }
     Ok(task_dir)
 }
 
@@ -190,25 +240,33 @@ pub fn launch_apply_and_exit(task_dir: &Path, base_dir: &Path) -> Result<()> {
     if !task.starts_with(&temp) || !task.is_dir() {
         anyhow::bail!("staged update path is outside the app temp folder");
     }
-    let task_name = task
-        .file_name()
+    task.file_name()
         .and_then(|name| name.to_str())
         .filter(|name| name.starts_with("nsl_rust_update_"))
         .ok_or_else(|| anyhow!("staged update folder has an unexpected name"))?;
-    let script = base.join("update-rust.bat");
-    let script_text = format!(
-        "@echo off\r\nsetlocal\r\ntimeout /t 2 /nobreak >nul\r\nxcopy /Y /E /H /C /I \"%~dp0temp\\{task_name}\\package\\*\" \"%~dp0\" >nul\r\nif errorlevel 1 exit /b 1\r\nrmdir /S /Q \"%~dp0temp\\{task_name}\"\r\nstart \"\" \"%~dp0nsl.exe\"\r\n(goto) 2>nul & del \"%~f0\"\r\n"
-    );
-    fs::write(&script, script_text)?;
-    let mut command = Command::new("cmd.exe");
+    // Only application binaries and manifest are installed; user data and
+    // title databases are never overwritten during an automatic update.
+    let script = task.join("apply.ps1");
+    fs::write(&script, include_str!("../scripts/apply-update.ps1"))?;
+    let mut command = Command::new("powershell.exe");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
     command
-        .arg("/C")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(&script)
+        .arg("-BaseDir")
+        .arg(&base)
+        .arg("-TaskDir")
+        .arg(&task)
         .current_dir(&base)
         .spawn()
         .context("could not start update replacement script")?;

@@ -2589,18 +2589,33 @@ impl NslApp {
                         .stroke(egui::Stroke::new(1.0_f32, border))
                         .rounding(egui::Rounding::same(4.0))
                         .inner_margin(egui::Margin::same(6.0));
+                    // Fold child hit results into a boolean instead of
+                    // allocating a Vec for every visible catalog row.
+                    let mut clicked_content = false;
                     let _response = frame.show(ui, |ui| {
                         ui.set_width(row_width - 12.0);
                         ui.set_min_height(60.0);
                         ui.horizontal(|ui| {
                             if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
-                                ui.add(egui::Image::new((cover.id(), egui::vec2(52.0, 52.0))));
+                                clicked_content |= ui
+                                    .add(
+                                        egui::Image::new((cover.id(), egui::vec2(52.0, 52.0)))
+                                            .sense(egui::Sense::click()),
+                                    )
+                                    .clicked();
                             } else {
-                                ui.allocate_ui(egui::vec2(52.0, 52.0), |ui| {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label("🎮");
-                                    });
-                                });
+                                let (rect, cover_response) = ui.allocate_exact_size(
+                                    egui::vec2(52.0, 52.0),
+                                    egui::Sense::click(),
+                                );
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "🎮",
+                                    egui::FontId::proportional(16.0),
+                                    ui.visuals().text_color(),
+                                );
+                                clicked_content |= cover_response.clicked();
                             }
                             let label_width = (ui.available_width() - 120.0).max(64.0);
                             ui.allocate_ui_with_layout(
@@ -2611,8 +2626,10 @@ impl NslApp {
                                         egui::Label::new(
                                             egui::RichText::new(&display_title).size(13.0).strong(),
                                         )
-                                        .truncate(),
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
                                     );
+                                    clicked_content |= name.clicked();
                                     name.on_hover_text(if display_title == item.title {
                                         display_title.clone()
                                     } else {
@@ -2623,25 +2640,29 @@ impl NslApp {
                                         "{id}   ·   {}   ·   {}",
                                         item.image_format, item.size
                                     );
-                                    ui.add(
+                                    let meta_response = ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(meta.clone())
                                                 .size(11.0)
                                                 .color(ui.visuals().weak_text_color()),
                                         )
-                                        .truncate(),
-                                    )
-                                    .on_hover_text(meta);
+                                        .truncate()
+                                        .sense(egui::Sense::click()),
+                                    );
+                                    clicked_content |= meta_response.clicked();
+                                    meta_response.on_hover_text(meta);
                                     if display_title != item.title {
-                                        ui.add(
+                                        let original_title = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&item.title)
                                                     .size(10.0)
                                                     .color(ui.visuals().weak_text_color()),
                                             )
-                                            .truncate(),
-                                        )
-                                        .on_hover_text(&item.title);
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        );
+                                        clicked_content |= original_title.clicked();
+                                        original_title.on_hover_text(&item.title);
                                     }
                                 },
                             );
@@ -2669,8 +2690,10 @@ impl NslApp {
                     });
                     // The background registers before child buttons, so they
                     // keep their own click action while card padding selects.
+                    // Labels and cover images also have their own hit regions.
+                    // Never turn the action button into a selection click.
                     remember_card_geometry(ui.ctx(), card_id, card.rect, _response.response.rect);
-                    if card.clicked() {
+                    if card.clicked() || clicked_content {
                         self.catalog_selected = Some(item.topic_id.clone());
                         ui.ctx().request_repaint();
                     }
@@ -3250,6 +3273,7 @@ impl NslApp {
                             ui.visuals().widgets.noninteractive.bg_stroke.color
                         },
                     ));
+                let mut clicked_content = false;
                 let _row = frame.show(ui, |ui| {
                     ui.set_width((row_width - 20.0).max(200.0));
                     let label = if progress.name.is_empty() {
@@ -3259,21 +3283,25 @@ impl NslApp {
                     };
                     let compact = ui.available_width() < 440.0;
                     if compact {
-                        ui.add(
+                        let label_response = ui.add(
                             egui::Label::new(egui::RichText::new(label).size(13.0).strong())
-                                .truncate(),
-                        )
-                        .on_hover_text(label);
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        );
+                        clicked_content |= label_response.clicked();
+                        label_response.on_hover_text(label);
                         ui.horizontal(|ui| self.download_row_buttons(ui, key, progress));
                     } else {
                         ui.horizontal(|ui| {
                             let label_width = (ui.available_width() - 205.0).max(96.0);
-                            ui.add_sized(
+                            let label_response = ui.add_sized(
                                 [label_width, 22.0],
                                 egui::Label::new(egui::RichText::new(label).size(13.0).strong())
-                                    .truncate(),
-                            )
-                            .on_hover_text(label);
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            );
+                            clicked_content |= label_response.clicked();
+                            label_response.on_hover_text(label);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| self.download_row_buttons(ui, key, progress),
@@ -3284,7 +3312,7 @@ impl NslApp {
                         let fraction =
                             progress.progress_bytes as f32 / progress.total_bytes.max(1) as f32;
                         if progress.finished {
-                            ui.add(
+                            let bar = ui.add(
                                 egui::ProgressBar::new(1.0)
                                     .desired_height(17.0)
                                     .desired_width(ui.available_width())
@@ -3294,8 +3322,9 @@ impl NslApp {
                                         common::format_size(progress.total_bytes)
                                     )),
                             );
+                            clicked_content |= bar.interact(egui::Sense::click()).clicked();
                         } else {
-                            ui.add(
+                            let bar = ui.add(
                                 egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
                                     .desired_height(17.0)
                                     .desired_width(ui.available_width())
@@ -3306,35 +3335,48 @@ impl NslApp {
                                         common::format_size(progress.download_speed_bps),
                                     )),
                             );
+                            clicked_content |= bar.interact(egui::Sense::click()).clicked();
                         }
                     } else {
-                        ui.label(
-                            egui::RichText::new("크기 확인 중… (메타데이터 받는 중)")
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                        clicked_content |= ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new("크기 확인 중… (메타데이터 받는 중)")
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .clicked();
                     }
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(&progress.state)
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
+                        clicked_content |= ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(&progress.state)
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .clicked();
                         if let Some(error) = &progress.error {
-                            ui.add(
+                            let error_response = ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(error)
                                         .small()
                                         .color(egui::Color32::LIGHT_RED),
                                 )
-                                .truncate(),
-                            )
-                            .on_hover_text(error);
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                            );
+                            clicked_content |= error_response.clicked();
+                            error_response.on_hover_text(error);
                         }
                     });
                 });
                 remember_card_geometry(ui.ctx(), card_id, card.rect, _row.response.rect);
-                if card.clicked() {
+                if card.clicked() || clicked_content {
                     self.download_selected = Some(key.clone());
                     ui.ctx().request_repaint();
                 }
@@ -7032,6 +7074,8 @@ impl NslApp {
                                                     grid_card_width,
                                                     row_height,
                                                 );
+                                                let mut icon_response = None;
+                                                let mut title_response = None;
                                                 let _card_response = egui::Frame::none()
                                                     .fill(if selected {
                                                         ui.visuals().selection.bg_fill
@@ -7048,32 +7092,38 @@ impl NslApp {
                                                                 .icon_textures
                                                                 .get(&row.title_id)
                                                             {
-                                                                ui.image((
-                                                                    icon.id(),
-                                                                    egui::vec2(
-                                                                        grid_thumbnail_size,
-                                                                        grid_thumbnail_size,
-                                                                    ),
+                                                                icon_response = Some(ui.add(
+                                                                    egui::Image::new((
+                                                                        icon.id(),
+                                                                        egui::vec2(
+                                                                            grid_thumbnail_size,
+                                                                            grid_thumbnail_size,
+                                                                        ),
+                                                                    ))
+                                                                    .sense(egui::Sense::click()),
                                                                 ));
                                                             } else {
-                                                                ui.allocate_ui(
+                                                                let (rect, response) = ui.allocate_exact_size(
                                                                     egui::vec2(
                                                                         grid_thumbnail_size,
                                                                         grid_thumbnail_size,
                                                                     ),
-                                                                    |ui| {
-                                                                        ui.centered_and_justified(
-                                                                            |ui| {
-                                                                                ui.label("🎮");
-                                                                            },
-                                                                        );
-                                                                    },
+                                                                    egui::Sense::click(),
                                                                 );
+                                                                ui.painter().text(
+                                                                    rect.center(),
+                                                                    egui::Align2::CENTER_CENTER,
+                                                                    "🎮",
+                                                                    egui::FontId::proportional(14.0),
+                                                                    ui.visuals().text_color(),
+                                                                );
+                                                                icon_response = Some(response);
                                                             }
-                                                            ui.add(
+                                                            title_response = Some(ui.add(
                                                                 egui::Label::new(&row.title_name)
-                                                                    .truncate(),
-                                                            );
+                                                                    .truncate()
+                                                                    .sense(egui::Sense::click()),
+                                                            ));
                                                         });
                                                     });
                                                 // One click target for the complete grid card,
@@ -7084,7 +7134,17 @@ impl NslApp {
                                                     card.rect,
                                                     _card_response.response.rect,
                                                 );
-                                                let response = card;
+                                                // Child image/label widgets have their own
+                                                // hit regions. Merge them with the card so
+                                                // clicking artwork or title selects exactly as
+                                                // clicking the surrounding padding does.
+                                                let mut response = card;
+                                                if let Some(icon) = icon_response {
+                                                    response |= icon;
+                                                }
+                                                if let Some(title) = title_response {
+                                                    response |= title;
+                                                }
                                                 #[cfg(test)]
                                                 let hit_rect = response.rect;
                                                 if response.clicked() {
@@ -7119,6 +7179,15 @@ impl NslApp {
                                                         data.insert_temp(
                                                             egui::Id::new("nsl_test_grid_first_card_hit_rect"),
                                                             hit_rect,
+                                                        );
+                                                    });
+                                                }
+                                                #[cfg(test)]
+                                                if page_items.get(1).is_some_and(|second| second.id == row.id) {
+                                                    ctx.data_mut(|data| {
+                                                        data.insert_temp(
+                                                            egui::Id::new("nsl_test_grid_second_card"),
+                                                            _card_response.response.rect,
                                                         );
                                                     });
                                                 }
@@ -9741,12 +9810,16 @@ mod runtime_tests {
     /// Clicks the same coordinate using real egui pointer events (press and
     /// release), so selection cannot pass merely from matching cell bounds.
     fn click_cell(ctx: &egui::Context, app: &mut NslApp, pos: egui::Pos2, width: f32, height: f32) {
-        for pressed in [true, false] {
+        // Separate successive independent tests by more than egui's
+        // double-click interval so QA never accidentally launches a game.
+        let click_time = ctx.input(|input| input.time) + 1.0;
+        for (phase, pressed) in [true, false].into_iter().enumerate() {
             ctx.begin_pass(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(width, height),
                 )),
+                time: Some(click_time + 0.03 * phase as f64),
                 events: vec![
                     egui::Event::PointerMoved(pos),
                     egui::Event::PointerButton {
@@ -9764,11 +9837,21 @@ mod runtime_tests {
     }
 
     fn draw_card_test_frames(ctx: &egui::Context, app: &mut NslApp, count: usize) {
+        draw_card_test_frames_at(ctx, app, count, 1456.0, 900.0);
+    }
+
+    fn draw_card_test_frames_at(
+        ctx: &egui::Context,
+        app: &mut NslApp,
+        count: usize,
+        width: f32,
+        height: f32,
+    ) {
         for _ in 0..count {
             ctx.begin_pass(egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(1456.0, 900.0),
+                    egui::vec2(width, height),
                 )),
                 ..Default::default()
             });
@@ -9906,6 +9989,310 @@ mod runtime_tests {
                 && (selected.size() - card.size()).length() < 20.0,
             "grid selection background does not cover the clicked card: {selected:?} versus {card:?}"
         );
+    }
+
+    #[test]
+    fn grid_card_clicks_on_artwork_title_edges_at_three_window_widths() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.view_mode = "grid".into();
+        for (width, height) in [(1456.0, 900.0), (980.0, 760.0), (720.0, 690.0)] {
+            for region in ["artwork", "title", "right margin", "bottom margin"] {
+                // A real deselection closes the library detail sidebar and
+                // changes the grid width. Render that change BEFORE deriving
+                // the next click point, as users see the resized card.
+                app.selected = None;
+                draw_card_test_frames_at(&ctx, &mut app, 3, width, height);
+                let rect = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_first_card"))
+                        .expect("grid first card missing")
+                });
+                assert!(rect.width() > 120.0 && rect.bottom() < height);
+                let point = match region {
+                    "artwork" => rect.left_top() + egui::vec2(rect.width() / 2.0, 35.0),
+                    "title" => rect.left_bottom() + egui::vec2(rect.width() / 2.0, -25.0),
+                    "right margin" => rect.right_center() - egui::vec2(4.0, 0.0),
+                    _ => rect.right_bottom() - egui::vec2(6.0, 4.0),
+                };
+                click_cell(&ctx, &mut app, point, width, height);
+                assert!(
+                    app.selected.is_some(),
+                    "grid {region} did not select at {width}x{height}: card={rect:?}, point={point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn store_card_cover_name_metadata_and_padding_select_across_window_widths() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![catalog::CatalogItem {
+            title: "Whole store card".into(),
+            topic_id: "whole-store-row".into(),
+            title_id: Some("0100D2C0115B6000".into()),
+            image_format: "NSZ".into(),
+            size: "16 MB".into(),
+            cover: String::new(),
+            ..Default::default()
+        }];
+        app.catalog_title_metadata_loaded = true;
+        app.catalog_search_cache = None;
+        app.torrent_engine = None;
+        for (width, height) in [(1456.0, 900.0), (980.0, 760.0), (720.0, 690.0)] {
+            for region in ["cover", "name", "metadata", "bottom padding"] {
+                app.catalog_selected = None;
+                draw_card_test_frames_at(&ctx, &mut app, 3, width, height);
+                let rect = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_row"))
+                        .expect("store first row missing")
+                });
+                let point = match region {
+                    "cover" => rect.left_top() + egui::vec2(30.0, 30.0),
+                    "name" => rect.left_top() + egui::vec2(98.0, 16.0),
+                    "metadata" => rect.left_top() + egui::vec2(98.0, 37.0),
+                    _ => rect.left_bottom() + egui::vec2(4.0, -4.0),
+                };
+                assert!(rect.contains(point), "invalid store target {point:?}");
+                click_cell(&ctx, &mut app, point, width, height);
+                assert_eq!(
+                    app.catalog_selected.as_deref(),
+                    Some("whole-store-row"),
+                    "store {region} did not select at {width}: {point:?} in {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn download_card_name_progress_state_and_padding_select_across_widths() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None; // No file or network activity in this QA.
+        app.torrent_progress = vec![(
+            "download-full-cell".into(),
+            torrent::TorrentProgress {
+                name: "Example download title".into(),
+                state: "다운로드 중".into(),
+                total_bytes: 1_000_000,
+                progress_bytes: 250_000,
+                download_speed_bps: 4_000,
+                ..Default::default()
+            },
+        )];
+        for (width, height) in [(1456.0, 900.0), (980.0, 760.0), (720.0, 690.0)] {
+            for region in ["name", "progress", "status", "bottom padding"] {
+                app.download_selected = None;
+                draw_card_test_frames_at(&ctx, &mut app, 3, width, height);
+                let rect = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_first_row"))
+                        .expect("download first row missing")
+                });
+                let point = match region {
+                    "name" => rect.left_top() + egui::vec2(40.0, 23.0),
+                    "progress" => rect.center(),
+                    "status" => rect.left_bottom() + egui::vec2(38.0, -23.0),
+                    _ => rect.left_bottom() + egui::vec2(3.0, -3.0),
+                };
+                assert!(rect.contains(point), "invalid download point {point:?}");
+                click_cell(&ctx, &mut app, point, width, height);
+                assert_eq!(
+                    app.download_selected.as_deref(),
+                    Some("download-full-cell"),
+                    "download {region} did not select at {width}: {point:?} in {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_grid_icon_and_store_cover_are_clickable_whole_card_targets() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        let texture = ctx.load_texture(
+            "stage15-synthetic-artwork",
+            egui::ColorImage::new([24, 24], egui::Color32::from_rgb(33, 88, 153)),
+            egui::TextureOptions::LINEAR,
+        );
+        for row in &app.rows {
+            app.icon_textures
+                .insert(row.title_id.clone(), texture.clone());
+        }
+        app.view_mode = "grid".into();
+        app.selected = None;
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let grid = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_first_card"))
+                .expect("grid texture card missing")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            grid.left_top() + egui::vec2(grid.width() / 2.0, 35.0),
+            1456.0,
+            900.0,
+        );
+        assert!(
+            app.selected.is_some(),
+            "loaded grid texture blocked selection"
+        );
+
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![catalog::CatalogItem {
+            title: "Store cover test".into(),
+            topic_id: "stage15-cover".into(),
+            ..Default::default()
+        }];
+        app.catalog_cover_textures
+            .insert("stage15-cover".into(), texture);
+        app.catalog_title_metadata_loaded = true;
+        app.catalog_search_cache = None;
+        app.catalog_selected = None;
+        app.torrent_engine = None;
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let store = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_row"))
+                .expect("store texture card missing")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            store.left_top() + egui::vec2(32.0, 32.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(
+            app.catalog_selected.as_deref(),
+            Some("stage15-cover"),
+            "loaded store cover blocked selection"
+        );
+    }
+
+    #[test]
+    fn selection_moves_between_distinct_grid_store_and_download_items() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+
+        app.view_mode = "grid".into();
+        // Include both the base title and the DLC test fixture.
+        app.kind_filter.clear();
+        app.selected = None;
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let first_grid = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_first_card"))
+                .expect("first grid card")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            first_grid.left_top() + egui::vec2(4.0, 4.0),
+            1456.0,
+            900.0,
+        );
+        let first_id = app.selected.expect("grid first selection");
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let second_grid = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_second_card"))
+                .expect("second grid card")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            second_grid.left_top() + egui::vec2(4.0, 4.0),
+            1456.0,
+            900.0,
+        );
+        assert_ne!(app.selected, Some(first_id), "grid cannot switch cards");
+
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = ["topic-a", "topic-b"]
+            .iter()
+            .map(|topic| catalog::CatalogItem {
+                title: topic.to_string(),
+                topic_id: topic.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        app.catalog_title_metadata_loaded = true;
+        app.catalog_search_cache = None;
+        app.catalog_selected = None;
+        app.torrent_engine = None;
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let store_first = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_row"))
+                .expect("first store row")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            store_first.left_top() + egui::vec2(3.0, 3.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(app.catalog_selected.as_deref(), Some("topic-a"));
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let store_last = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_last_row"))
+                .expect("second store row")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            store_last.left_top() + egui::vec2(3.0, 3.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(app.catalog_selected.as_deref(), Some("topic-b"));
+
+        app.folder_filter = "DOWNLOADS".into();
+        app.download_selected = None;
+        app.torrent_progress = ["job-a", "job-b"]
+            .iter()
+            .map(|key| {
+                (
+                    key.to_string(),
+                    torrent::TorrentProgress {
+                        name: key.to_string(),
+                        paused: true,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let download_first = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_first_row"))
+                .expect("first download row")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            download_first.left_top() + egui::vec2(4.0, 4.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(app.download_selected.as_deref(), Some("job-a"));
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let download_last = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_last_row"))
+                .expect("second download row")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            download_last.left_top() + egui::vec2(4.0, 4.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(app.download_selected.as_deref(), Some("job-b"));
+        assert_eq!(app.torrent_progress.len(), 2);
     }
 
     #[test]

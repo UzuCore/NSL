@@ -426,20 +426,48 @@ impl TorrentFilePicker {
             } else {
                 "📄"
             };
-            ui.label(egui::RichText::new(icon).size(16.0));
+            let icon_response = ui.label(egui::RichText::new(icon).size(16.0));
+            #[cfg(not(test))]
+            let _ = icon_response;
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(("nsl_test_torrent_node_icon", node.key.as_str())),
+                    icon_response.rect,
+                );
+            });
             let name = if folder {
                 egui::RichText::new(format!("{}  ({}개)", node.name, count)).strong()
             } else {
                 egui::RichText::new(&node.name)
             };
             let name_width = (ui.available_width() - TREE_SIZE_COLUMN - 8.0).max(18.0);
-            let name_response = ui.add_sized(
-                [name_width, TREE_ROW_HEIGHT - 2.0],
-                egui::Label::new(name)
-                    .truncate()
-                    .halign(egui::Align::LEFT)
-                    .sense(egui::Sense::click()),
-            );
+            // egui::Ui::add_sized uses a centered-and-justified child layout.
+            // Even Label::halign(LEFT) cannot move its *widget* to the left,
+            // so short file names were centered in the whole name column.
+            // Reserve the same column width, but place the text at its START
+            // with a non-justified layout, directly beside the file icon.
+            let name_response = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(name_width, TREE_ROW_HEIGHT - 2.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(name)
+                                .truncate()
+                                .halign(egui::Align::LEFT)
+                                .sense(egui::Sense::click()),
+                        )
+                    },
+                )
+                .inner;
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(("nsl_test_torrent_node_name", node.key.as_str())),
+                    name_response.rect,
+                );
+            });
             if name_response.clicked() {
                 if folder {
                     if is_expanded {
@@ -616,6 +644,54 @@ mod tests {
             .collect_visible(&picker.expanded, 0, 0, &mut collapsed);
         assert_eq!(collapsed.len(), 3);
         assert_eq!(picker.selected_count(), 6);
+    }
+
+    #[test]
+    fn explorer_file_names_start_immediately_after_icons_at_every_depth() {
+        for screen_width in [720.0_f32, 980.0, 1456.0] {
+            let mut picker = TorrentFilePicker::new(preview()).unwrap();
+            picker.set_all_expanded(true);
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(screen_width, 800.0),
+                )),
+                ..Default::default()
+            });
+            egui::CentralPanel::default().show(&ctx, |ui| {
+                ui.set_width(650.0);
+                picker.ui(ui);
+            });
+            let _ = ctx.end_pass();
+
+            for path in [
+                "game",
+                "game/base",
+                "game/base/game.nsp",
+                "game/dlc/extra",
+                "game/dlc/extra/a.nsp",
+                "readme.txt",
+            ] {
+                let icon = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new(("nsl_test_torrent_node_icon", path)))
+                        .unwrap_or_else(|| panic!("missing icon for {path} at {screen_width}px"))
+                });
+                let name = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new(("nsl_test_torrent_node_name", path)))
+                        .unwrap_or_else(|| panic!("missing name for {path} at {screen_width}px"))
+                });
+                assert!(
+                    name.left() >= icon.right() - 1.0
+                        && name.left() <= icon.right() + 10.0,
+                    "name must start immediately after its icon, not centered: screen={screen_width}, path={path}, icon={icon:?}, name={name:?}"
+                );
+                assert!(
+                    name.width() < 260.0,
+                    "short filename must not stretch across whole name column: screen={screen_width}, path={path}, name={name:?}"
+                );
+            }
+        }
     }
 
     #[test]

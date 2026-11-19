@@ -6694,9 +6694,36 @@ impl NslApp {
                 }
             }
         }
-        if !self.settings_open && self.folder_filter == "CATALOG" {
-            let sidebar = egui::SidePanel::right("catalog_controls")
-                .default_width(282.0)
+        // Store and Downloads are one management workspace: use the SAME
+        // resize handle, persisted width and egui panel cache on both tabs.
+        // The library's detail panel ("detail"/"sash_pos") remains separate.
+        if !self.settings_open && matches!(self.folder_filter.as_str(), "CATALOG" | "DOWNLOADS") {
+            let panel_id = egui::Id::new("management_controls");
+            let resize_id = panel_id.with("__resize");
+            let saved_width = self
+                .config
+                .settings
+                .get("management_sidebar_width")
+                .and_then(|value| value.as_str())
+                .and_then(|width| width.parse::<f32>().ok())
+                .filter(|width| width.is_finite())
+                .unwrap_or(282.0)
+                .clamp(235.0, 365.0);
+            // A temporarily narrow window or a longer control label may
+            // clamp egui's layout cache. Never save that as a user resize.
+            let was_dragging = ctx
+                .read_response(resize_id)
+                .is_some_and(|response| response.dragged());
+            if !was_dragging {
+                if let Some(mut state) = egui::containers::panel::PanelState::load(ctx, panel_id) {
+                    if (state.size().x - saved_width).abs() > 1.0 {
+                        state.rect.min.x = state.rect.max.x - saved_width;
+                        ctx.data_mut(|data| data.insert_persisted(panel_id, state));
+                    }
+                }
+            }
+            let sidebar = egui::SidePanel::right(panel_id)
+                .default_width(saved_width)
                 .min_width(235.0)
                 .max_width(365.0)
                 .resizable(true)
@@ -6704,37 +6731,36 @@ impl NslApp {
                 .show(ctx, |ui| {
                     ui.scope(|ui| {
                         outlined_action_style(ui);
-                        self.catalog_sidebar_ui(ui, ctx);
+                        if self.folder_filter == "CATALOG" {
+                            self.catalog_sidebar_ui(ui, ctx);
+                        } else {
+                            self.downloads_sidebar_ui(ui);
+                        }
                     });
                 });
+            if ctx
+                .read_response(resize_id)
+                .is_some_and(|response| response.dragged())
+            {
+                let width = egui::containers::panel::PanelState::load(ctx, panel_id)
+                    .map(|state| state.size().x)
+                    .unwrap_or_else(|| sidebar.response.rect.width())
+                    .clamp(235.0, 365.0);
+                if (width - saved_width).abs() > 1.0 {
+                    self.config.settings.insert(
+                        "management_sidebar_width".into(),
+                        serde_json::Value::String(format!("{width:.0}")),
+                    );
+                }
+            }
             #[cfg(test)]
             ctx.data_mut(|data| {
-                data.insert_temp(
-                    egui::Id::new("nsl_test_store_sidebar_rect"),
-                    sidebar.response.rect,
-                );
-            });
-            #[cfg(not(test))]
-            let _ = sidebar;
-        } else if !self.settings_open && self.folder_filter == "DOWNLOADS" {
-            let sidebar = egui::SidePanel::right("download_controls")
-                .default_width(282.0)
-                .min_width(235.0)
-                .max_width(365.0)
-                .resizable(true)
-                .frame(management_sidebar_frame(&ctx.style()))
-                .show(ctx, |ui| {
-                    ui.scope(|ui| {
-                        outlined_action_style(ui);
-                        self.downloads_sidebar_ui(ui);
-                    });
-                });
-            #[cfg(test)]
-            ctx.data_mut(|data| {
-                data.insert_temp(
-                    egui::Id::new("nsl_test_download_sidebar_rect"),
-                    sidebar.response.rect,
-                );
+                let marker = if self.folder_filter == "CATALOG" {
+                    "nsl_test_store_sidebar_rect"
+                } else {
+                    "nsl_test_download_sidebar_rect"
+                };
+                data.insert_temp(egui::Id::new(marker), sidebar.response.rect);
             });
             #[cfg(not(test))]
             let _ = sidebar;
@@ -10566,6 +10592,41 @@ mod runtime_tests {
                 .is_expanded("game/base"),
             "clicking minus must collapse the nested directory"
         );
+        // Folder and file names must stay clickable after being moved left.
+        let folder_name = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new(("nsl_test_torrent_node_name", "game/base")))
+                .expect("folder name hitbox missing")
+        });
+        click_cell(&ctx, &mut app, folder_name.center(), 1456.0, 900.0);
+        assert!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .is_expanded("game/base"),
+            "clicking the left-aligned folder name must expand the folder"
+        );
+        let file_name = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_torrent_node_name",
+                "game/base/a.nsp",
+            )))
+            .expect("nested filename hitbox missing")
+        });
+        click_cell(&ctx, &mut app, file_name.center(), 1456.0, 900.0);
+        assert_eq!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .selected_ids(),
+            vec![1, 2],
+            "clicking a left-aligned filename must toggle only its file"
+        );
         let clear = ctx.data_mut(|data| {
             data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_clear_all"))
                 .unwrap()
@@ -11741,6 +11802,150 @@ mod runtime_tests {
         assert!(
             (top_heights[0] - top_heights[1]).abs() < 3.0,
             "toolbar grows on compact screens: {top_heights:?}"
+        );
+    }
+
+    #[test]
+    fn store_download_share_right_sidebar_width_and_preserve_real_drag_across_tabs() {
+        use egui::containers::panel::PanelState;
+
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.torrent_engine = None;
+        let panel_id = egui::Id::new("management_controls");
+        let resize_id = panel_id.with("__resize");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1456.0, 900.0));
+        let frame = |app: &mut NslApp, events: Vec<egui::Event>| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        };
+        let set_cache = |width: f32| {
+            ctx.data_mut(|data| {
+                data.insert_persisted(
+                    panel_id,
+                    PanelState {
+                        rect: egui::Rect::from_min_size(
+                            egui::pos2(1456.0 - width, 0.0),
+                            egui::vec2(width, 900.0),
+                        ),
+                    },
+                );
+            });
+        };
+        // Both tabs must use the exact same panel cache, including at the
+        // endpoints of the permitted splitter width.
+        for width in [235.0_f32, 282.0, 342.0, 365.0] {
+            app.config.settings.insert(
+                "management_sidebar_width".into(),
+                format!("{width:.0}").into(),
+            );
+            set_cache(width);
+            for tab in ["CATALOG", "DOWNLOADS", "CATALOG", "DOWNLOADS"] {
+                app.folder_filter = tab.into();
+                frame(&mut app, vec![]);
+                let observed = PanelState::load(&ctx, panel_id).unwrap().size().x;
+                assert!(
+                    (observed - width).abs() <= 1.0,
+                    "switching to {tab} changed shared sidebar: requested={width}, actual={observed}"
+                );
+            }
+        }
+        app.config
+            .settings
+            .insert("management_sidebar_width".into(), "282".into());
+        app.config.settings.insert("sash_pos".into(), "440".into());
+        set_cache(282.0);
+        app.folder_filter = "CATALOG".into();
+        frame(&mut app, vec![]);
+        // egui stores response hitboxes separately from the panel cache.
+        // Let the resize handle catch up after the preceding 365px tab.
+        frame(&mut app, vec![]);
+        let start = ctx
+            .read_response(resize_id)
+            .expect("shared sidebar resize handle not rendered")
+            .rect
+            .center();
+        assert!(
+            (start.x - 1174.0).abs() < 3.0,
+            "splitter must line up with the actual right panel: {start:?}"
+        );
+        let target = start + egui::vec2(-53.0, 0.0);
+        let click = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+        frame(&mut app, vec![click(start, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(target)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(target)]);
+        frame(&mut app, vec![click(target, false)]);
+        frame(&mut app, vec![]);
+        let resized = PanelState::load(&ctx, panel_id).unwrap().size().x;
+        assert!(
+            (resized - 335.0).abs() < 3.0,
+            "store resize did not reach target: {resized}"
+        );
+        let persisted = app
+            .config
+            .settings
+            .get("management_sidebar_width")
+            .and_then(|v| v.as_str())
+            .unwrap()
+            .parse::<f32>()
+            .unwrap();
+        assert!(
+            (persisted - resized).abs() <= 2.0,
+            "shared sidebar width was not persisted: stored={persisted} actual={resized}"
+        );
+        for tab in ["DOWNLOADS", "CATALOG", "DOWNLOADS"] {
+            app.folder_filter = tab.into();
+            frame(&mut app, vec![]);
+            let actual = PanelState::load(&ctx, panel_id).unwrap().size().x;
+            assert!(
+                (actual - resized).abs() < 1.0,
+                "resized Store width not shared with {tab}: {actual} vs {resized}"
+            );
+        }
+        // Settings and the library's own independent sash must not overwrite
+        // the shared management width.
+        app.settings_open = true;
+        frame(&mut app, vec![]);
+        app.settings_open = false;
+        app.folder_filter = "CATALOG".into();
+        frame(&mut app, vec![]);
+        assert!(
+            (PanelState::load(&ctx, panel_id).unwrap().size().x - resized).abs() < 1.0,
+            "returning from Settings changed the management sidebar size"
+        );
+        assert_eq!(
+            app.config.settings.get("sash_pos").and_then(|v| v.as_str()),
+            Some("440"),
+            "management resize changed the library detail width"
+        );
+        let disk_config = database::load_config(&app.base_dir.join("config.json")).unwrap();
+        assert_eq!(
+            disk_config.settings.get("management_sidebar_width"),
+            app.config.settings.get("management_sidebar_width"),
+            "shared sidebar width was not saved for the next app launch"
+        );
+        // A stale/clamped egui panel cache must not reset the user's width.
+        ctx.data_mut(|data| {
+            let mut state = data.get_persisted::<PanelState>(panel_id).unwrap();
+            state.rect.min.x = state.rect.max.x - 245.0;
+            data.insert_persisted(panel_id, state);
+        });
+        frame(&mut app, vec![]);
+        assert!(
+            (PanelState::load(&ctx, panel_id).unwrap().size().x - resized).abs() < 1.0,
+            "temporary panel layout changed the saved shared sidebar width"
         );
     }
 

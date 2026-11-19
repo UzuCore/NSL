@@ -53,3 +53,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-verify.
 ```
 
 Only after manually authorizing a compile/build, run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`, and the ignored real-corpus / isolated GUI tests. Do not replace the existing local r22 executable or start workflows without explicit user instruction.
+
+## Follow-up: independent entry range / overlap safety
+
+Further format review found a gap: the shared reader validated each PFS0/HFS0 entry against the container end, but did not reject **overlapping entry regions**. Multiple individually in-bounds records could therefore reference the same underlying bytes. The Rust reader now uses an ordered nonempty-extent map for intersection checks. The strict mode rejects such indexes, while the best-effort metadata mode discards the later overlapping entry and preserves previously validated entries. Adjacent entries and empty/zero-sized files remain accepted.
+
+The independent Python reference validator now performs matching overlap checks and regression cases for PFS0, HFS0, metadata salvage, zero-sized and adjacent entries. No ROM data is modified. Local full-corpus read-only recheck:
+
+| Check | Result |
+| --- | --- |
+| `python -B scripts/qa-rom-index-readonly.py --require-corpus --mutations 5000` | **5,017 synthetic checks passed** |
+| `python -B scripts/qa-rom-index-readonly.py --db scripts/nonexistent-synthetic-library.db --mutations 10000` | **10,017 synthetic checks passed**, independent of a real corpus |
+| Full NSP/NSZ files and readable indexes | **875 checked**, 874 strict-valid + 1 partial |
+| XCI/XCZ roots | **14/14** valid |
+| XCI/XCZ nested partitions | **17/17** valid |
+| Combined PFS0/HFS0 indexes inspected | **906**, **15,274** entries |
+| Overlapping regions in accepted real indexes | **0** in pre-change independent full-corpus audit; new validator preserves counts |
+| `cargo fmt --all -- --check`, `git diff --check` | PASS |
+| `cargo metadata --locked --no-deps --offline --format-version 1` and isolated new/legacy ZIP verification | PASS |
+| Rust execution, cargo test, Clippy, GUI | **NOT RUN** (manual-build policy) |
+
+This is a source security/compatibility improvement with independent format-rule validation. The new Rust overlap-check tests have **not** been compiled or run, so their outcomes must not be reported as Rust test PASS until the user performs the manual build and regression suite.

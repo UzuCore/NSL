@@ -19,6 +19,7 @@ import random
 import sqlite3
 import struct
 import unicodedata
+from bisect import bisect_left
 from pathlib import Path
 
 MAX_FILES = 16_384
@@ -52,6 +53,8 @@ def parse_index(source, base: int, limit: int, kind=None, strict=True):
 
     entries = []
     seen = set()
+    # Keep the validated nonempty extents ordered for overlap detection.
+    occupied = []
     rejected = 0
     for i in range(count):
         row = table[i * entry_size:(i + 1) * entry_size]
@@ -79,6 +82,12 @@ def parse_index(source, base: int, limit: int, kind=None, strict=True):
                 length = limit - start
             else:
                 invalid = True
+        if not invalid and length > 0:
+            position = bisect_left(occupied, (start, -1))
+            if (position > 0 and occupied[position - 1][1] > start) or (
+                position < len(occupied) and occupied[position][0] < start + length
+            ):
+                invalid = True
         if invalid:
             if strict:
                 return None
@@ -86,6 +95,8 @@ def parse_index(source, base: int, limit: int, kind=None, strict=True):
             continue
         assert end <= limit or (actual_kind == "HFS0" and name.lower() in CARD_PARTITIONS)
         seen.add(name.lower())
+        if length > 0:
+            occupied.insert(bisect_left(occupied, (start, -1)), (start, start + length))
         entries.append((name, start, length))
     if not entries:
         return None
@@ -145,6 +156,22 @@ def synthetic_tests(mutation_count=500):
     checks += 1
     hfs[24:32] = struct.pack("<Q", 8 + 513)
     assert parse(hfs, "HFS0") is None
+    checks += 1
+
+    # Adjacent regions are valid, overlapping ones are not. In metadata mode
+    # the first valid region survives and the aliased entry is discarded.
+    for index_kind, entry_size in (("PFS0", 24), ("HFS0", 64)):
+        two_files = make_fixture(index_kind, (("first.nca", b"abcd"), ("second.nca", b"efgh")))
+        assert len(parse(two_files, index_kind)["entries"]) == 2
+        two_files[16 + entry_size:16 + entry_size + 8] = struct.pack("<Q", 2)
+        assert parse(two_files, index_kind) is None
+        valid = parse(two_files, index_kind, strict=False)
+        assert valid and valid["rejected"] == 1 and len(valid["entries"]) == 1
+        checks += 1
+    zero_length = make_fixture(
+        "PFS0", (("empty-1", b""), ("empty-2", b""), ("data.nca", b"x"))
+    )
+    assert len(parse(zero_length, "PFS0")["entries"]) == 3
     checks += 1
 
     # Reject impossible table counts and string lengths before allocating a

@@ -5,7 +5,7 @@
 //! See `licenses/nsrp-MIT.txt`. This module neither extracts nor writes ROMs.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     io::{Read, Seek, SeekFrom},
 };
 
@@ -103,6 +103,9 @@ fn read_inner<R: Read + Seek>(
 
     let mut entries = Vec::with_capacity(count);
     let mut seen = HashSet::with_capacity(count);
+    // Reject aliases: independent entries must not point to overlapping
+    // regions, even when each individual extent lies within the file.
+    let mut extents = BTreeMap::<u64, u64>::new();
     for record in table.chunks_exact(entry_size) {
         let Some(entry) = parse_entry(record, &strings, data_start, file_end, kind) else {
             if strict {
@@ -110,11 +113,32 @@ fn read_inner<R: Read + Seek>(
             }
             continue;
         };
+        let start = data_start.checked_add(entry.offset)?;
+        let end = start.checked_add(entry.size)?;
+        let overlaps = entry.size != 0
+            && (extents
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(_, previous_end)| *previous_end > start)
+                || extents
+                    .range(start..)
+                    .next()
+                    .is_some_and(|(next_start, _)| *next_start < end));
+        if overlaps {
+            if strict {
+                return None;
+            }
+            // In metadata mode, retain the first valid nonoverlapping entry.
+            continue;
+        }
         if !seen.insert(entry.name.to_lowercase()) {
             if strict {
                 return None;
             }
             continue;
+        }
+        if entry.size != 0 {
+            extents.insert(start, end);
         }
         entries.push(entry);
     }
@@ -288,6 +312,42 @@ mod tests {
         assert_eq!(index.entries.len(), 1);
         assert_eq!(index.entries[0].name, "valid.cnmt.nca");
         assert_eq!(index.entries[0].size, 4);
+    }
+
+    #[test]
+    fn rejects_overlapping_data_ranges_but_accepts_adjacent_and_empty_files() {
+        let mut bytes = fixture(
+            Kind::Pfs0,
+            &[("first.nca", b"abcd"), ("second.nca", b"efgh")],
+        );
+        assert_eq!(parse(&bytes, Kind::Pfs0).unwrap().entries.len(), 2);
+        // The second entry now aliases the final two bytes of the first.
+        bytes[16 + 24..16 + 24 + 8].copy_from_slice(&2u64.to_le_bytes());
+        assert!(parse(&bytes, Kind::Pfs0).is_none());
+        let partial = read_for_metadata(
+            &mut Cursor::new(&bytes),
+            0,
+            bytes.len() as u64,
+            Some(Kind::Pfs0),
+        )
+        .expect("first entry remains valid for metadata");
+        assert_eq!(partial.entries.len(), 1);
+        assert_eq!(partial.entries[0].name, "first.nca");
+
+        let with_empty = fixture(
+            Kind::Pfs0,
+            &[("empty-a", b""), ("empty-b", b""), ("data.nca", b"x")],
+        );
+        assert_eq!(parse(&with_empty, Kind::Pfs0).unwrap().entries.len(), 3);
+    }
+
+    #[test]
+    fn rejects_overlapping_hfs0_partitions() {
+        let mut bytes = fixture(Kind::Hfs0, &[("secure", b"abcd"), ("normal", b"efgh")]);
+        assert!(parse(&bytes, Kind::Hfs0).is_some());
+        // HFS0 table entries are 64 bytes wide.
+        bytes[16 + 64..16 + 64 + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(parse(&bytes, Kind::Hfs0).is_none());
     }
 
     #[test]

@@ -78,6 +78,21 @@ pub struct GameFile {
     pub missing_dlcs: Vec<(String, String)>,
 }
 
+/// Store metadata for owned and unowned catalog titles. Loaded in indexed
+/// batches in a worker, not on the UI frame/render thread.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogTitleDetails {
+    pub name: String,
+    pub version: i64,
+    pub release_date: String,
+    pub num_players: String,
+    pub rating: String,
+    pub region: String,
+    pub description: String,
+    pub screenshots: String,
+    pub languages: String,
+}
+
 #[derive(Clone)]
 struct Content {
     title_id: Option<String>,
@@ -290,6 +305,55 @@ impl Database {
             },
         )?)
     }
+    /// A Store catalog can contain thousands of uninstalled titles. Resolve
+    /// their metadata by indexed title_id lookups in bounded SQLite batches,
+    /// instead of scanning 46k descriptions or issuing a query per UI row.
+    pub fn catalog_title_details(
+        &self,
+        base_title_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, CatalogTitleDetails>> {
+        let mut ids = base_title_ids
+            .iter()
+            .filter(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(|id| id.to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let conn = self.connect()?;
+        let mut result = HashMap::with_capacity(ids.len());
+        for chunk in ids.chunks(400) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT title_id,COALESCE(name,''),COALESCE(version,0),\
+                 COALESCE(release_date,''),COALESCE(num_players,''),COALESCE(rating,''),\
+                 COALESCE(region,''),COALESCE(description,''),COALESCE(screenshots,'[]'),\
+                 COALESCE(languages,'') FROM title_db WHERE title_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    CatalogTitleDetails {
+                        name: row.get(1)?,
+                        version: row.get(2)?,
+                        release_date: row.get(3)?,
+                        num_players: row.get(4)?,
+                        rating: row.get(5)?,
+                        region: row.get(6)?,
+                        description: row.get(7)?,
+                        screenshots: row.get(8)?,
+                        languages: row.get(9)?,
+                    },
+                ))
+            })?;
+            for item in rows {
+                let (id, details) = item?;
+                result.insert(id.to_ascii_uppercase(), details);
+            }
+        }
+        Ok(result)
+    }
+
     pub fn files(&self, name_mode: &str) -> Result<Vec<GameFile>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
@@ -916,6 +980,45 @@ mod tests {
             region: "US".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn catalog_metadata_reads_only_requested_base_ids_across_sqlite_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("library.db")).unwrap();
+        db.init().unwrap();
+        let mut first = title("0100D2C0115B6000", "타이틀 DB 이름", 131072);
+        first.description = "게임 설명\n두 번째 줄".into();
+        first.release_date = "20261119".into();
+        first.num_players = "1-4".into();
+        first.rating = "E".into();
+        first.languages = "Korean, English".into();
+        first.screenshots = "[\"https://example.org/one.jpg\"]".into();
+        db.load_titles(&[
+            first,
+            title("0100D2C0115B7001", "DLC", 0),
+            title("0100ABCDEF012000", "Another game", 0),
+        ])
+        .unwrap();
+        let mut requested = HashSet::new();
+        requested.insert("0100D2C0115B6000".into());
+        for i in 0..900 {
+            requested.insert(format!("A00000000{i:07X}"));
+        }
+        // Dynamic IDs are always passed as parameters, never as SQL text.
+        requested.insert("0100' OR 1=1 --".into());
+        let result = db.catalog_title_details(&requested).unwrap();
+        assert_eq!(result.len(), 1);
+        let details = &result["0100D2C0115B6000"];
+        assert_eq!(details.name, "타이틀 DB 이름");
+        assert_eq!(details.version, 131072);
+        assert_eq!(details.release_date, "20261119");
+        assert_eq!(details.num_players, "1-4");
+        assert_eq!(details.rating, "E");
+        assert_eq!(details.description, "게임 설명\n두 번째 줄");
+        assert!(details.screenshots.contains("one.jpg"));
+        assert_eq!(details.languages, "Korean, English");
+        assert_eq!(db.stats().unwrap().title_db_count, 3);
     }
 
     #[test]

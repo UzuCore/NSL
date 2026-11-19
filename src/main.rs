@@ -706,13 +706,21 @@ struct NslApp {
     catalog_search: String,
     catalog_search_committed: String,
     catalog_search_cache: Option<String>,
+    catalog_user_filter_cache: Option<String>,
     catalog_matching_indices: Vec<usize>,
     catalog_search_pending: Option<std::time::Instant>,
     catalog_page: usize,
     catalog_genre_filter: String,
     catalog_format_filter: String,
+    catalog_language_filter: String,
     catalog_scroll_reset: bool,
     catalog_selected: Option<String>,
+    catalog_owned: HashMap<String, CatalogOwnedSummary>,
+    catalog_title_details: HashMap<String, database::CatalogTitleDetails>,
+    catalog_title_load_result: Option<
+        Receiver<std::result::Result<HashMap<String, database::CatalogTitleDetails>, String>>,
+    >,
+    catalog_title_metadata_loaded: bool,
     catalog_cover_dir: PathBuf,
     catalog_cover_textures: HashMap<String, egui::TextureHandle>,
     catalog_cover_lru: VecDeque<String>,
@@ -773,6 +781,117 @@ const STORE_FORMATS: [(&str, &str); 6] = [
     ("XCZ", "XCZ"),
     ("NRO", "NRO"),
 ];
+const STORE_LANGUAGES: [(&str, &str); 16] = [
+    ("all", "전체 언어"),
+    ("ko", "한국어"),
+    ("en", "영어"),
+    ("ja", "일본어"),
+    ("zh", "중국어"),
+    ("ru", "러시아어"),
+    ("es", "스페인어"),
+    ("fr", "프랑스어"),
+    ("de", "독일어"),
+    ("it", "이탈리아어"),
+    ("pt", "포르투갈어"),
+    ("pl", "폴란드어"),
+    ("nl", "네덜란드어"),
+    ("tr", "튀르키예어"),
+    ("uk", "우크라이나어"),
+    ("none", "텍스트 없음"),
+];
+
+/// Match only languages explicitly listed by the source. A vague "Multi 10"
+/// marker must not be interpreted as Korean (or any other language).
+fn catalog_matches_language(source: &str, language: &str) -> bool {
+    if language == "all" {
+        return true;
+    }
+    if language == "none" {
+        return source.eq_ignore_ascii_case("No text");
+    }
+    let names: &[&str] = match language {
+        "ko" => &["korean", "kor", "ko"],
+        "en" => &["english", "eng", "en"],
+        "ja" => &["japanese", "jap", "jpn", "ja"],
+        "zh" => &["chinese", "chn", "chi", "chs", "cht", "zh"],
+        "ru" => &["russian", "rus", "ru"],
+        "es" => &["spanish", "esp", "spa", "es"],
+        "fr" => &["french", "fra", "fre", "fr"],
+        "de" => &["german", "ger", "deu", "de"],
+        "it" => &["italian", "ita", "it"],
+        "pt" => &["portuguese", "por", "pt"],
+        "pl" => &["polish", "pol", "pl"],
+        "nl" => &["dutch", "nld", "dut", "nl"],
+        "tr" => &["turkish", "tur", "tr"],
+        "uk" => &["ukrainian", "ukr", "uk"],
+        _ => return false,
+    };
+    source
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| names.iter().any(|name| word.eq_ignore_ascii_case(name)))
+}
+
+fn catalog_item_matches_language(
+    item: &catalog::CatalogItem,
+    metadata: Option<&database::CatalogTitleDetails>,
+    language: &str,
+) -> bool {
+    catalog_matches_language(&item.interface_lang, language)
+        || metadata.is_some_and(|details| catalog_matches_language(&details.languages, language))
+}
+
+#[derive(Clone, Debug, Default)]
+struct CatalogOwnedSummary {
+    display_name: String,
+    has_base: bool,
+    has_update: bool,
+    update_version: i64,
+    dlc_count: usize,
+    file_count: usize,
+}
+
+fn catalog_base_id(id: &str) -> Option<String> {
+    let parsed = u64::from_str_radix(id, 16).ok()?;
+    (id.len() == 16).then(|| format!("{:016X}", parsed & !0x1FFF))
+}
+
+fn catalog_owned_summaries(rows: &[library::GameFile]) -> HashMap<String, CatalogOwnedSummary> {
+    let mut owned = HashMap::<String, CatalogOwnedSummary>::new();
+    for row in rows {
+        let Some(base) = catalog_base_id(&row.title_id) else {
+            continue;
+        };
+        let entry = owned.entry(base).or_default();
+        if entry.display_name.is_empty() || (row.has_base && !entry.has_base) {
+            entry.display_name.clone_from(&row.title_name);
+        }
+        entry.has_base |= row.has_base;
+        entry.has_update |= row.has_update;
+        entry.update_version = entry.update_version.max(row.update_version);
+        entry.dlc_count = entry.dlc_count.max(row.dlc_count);
+        entry.file_count += 1;
+    }
+    owned
+}
+
+fn catalog_preferred_title<'a>(
+    item: &'a catalog::CatalogItem,
+    metadata: Option<&'a database::CatalogTitleDetails>,
+    owned: Option<&'a CatalogOwnedSummary>,
+) -> &'a str {
+    // Database::files uses the exact Settings > name_mode priority, including
+    // Korean/English/Japanese NACP names for owned games.
+    if let Some(owned) = owned {
+        if !owned.display_name.is_empty() {
+            return &owned.display_name;
+        }
+    }
+    metadata
+        .map(|details| details.name.as_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&item.title)
+}
+
 const DOWNLOAD_STATUSES: [(&str, &str); 5] = [
     ("all", "전체 작업"),
     ("active", "진행 중"),
@@ -1137,13 +1256,19 @@ impl NslApp {
             catalog_search: String::new(),
             catalog_search_committed: String::new(),
             catalog_search_cache: None,
+            catalog_user_filter_cache: None,
             catalog_matching_indices: Vec::new(),
             catalog_search_pending: None,
             catalog_page: 0,
             catalog_genre_filter: "all".into(),
             catalog_format_filter: "all".into(),
+            catalog_language_filter: "all".into(),
             catalog_scroll_reset: false,
             catalog_selected: None,
+            catalog_owned: HashMap::new(),
+            catalog_title_details: HashMap::new(),
+            catalog_title_load_result: None,
+            catalog_title_metadata_loaded: false,
             catalog_cover_dir: base_dir.join("icons").join("store"),
             catalog_cover_textures: HashMap::new(),
             catalog_cover_lru: VecDeque::new(),
@@ -1744,6 +1869,39 @@ impl NslApp {
         }
     }
 
+    fn invalidate_catalog_title_details(&mut self) {
+        // A title DB import or catalog refresh invalidates all cached rows.
+        // Dropping the old receiver also makes stale worker replies harmless.
+        self.catalog_title_load_result = None;
+        self.catalog_title_metadata_loaded = false;
+        self.catalog_title_details.clear();
+        self.catalog_search_cache = None;
+    }
+
+    fn start_catalog_title_details(&mut self) {
+        if self.catalog_title_metadata_loaded
+            || self.catalog_title_load_result.is_some()
+            || self.catalog_state.items.is_empty()
+        {
+            return;
+        }
+        let ids = self
+            .catalog_state
+            .items
+            .iter()
+            .filter_map(catalog::CatalogItem::base_title_id)
+            .collect::<HashSet<_>>();
+        let db = self.db.clone();
+        let (tx, rx) = mpsc::channel();
+        self.catalog_title_load_result = Some(rx);
+        std::thread::spawn(move || {
+            let result = db
+                .catalog_title_details(&ids)
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+    }
+
     fn refresh_catalog_matches(&mut self, ctx: &egui::Context) {
         if let Some(deadline) = self.catalog_search_pending {
             if std::time::Instant::now() >= deadline {
@@ -1755,35 +1913,244 @@ impl NslApp {
             }
         }
         let query = self.catalog_search_committed.trim().to_lowercase();
-        let filter_key = format!(
-            "{query}\u{1f}{}\u{1f}{}",
-            self.catalog_genre_filter, self.catalog_format_filter
+        let user_filter_key = format!(
+            "{query}\u{1f}{}\u{1f}{}\u{1f}{}",
+            self.catalog_genre_filter, self.catalog_format_filter, self.catalog_language_filter,
         );
+        let filter_key = format!("{user_filter_key}\u{1f}{}", self.rows_generation);
         if self.catalog_search_cache.as_ref() != Some(&filter_key) {
+            // A DB/name refresh must re-evaluate localized names, but must
+            // not unexpectedly send someone browsing page 22 back to page 1.
+            let user_changed = self.catalog_user_filter_cache.as_ref() != Some(&user_filter_key);
             self.catalog_matching_indices = self
                 .catalog_state
                 .items
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| {
+                    let base = item.base_title_id();
+                    let metadata = base
+                        .as_ref()
+                        .and_then(|id| self.catalog_title_details.get(id));
+                    if !catalog_item_matches_language(item, metadata, &self.catalog_language_filter)
+                    {
+                        return false;
+                    }
+                    let preferred = catalog_preferred_title(
+                        item,
+                        metadata,
+                        base.as_ref().and_then(|id| self.catalog_owned.get(id)),
+                    );
                     catalog_matches_filters(
                         item,
                         &query,
                         &self.catalog_genre_filter,
                         &self.catalog_format_filter,
-                    )
+                    ) || (catalog_matches_filters(
+                        item,
+                        "",
+                        &self.catalog_genre_filter,
+                        &self.catalog_format_filter,
+                    ) && preferred.to_lowercase().contains(&query))
                 })
                 .map(|(index, _)| index)
                 .collect();
+            let selection_matches = self.catalog_selected.as_deref().is_some_and(|id| {
+                self.catalog_matching_indices
+                    .iter()
+                    .any(|&index| self.catalog_state.items[index].topic_id == id)
+            });
+            if !selection_matches {
+                self.catalog_selected = self
+                    .catalog_matching_indices
+                    .first()
+                    .map(|&index| self.catalog_state.items[index].topic_id.clone());
+            }
             self.catalog_search_cache = Some(filter_key);
-            self.catalog_page = 0;
-            self.catalog_scroll_reset = true;
+            self.catalog_user_filter_cache = Some(user_filter_key);
+            if user_changed {
+                self.catalog_page = 0;
+                self.catalog_scroll_reset = true;
+            }
+        }
+    }
+
+    fn catalog_details_field(ui: &mut egui::Ui, label: &str, value: &str) {
+        if value.trim().is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [72.0, 20.0],
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                ),
+            );
+            ui.add(egui::Label::new(value).wrap());
+        });
+    }
+
+    fn catalog_selected_details_ui(&mut self, ui: &mut egui::Ui) {
+        let selected = self.catalog_selected.as_deref().and_then(|id| {
+            self.catalog_state
+                .items
+                .iter()
+                .find(|item| item.topic_id == id)
+                .cloned()
+        });
+        let Some(item) = selected else {
+            ui.label(
+                egui::RichText::new("게임 이름을 선택하면 상세 정보가 표시됩니다.")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+            return;
+        };
+        let base = item.base_title_id();
+        let metadata = base
+            .as_ref()
+            .and_then(|id| self.catalog_title_details.get(id))
+            .cloned();
+        let owned = base
+            .as_ref()
+            .and_then(|id| self.catalog_owned.get(id))
+            .cloned();
+        let name = catalog_preferred_title(&item, metadata.as_ref(), owned.as_ref()).to_owned();
+
+        if self.catalog_cover_queue.is_none()
+            && self.should_prefetch_catalog_cover(&item, std::time::Instant::now())
+        {
+            self.start_cover_prefetch(vec![(item.topic_id.clone(), item.cover.clone())]);
+        }
+        let mut budget = 1;
+        self.ensure_catalog_cover(ui.ctx(), &item.topic_id, &mut budget);
+        if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
+            let image_size = cover.size_vec2();
+            let scale = (172.0 / image_size.x.max(1.0)).min(178.0 / image_size.y.max(1.0));
+            ui.vertical_centered(|ui| {
+                ui.add(egui::Image::new((cover.id(), image_size * scale)));
+            });
+            ui.add_space(5.0);
+        }
+        let title_label = ui.label(egui::RichText::new(&name).size(16.0).strong());
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_store_detail_title"),
+                title_label.rect,
+            );
+        });
+        #[cfg(not(test))]
+        let _ = title_label;
+        if name != item.title {
+            ui.label(
+                egui::RichText::new(&item.title)
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            )
+            .on_hover_text("카탈로그 원본 이름 / 패키지 표기");
+        }
+        ui.add_space(5.0);
+        if let Some(owned) = &owned {
+            let message = if owned.has_base {
+                "● 라이브러리에 보유 중"
+            } else {
+                "● 관련 업데이트 / DLC 보유 중"
+            };
+            ui.colored_label(ui.visuals().hyperlink_color, message);
+        } else {
+            ui.label(
+                egui::RichText::new("라이브러리에 없음")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(egui::RichText::new("게임 정보").strong());
+        Self::catalog_details_field(ui, "타이틀 ID", item.title_id.as_deref().unwrap_or(""));
+        Self::catalog_details_field(ui, "출시 시기", &item.year);
+        Self::catalog_details_field(ui, "장르", &item.genre);
+        Self::catalog_details_field(ui, "개발사", &item.developer);
+        Self::catalog_details_field(ui, "배급사", &item.publisher);
+        Self::catalog_details_field(ui, "표기 언어", &item.interface_lang);
+        Self::catalog_details_field(ui, "파일 형식", &item.image_format);
+        Self::catalog_details_field(ui, "다운로드 크기", &item.size);
+        if let Some(metadata) = &metadata {
+            Self::catalog_details_field(ui, "DB 출시일", &metadata.release_date);
+            Self::catalog_details_field(ui, "DB 언어", &metadata.languages);
+            Self::catalog_details_field(ui, "지원 인원", &metadata.num_players);
+            Self::catalog_details_field(ui, "이용 등급", &metadata.rating);
+            Self::catalog_details_field(ui, "지역", &metadata.region);
+            if metadata.version > 0 {
+                Self::catalog_details_field(ui, "최신 버전", &format!("v{}", metadata.version));
+            }
+        } else if self.catalog_title_load_result.is_some() {
+            ui.label(
+                egui::RichText::new("타이틀 DB 상세 정보를 불러오는 중...")
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+        if let Some(owned) = &owned {
+            ui.add_space(5.0);
+            ui.label(egui::RichText::new("내 라이브러리").strong());
+            Self::catalog_details_field(ui, "보유 파일", &format!("{}개", owned.file_count));
+            Self::catalog_details_field(ui, "보유 DLC", &format!("{}개", owned.dlc_count));
+            if owned.has_update && owned.update_version > 0 {
+                Self::catalog_details_field(ui, "보유 버전", &format!("v{}", owned.update_version));
+            }
+        }
+        if let Some(metadata) = &metadata {
+            if !metadata.description.trim().is_empty() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("게임 소개").strong());
+                egui::ScrollArea::vertical()
+                    .id_salt(("catalog_description", &item.topic_id))
+                    .max_height(180.0)
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(&metadata.description).wrap());
+                    });
+            }
+            if let Ok(urls) = serde_json::from_str::<Vec<String>>(&metadata.screenshots) {
+                let screenshots = urls
+                    .iter()
+                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+                    .take(4)
+                    .collect::<Vec<_>>();
+                if !screenshots.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("스크린샷").strong());
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, url) in screenshots.iter().enumerate() {
+                            ui.hyperlink_to(format!("사진 {}", index + 1), url.as_str());
+                        }
+                    });
+                }
+            }
+        }
+        ui.add_space(8.0);
+        if ui
+            .add_sized(
+                [ui.available_width(), 29.0],
+                egui::Button::new("선택한 게임 다운로드"),
+            )
+            .clicked()
+        {
+            self.start_catalog_torrent(&item);
+        }
+        if item.url.starts_with("https://") || item.url.starts_with("http://") {
+            ui.hyperlink_to("원본 게시물 보기", &item.url);
         }
     }
 
     /// Store controls live in their own sidebar, independent of the saved
     /// game-detail splitter. The catalog list below gets all remaining space.
     fn catalog_sidebar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.start_catalog_title_details();
         egui::ScrollArea::vertical()
             .id_salt("catalog_sidebar_scroll")
             .auto_shrink([false, false])
@@ -1862,6 +2229,35 @@ impl NslApp {
                             );
                         }
                     });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("지원 언어").strong())
+                    .on_hover_text("카탈로그/타이틀 DB에 명시된 언어로만 분류합니다. Multi만으로 특정 언어를 추정하지 않습니다.");
+                let language_label = STORE_LANGUAGES
+                    .iter()
+                    .find(|(key, _)| *key == self.catalog_language_filter)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("전체 언어");
+                let language_combo = egui::ComboBox::from_id_salt("catalog_language_filter")
+                    .selected_text(language_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for &(key, label) in &STORE_LANGUAGES {
+                            ui.selectable_value(
+                                &mut self.catalog_language_filter,
+                                key.to_owned(),
+                                label,
+                            );
+                        }
+                    });
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_store_language_filter"),
+                        language_combo.response.rect,
+                    );
+                });
+                #[cfg(not(test))]
+                let _ = language_combo;
                 ui.add_space(8.0);
                 if ui.button("검색·분류 초기화").clicked() {
                     self.catalog_search.clear();
@@ -1869,6 +2265,7 @@ impl NslApp {
                     self.catalog_search_pending = None;
                     self.catalog_genre_filter = "all".into();
                     self.catalog_format_filter = "all".into();
+                    self.catalog_language_filter = "all".into();
                 }
                 self.refresh_catalog_matches(ctx);
                 let total_pages = self.catalog_matching_indices.len().div_ceil(100).max(1);
@@ -1917,36 +2314,9 @@ impl NslApp {
                     );
                     let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
                 }
-                if let Some(topic_id) = self.catalog_selected.as_deref() {
-                    if let Some(item) = self
-                        .catalog_state
-                        .items
-                        .iter()
-                        .find(|item| item.topic_id == topic_id)
-                        .cloned()
-                    {
-                        ui.separator();
-                        ui.label(egui::RichText::new("선택한 타이틀").strong());
-                        ui.label(&item.title);
-                        for (label, value) in [
-                            ("ID", item.title_id.as_deref().unwrap_or("-")),
-                            ("장르", item.genre.as_str()),
-                            ("형식", item.image_format.as_str()),
-                            ("크기", item.size.as_str()),
-                        ] {
-                            if !value.is_empty() {
-                                ui.label(
-                                    egui::RichText::new(format!("{label}: {value}"))
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            }
-                        }
-                        if ui.button("선택한 항목 다운로드").clicked() {
-                            self.start_catalog_torrent(&item);
-                        }
-                    }
-                }
+                ui.separator();
+                ui.label(egui::RichText::new("선택한 게임").strong());
+                self.catalog_selected_details_ui(ui);
                 ui.separator();
                 ui.label(
                     egui::RichText::new(format!(
@@ -2007,6 +2377,14 @@ impl NslApp {
                 let mut cover_budget = ICON_LOAD_BUDGET;
                 for &index in &page_indices[row_range] {
                     let item = self.catalog_state.items[index].clone();
+                    let base = item.base_title_id();
+                    let display_title = catalog_preferred_title(
+                        &item,
+                        base.as_ref()
+                            .and_then(|id| self.catalog_title_details.get(id)),
+                        base.as_ref().and_then(|id| self.catalog_owned.get(id)),
+                    )
+                    .to_owned();
                     if self.catalog_cover_queue.is_none()
                         && cover_jobs.len() < STORE_COVER_FETCH_BATCH
                         && self.should_prefetch_catalog_cover(&item, now)
@@ -2054,7 +2432,7 @@ impl NslApp {
                                 |ui| {
                                     let name = ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(&item.title).size(13.0).strong(),
+                                            egui::RichText::new(&display_title).size(13.0).strong(),
                                         )
                                         .truncate()
                                         .sense(egui::Sense::click()),
@@ -2062,7 +2440,11 @@ impl NslApp {
                                     if name.clicked() {
                                         self.catalog_selected = Some(item.topic_id.clone());
                                     }
-                                    name.on_hover_text(&item.title);
+                                    name.on_hover_text(if display_title == item.title {
+                                        display_title.clone()
+                                    } else {
+                                        format!("{display_title}\n원본: {}", item.title)
+                                    });
                                     let id = item.title_id.as_deref().unwrap_or("-");
                                     let meta = format!(
                                         "{id}   ·   {}   ·   {}",
@@ -2077,6 +2459,17 @@ impl NslApp {
                                         .truncate(),
                                     )
                                     .on_hover_text(meta);
+                                    if display_title != item.title {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&item.title)
+                                                    .size(10.0)
+                                                    .color(ui.visuals().weak_text_color()),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&item.title);
+                                    }
                                 },
                             );
                             ui.with_layout(
@@ -5049,6 +5442,7 @@ impl NslApp {
                 }
                 Ok(titledb::UpdateOutcome::Updated(n)) => {
                     self.status = format!("타이틀 DB {n}개 항목 다운로드 및 반영 완료");
+                    self.invalidate_catalog_title_details();
                     self.start_reload();
                 }
                 Err(e) => self.status = e,
@@ -5062,6 +5456,8 @@ impl NslApp {
             match done {
                 Ok(rows) => {
                     self.rows = rows;
+                    self.catalog_owned = catalog_owned_summaries(&self.rows);
+                    self.catalog_search_cache = None;
                     self.cached_screenshot_selection = None;
                     self.rows_generation = self.rows_generation.wrapping_add(1);
                     match self.db.stats() {
@@ -5119,6 +5515,7 @@ impl NslApp {
         if let Some(state) = catalog_loaded {
             if self.catalog_state.items.is_empty() && self.catalog_result.is_none() {
                 self.catalog_state = state;
+                self.invalidate_catalog_title_details();
                 self.catalog_search_cache = None;
                 self.catalog_page = 0;
             }
@@ -5134,6 +5531,7 @@ impl NslApp {
                     self.status = format!("카탈로그 {count}개 항목 준비 완료");
                     if let Some(state) = catalog::load(&self.base_dir) {
                         self.catalog_state = state;
+                        self.invalidate_catalog_title_details();
                         self.catalog_page = 0;
                         self.catalog_search_cache = None;
                         self.catalog_matching_indices.clear();
@@ -5144,6 +5542,26 @@ impl NslApp {
                 Err(e) => self.status = e,
             }
         } else if self.catalog_result.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(done) =
+            poll_background(&self.catalog_title_load_result, "catalog title metadata")
+        {
+            self.catalog_title_load_result = None;
+            self.catalog_title_metadata_loaded = true;
+            match done {
+                Ok(details) => {
+                    self.catalog_title_details = details;
+                    self.catalog_search_cache = None;
+                    ctx.request_repaint();
+                }
+                Err(error) => {
+                    let _ = self.log_sender.send(format!(
+                        "스토어 타이틀 DB 정보 조회 실패: {error} (기본 카탈로그 이름 사용)"
+                    ));
+                }
+            }
+        } else if self.catalog_title_load_result.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         let cover_done = match self.catalog_cover_queue.as_ref().map(|rx| rx.try_recv()) {
@@ -8675,6 +9093,222 @@ mod runtime_tests {
             "XCI"
         ));
         assert!(!catalog_matches_filters(&puzzle_xci, "", "Action", "XCI"));
+    }
+
+    #[test]
+    fn store_language_filter_does_not_assume_generic_multi_means_korean() {
+        let typical = "Russian, English [RUS / ENG / Multi 10]";
+        assert!(catalog_matches_language(typical, "all"));
+        assert!(catalog_matches_language(typical, "ru"));
+        assert!(catalog_matches_language(typical, "en"));
+        assert!(!catalog_matches_language(typical, "ko"));
+        assert!(!catalog_matches_language(typical, "ja"));
+        assert!(catalog_matches_language(
+            "Korean, English [KOR / ENG]",
+            "ko"
+        ));
+        assert!(catalog_matches_language("Japanese [JAP]", "ja"));
+        assert!(catalog_matches_language("Chinese [CHN]", "zh"));
+        assert!(catalog_matches_language("Spanish [ESP]", "es"));
+        assert!(catalog_matches_language("No text", "none"));
+        assert!(!catalog_matches_language("English [ENG]", "none"));
+        assert!(!catalog_matches_language("English [ENG]", "ko"));
+        assert!(!catalog_matches_language("Korean", "unknown"));
+        let item = catalog::CatalogItem {
+            interface_lang: "English [ENG]".into(),
+            ..Default::default()
+        };
+        let db = database::CatalogTitleDetails {
+            languages: "Korean, English".into(),
+            ..Default::default()
+        };
+        assert!(!catalog_item_matches_language(&item, None, "ko"));
+        assert!(catalog_item_matches_language(&item, Some(&db), "ko"));
+        assert!(!catalog_item_matches_language(&item, Some(&db), "ja"));
+    }
+
+    #[test]
+    fn store_title_follows_all_three_library_name_priority_modes() {
+        let (app, _dir) = seeded_app();
+        app.db
+            .load_titles(&[titledb::Entry {
+                title_id: "0100D2C0115B6000".into(),
+                name: "DB preferred title".into(),
+                description: "DB description".into(),
+                ..Default::default()
+            }])
+            .unwrap();
+        let item = catalog::CatalogItem {
+            title: "Original Store [NSZ] + DLC".into(),
+            title_id: Some("0100D2C0115B6000".into()),
+            ..Default::default()
+        };
+        let ids = HashSet::from(["0100D2C0115B6000".to_owned()]);
+        let metadata = app.db.catalog_title_details(&ids).unwrap();
+        let details = metadata.get("0100D2C0115B6000");
+        for (mode, expected) in [
+            ("db", "DB preferred title"),
+            ("ko_en_db", "알파"),
+            ("ko_ja_db", "알파"),
+        ] {
+            let rows = app.db.files(mode).unwrap();
+            let owned = catalog_owned_summaries(&rows);
+            assert_eq!(
+                catalog_preferred_title(&item, details, owned.get("0100D2C0115B6000")),
+                expected,
+                "Store and Library disagree under name_mode={mode}"
+            );
+        }
+        assert_eq!(
+            catalog_preferred_title(&item, details, None),
+            "DB preferred title",
+            "Unowned games should use title DB when available"
+        );
+        assert_eq!(catalog_preferred_title(&item, None, None), item.title);
+        assert_eq!(
+            catalog_base_id("0100D2C0115B6800").as_deref(),
+            Some("0100D2C0115B6000")
+        );
+    }
+
+    #[test]
+    fn store_sidebar_language_filter_is_combined_with_genre_and_format() {
+        let (mut app, _dir) = seeded_app();
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![
+            catalog::CatalogItem {
+                title: "Alpha [NSZ]".into(),
+                topic_id: "a".into(),
+                interface_lang: "Korean, English [KOR / ENG]".into(),
+                genre: "Action".into(),
+                image_format: "NSZ".into(),
+                ..Default::default()
+            },
+            catalog::CatalogItem {
+                title: "Beta [NSZ]".into(),
+                topic_id: "b".into(),
+                interface_lang: "Russian, English [RUS / ENG / Multi 10]".into(),
+                genre: "Action".into(),
+                image_format: "NSZ".into(),
+                ..Default::default()
+            },
+            catalog::CatalogItem {
+                title: "Gamma [XCI]".into(),
+                topic_id: "c".into(),
+                interface_lang: "Japanese [JAP]".into(),
+                genre: "Puzzle".into(),
+                image_format: "XCI".into(),
+                ..Default::default()
+            },
+        ];
+        app.catalog_genre_filter = "Action".into();
+        app.catalog_format_filter = "NSZ".into();
+        app.catalog_language_filter = "ko".into();
+        run_app_ticks(&mut app, 3);
+        assert_eq!(app.catalog_matching_indices, vec![0]);
+        app.catalog_language_filter = "ru".into();
+        run_app_ticks(&mut app, 2);
+        assert_eq!(app.catalog_matching_indices, vec![1]);
+        app.catalog_genre_filter = "Puzzle".into();
+        app.catalog_format_filter = "XCI".into();
+        app.catalog_language_filter = "ja".into();
+        run_app_ticks(&mut app, 2);
+        assert_eq!(app.catalog_matching_indices, vec![2]);
+        app.catalog_language_filter = "ko".into();
+        run_app_ticks(&mut app, 2);
+        assert!(app.catalog_matching_indices.is_empty());
+    }
+
+    #[test]
+    fn store_selected_detail_and_language_filter_fit_sidebar_at_three_widths() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![catalog::CatalogItem {
+            title: "Original long name with update and DLC [NSZ]".into(),
+            topic_id: "ui-detail-one".into(),
+            title_id: Some("0100D2C0115B6000".into()),
+            year: "2026, November".into(),
+            developer: "An independent developer".into(),
+            publisher: "A publishing studio".into(),
+            genre: "Action".into(),
+            interface_lang: "Korean, English [KOR / ENG]".into(),
+            image_format: "NSZ".into(),
+            size: "3.21 GB".into(),
+            ..Default::default()
+        }];
+        app.catalog_title_details.insert(
+            "0100D2C0115B6000".into(),
+            database::CatalogTitleDetails {
+                name: "Localized catalog name".into(),
+                description: "Game description text with enough length to wrap. ".repeat(18),
+                screenshots: "[\"https://example.org/one.jpg\"]".into(),
+                release_date: "20261119".into(),
+                languages: "Korean, English".into(),
+                version: 131072,
+                ..Default::default()
+            },
+        );
+        app.catalog_title_metadata_loaded = true;
+        app.catalog_selected = Some("ui-detail-one".into());
+        app.catalog_language_filter = "ko".into();
+        app.catalog_search_cache = None;
+        for width in [720.0, 980.0, 1456.0] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 750.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+            let (sidebar, language, title) = ctx.data_mut(|data| {
+                (
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_sidebar_rect"))
+                        .unwrap(),
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_language_filter"))
+                        .unwrap(),
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_detail_title"))
+                        .unwrap(),
+                )
+            });
+            assert!(
+                language.left() >= sidebar.left()
+                    && language.right() <= sidebar.right()
+                    && title.left() >= sidebar.left()
+                    && title.right() <= sidebar.right(),
+                "Store sidebar details/control spill outside panel at {width}: panel={sidebar:?}, language={language:?}, title={title:?}"
+            );
+            assert_eq!(app.catalog_matching_indices, vec![0]);
+        }
+    }
+
+    #[test]
+    #[ignore = "reads the existing real catalog and SQLite title DB without modifying user data"]
+    fn real_catalog_title_db_metadata_matches_read_only_and_is_bounded() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let catalog = catalog::load(root).expect("existing local catalog");
+        let ids = catalog
+            .items
+            .iter()
+            .filter_map(catalog::CatalogItem::base_title_id)
+            .collect::<HashSet<_>>();
+        let db = database::Database::open(root.join("library.db")).unwrap();
+        let start = std::time::Instant::now();
+        let details = db.catalog_title_details(&ids).unwrap();
+        let elapsed = start.elapsed();
+        assert!(ids.len() > 5_000, "real catalog was unexpectedly small");
+        assert!(details.len() > 1_000, "real title DB matching failed");
+        assert!(details.len() <= ids.len());
+        eprintln!(
+            "CATALOG_DB_METADATA titles={} base_ids={} matched={} elapsed={:.3}s",
+            catalog.items.len(),
+            ids.len(),
+            details.len(),
+            elapsed.as_secs_f64()
+        );
     }
 
     #[test]

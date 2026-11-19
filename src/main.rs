@@ -9331,7 +9331,11 @@ mod runtime_tests {
             .iter()
             .filter_map(catalog::CatalogItem::base_title_id)
             .collect::<HashSet<_>>();
-        let db = database::Database::open(root.join("library.db")).unwrap();
+        // A real-data QA test must not open the user's SQLite with write flags.
+        let sandbox = tempfile::tempdir().unwrap();
+        let snapshot = sandbox.path().join("library.db");
+        database::backup_read_only(&root.join("library.db"), &snapshot).unwrap();
+        let db = database::Database::open(snapshot).unwrap();
         let start = std::time::Instant::now();
         let details = db.catalog_title_details(&ids).unwrap();
         let elapsed = start.elapsed();

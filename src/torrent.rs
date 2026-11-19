@@ -54,14 +54,29 @@ fn safe_sub_folder(path: &Path) -> bool {
 }
 
 fn is_restorable_folder(output: &Path, default: &Path) -> bool {
-    let expected = default
-        .canonicalize()
-        .unwrap_or_else(|_| default.to_path_buf());
-    let actual = output
-        .canonicalize()
-        .unwrap_or_else(|_| output.to_path_buf());
-    // The torrent uses a dedicated child folder, not the session root.
-    actual.starts_with(expected)
+    // A restored torrent may be deleted with its downloaded files. Only
+    // restore dedicated direct children, never the downloads root itself,
+    // a sibling, a nested path, or a symlink escaping the root. Incomplete
+    // magnet downloads may not have created their child folder yet.
+    let Some(std::path::Component::Normal(_)) = output.components().next_back() else {
+        return false;
+    };
+    let (Ok(expected), Some(parent)) = (default.canonicalize(), output.parent()) else {
+        return false;
+    };
+    if parent.canonicalize().ok().as_deref() != Some(expected.as_path()) {
+        return false;
+    }
+    // Existing symlinks or junctions must resolve to a direct child; a
+    // missing folder is also valid because rqbit creates it on demand.
+    match std::fs::symlink_metadata(output) {
+        Ok(_) => output
+            .canonicalize()
+            .ok()
+            .is_some_and(|actual| actual.parent() == Some(expected.as_path())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false,
+    }
 }
 
 /// Controls the engine executes against a torrent session.
@@ -126,14 +141,22 @@ fn spawn_engine(
                 .parent()
                 .map(|parent| parent.join("torrent-session"))
                 .unwrap_or_else(|| default_folder.join(".rqbit-session"));
+            #[allow(unused_mut)]
+            let mut session_options = SessionOptions {
+                persistence: Some(SessionPersistenceConfig::Json {
+                    folder: Some(persistence_folder),
+                }),
+                ..Default::default()
+            };
+            // The QA engine uses localhost peers only; do not contact DHT.
+            #[cfg(test)]
+            {
+                session_options.dht = None;
+                session_options.disable_local_service_discovery = true;
+            }
             let session = runtime.block_on(Session::new_with_opts(
                 default_folder.clone(),
-                SessionOptions {
-                    persistence: Some(SessionPersistenceConfig::Json {
-                        folder: Some(persistence_folder),
-                    }),
-                    ..Default::default()
-                },
+                session_options,
             ));
             let session = match session {
                 Ok(session) => session,
@@ -577,9 +600,15 @@ impl TorrentEngine {
                 },
             );
         }
-        self.command_tx
-            .send(EngineCommand::Add(job))
-            .map_err(|_| anyhow::anyhow!("토렌트 엔진이 중지되었습니다"))?;
+        if self.command_tx.send(EngineCommand::Add(job)).is_err() {
+            if let Ok(mut map) = self.cancels.lock() {
+                map.remove(&key);
+            }
+            if let Ok(mut map) = self.progress.lock() {
+                map.remove(&key);
+            }
+            anyhow::bail!("토렌트 엔진이 중지되었습니다");
+        }
         Ok(key)
     }
 
@@ -670,11 +699,84 @@ mod tests {
         let outside = temp.path().join("unrelated");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        assert!(is_restorable_folder(&root, &root));
+        assert!(!is_restorable_folder(&root, &root));
         assert!(is_restorable_folder(&child, &root));
         assert!(!is_restorable_folder(&outside, &root));
+        let grandchild = child.join("nested");
+        std::fs::create_dir(&grandchild).unwrap();
+        assert!(!is_restorable_folder(&grandchild, &root));
+        assert!(is_restorable_folder(&root.join("missing"), &root));
+        assert!(!is_restorable_folder(
+            &root.join("..").join("unrelated"),
+            &root
+        ));
+        #[cfg(windows)]
+        {
+            let link = root.join("link-out");
+            if std::os::windows::fs::symlink_dir(&outside, &link).is_ok() {
+                assert!(!is_restorable_folder(&link, &root));
+            }
+        }
         assert!(safe_sub_folder(Path::new("BASE-HASH")));
         assert!(!safe_sub_folder(Path::new("../escape")));
         assert!(!safe_sub_folder(&child));
     }
+
+    #[test]
+    fn unsafe_download_inputs_never_create_jobs_or_files() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = TorrentEngine::new(root.path().join("downloads")).unwrap();
+        for (magnet, folder) in [
+            ("https://invalid.example/file", PathBuf::from("valid")),
+            ("magnet:?xt=urn:btih:bad", PathBuf::from("../escape")),
+            ("magnet:?xt=urn:btih:bad", root.path().join("escape")),
+        ] {
+            assert!(engine.start_download("invalid", magnet, folder).is_err());
+        }
+        let (progress, notices) = engine.poll();
+        assert!(progress.is_empty());
+        assert!(notices.is_empty());
+        assert!(!root.path().join("escape").exists());
+    }
+
+    #[test]
+    fn rejected_magnet_can_be_dismissed_without_deleting_other_files() {
+        let root = tempfile::tempdir().unwrap();
+        let downloads = root.path().join("downloads");
+        let engine = TorrentEngine::new(downloads.clone()).unwrap();
+        let sentinel = downloads.join("keep.bin");
+        std::fs::write(&sentinel, b"keep this").unwrap();
+        let key = engine
+            .start_download("bad", "magnet:?xt=urn:btih:invalid", PathBuf::from("case"))
+            .unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            let (items, notices) = engine.poll();
+            if !notices.is_empty() {
+                assert!(items
+                    .iter()
+                    .any(|(id, item)| id == &key && item.error.is_some()));
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(12),
+                "invalid magnet hung"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        engine.dismiss(&key);
+        let start = std::time::Instant::now();
+        loop {
+            if engine.poll().0.iter().all(|(id, _)| id != &key) {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(12), "dismiss hung");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep this");
+    }
 }
+
+#[cfg(test)]
+#[path = "torrent_e2e_tests.rs"]
+mod localhost_tests;

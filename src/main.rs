@@ -355,6 +355,52 @@ fn selectable_table_text_cell(
     response
 }
 
+/// Register a card's hit target before its embedded action buttons so egui
+/// routes clicks to child controls instead of the background. Eguis frame
+/// layout may shift the next_widget_position() by its margins, so remember
+/// the measured bounds to keep the hit region equal to the painted card.
+fn selectable_card_background(
+    ui: &egui::Ui,
+    id: egui::Id,
+    width: f32,
+    default_height: f32,
+) -> egui::Response {
+    let (size, offset) = ui.ctx().data_mut(|data| {
+        (
+            data.get_temp::<egui::Vec2>(id.with("size"))
+                .unwrap_or(egui::vec2(width, default_height)),
+            data.get_temp::<egui::Vec2>(id.with("offset"))
+                .unwrap_or(egui::Vec2::ZERO),
+        )
+    });
+    ui.interact(
+        egui::Rect::from_min_size(
+            ui.next_widget_position() + offset,
+            egui::vec2(width, size.y),
+        ),
+        id,
+        egui::Sense::click(),
+    )
+}
+
+fn remember_card_geometry(
+    ctx: &egui::Context,
+    id: egui::Id,
+    hit_rect: egui::Rect,
+    painted_rect: egui::Rect,
+) {
+    ctx.data_mut(|data| {
+        let previous = data
+            .get_temp::<egui::Vec2>(id.with("offset"))
+            .unwrap_or(egui::Vec2::ZERO);
+        data.insert_temp(
+            id.with("offset"),
+            previous + (painted_rect.min - hit_rect.min),
+        );
+        data.insert_temp(id.with("size"), painted_rect.size());
+    });
+}
+
 fn library_grid_dimensions(available_width: f32) -> (usize, f32, f32) {
     let available_width = available_width.max(1.0);
     let min_card_width = 130.0;
@@ -729,6 +775,7 @@ struct NslApp {
     catalog_cover_queue: Option<Receiver<(usize, Vec<String>)>>,
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
+    download_selected: Option<String>,
     download_search: String,
     download_status_filter: String,
     download_page: usize,
@@ -1317,6 +1364,7 @@ impl NslApp {
             catalog_cover_queue: None,
             torrent_engine: None,
             torrent_progress: Vec::new(),
+            download_selected: None,
             download_search: String::new(),
             download_status_filter: "all".into(),
             download_page: 0,
@@ -2534,6 +2582,8 @@ impl NslApp {
                         ui.visuals().widgets.noninteractive.bg_stroke.color
                     };
                     let row_width = ui.available_width();
+                    let card_id = ui.make_persistent_id(("catalog-card", item.topic_id.as_str()));
+                    let card = selectable_card_background(ui, card_id, row_width, 72.0);
                     let frame = egui::Frame::none()
                         .fill(base_fill)
                         .stroke(egui::Stroke::new(1.0_f32, border))
@@ -2561,12 +2611,8 @@ impl NslApp {
                                         egui::Label::new(
                                             egui::RichText::new(&display_title).size(13.0).strong(),
                                         )
-                                        .truncate()
-                                        .sense(egui::Sense::click()),
+                                        .truncate(),
                                     );
-                                    if name.clicked() {
-                                        self.catalog_selected = Some(item.topic_id.clone());
-                                    }
                                     name.on_hover_text(if display_title == item.title {
                                         display_title.clone()
                                     } else {
@@ -2602,23 +2648,39 @@ impl NslApp {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("다운로드").clicked() {
+                                    let download_button = ui.button("다운로드");
+                                    #[cfg(test)]
+                                    if index == 0 && self.catalog_page == 0 {
+                                        ui.ctx().data_mut(|data| {
+                                            data.insert_temp(
+                                                egui::Id::new(
+                                                    "nsl_test_catalog_first_download_button",
+                                                ),
+                                                download_button.rect,
+                                            )
+                                        });
+                                    }
+                                    if download_button.clicked() {
                                         self.start_catalog_torrent(&item);
                                     }
                                 },
                             );
                         });
                     });
+                    // The background registers before child buttons, so they
+                    // keep their own click action while card padding selects.
+                    remember_card_geometry(ui.ctx(), card_id, card.rect, _response.response.rect);
+                    if card.clicked() {
+                        self.catalog_selected = Some(item.topic_id.clone());
+                        ui.ctx().request_repaint();
+                    }
                     #[cfg(test)]
                     _ctx.data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("nsl_test_catalog_last_row"),
-                            _response.response.rect,
-                        );
+                        data.insert_temp(egui::Id::new("nsl_test_catalog_last_row"), card.rect);
                         if index == 0 && self.catalog_page == 0 {
                             data.insert_temp(
                                 egui::Id::new("nsl_test_catalog_first_row"),
-                                _response.response.rect,
+                                card.rect,
                             );
                         }
                     });
@@ -3171,7 +3233,23 @@ impl NslApp {
         download_scroll.show(ui, |ui| {
             for (key, progress) in &entries {
                 let row_width = ui.available_width();
-                let frame = library_section_frame(ui);
+                let card_id = ui.make_persistent_id(("download-card", key));
+                let card = selectable_card_background(ui, card_id, row_width, 130.0);
+                let selected = self.download_selected.as_deref() == Some(key.as_str());
+                let frame = library_section_frame(ui)
+                    .fill(if selected {
+                        ui.visuals().selection.bg_fill
+                    } else {
+                        ui.visuals().faint_bg_color
+                    })
+                    .stroke(egui::Stroke::new(
+                        1.0_f32,
+                        if selected {
+                            ui.visuals().hyperlink_color
+                        } else {
+                            ui.visuals().widgets.noninteractive.bg_stroke.color
+                        },
+                    ));
                 let _row = frame.show(ui, |ui| {
                     ui.set_width((row_width - 20.0).max(200.0));
                     let label = if progress.name.is_empty() {
@@ -3255,12 +3333,17 @@ impl NslApp {
                         }
                     });
                 });
+                remember_card_geometry(ui.ctx(), card_id, card.rect, _row.response.rect);
+                if card.clicked() {
+                    self.download_selected = Some(key.clone());
+                    ui.ctx().request_repaint();
+                }
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        egui::Id::new("nsl_test_download_last_row"),
-                        _row.response.rect,
-                    )
+                    data.insert_temp(egui::Id::new("nsl_test_download_last_row"), card.rect);
+                    if key == &entries[0].0 {
+                        data.insert_temp(egui::Id::new("nsl_test_download_first_row"), card.rect);
+                    }
                 });
             }
         });
@@ -5958,6 +6041,13 @@ impl NslApp {
                 if self.torrent_progress.len() != snapshot.len() {
                     self.cached_tabs_generation = u64::MAX;
                 }
+                if self
+                    .download_selected
+                    .as_deref()
+                    .is_some_and(|key| !snapshot.iter().any(|(current, _)| current == key))
+                {
+                    self.download_selected = None;
+                }
                 self.torrent_progress = snapshot;
             }
         }
@@ -6935,6 +7025,13 @@ impl NslApp {
                                                     &mut icon_budget,
                                                 );
                                                 let selected = self.selected == Some(row.id);
+                                                let card_id = ui.make_persistent_id(("grid-card", row.id));
+                                                let card = selectable_card_background(
+                                                    ui,
+                                                    card_id,
+                                                    grid_card_width,
+                                                    row_height,
+                                                );
                                                 let _card_response = egui::Frame::none()
                                                     .fill(if selected {
                                                         ui.visuals().selection.bg_fill
@@ -6951,41 +7048,13 @@ impl NslApp {
                                                                 .icon_textures
                                                                 .get(&row.title_id)
                                                             {
-                                                                let response = ui.add(
-                                                                    egui::ImageButton::new((
-                                                                        icon.id(),
-                                                                        egui::vec2(
-                                                                            grid_thumbnail_size,
-                                                                            grid_thumbnail_size,
-                                                                        ),
-                                                                    ))
-                                                                    .frame(false),
-                                                                );
-                                                                if response.clicked() {
-                                                                    self.selected = Some(row.id);
-                                                                    ctx.memory_mut(|memory| {
-                                                                        memory.request_focus(
-                                                                            library_focus_id,
-                                                                        )
-                                                                    });
-                                                                }
-                                                                if response.double_clicked() {
-                                                                    self.run_file(row);
-                                                                }
-                                                                response
-                                                                    .on_hover_text(format!(
-                                                                        "{}\n{}\n{}",
-                                                                        row.title_id,
-                                                                        common::format_size(
-                                                                            row.size.max(0) as u64
-                                                                        ),
-                                                                        row.path
-                                                                    ))
-                                                                    .context_menu(|ui| {
-                                                                        self.row_context_menu(
-                                                                            ui, row,
-                                                                        )
-                                                                    });
+                                                                ui.image((
+                                                                    icon.id(),
+                                                                    egui::vec2(
+                                                                        grid_thumbnail_size,
+                                                                        grid_thumbnail_size,
+                                                                    ),
+                                                                ));
                                                             } else {
                                                                 ui.allocate_ui(
                                                                     egui::vec2(
@@ -7001,35 +7070,58 @@ impl NslApp {
                                                                     },
                                                                 );
                                                             }
-                                                            let response = ui.selectable_label(
-                                                                selected,
-                                                                &row.title_name,
+                                                            ui.add(
+                                                                egui::Label::new(&row.title_name)
+                                                                    .truncate(),
                                                             );
-                                                            if response.clicked() {
-                                                                self.selected = Some(row.id);
-                                                                ctx.memory_mut(|memory| {
-                                                                    memory.request_focus(
-                                                                        library_focus_id,
-                                                                    )
-                                                                });
-                                                            }
-                                                            if response.double_clicked() {
-                                                                self.run_file(row);
-                                                            }
-                                                            response
-                                                                .on_hover_text(format!(
-                                                                    "{}\n{}\n{}",
-                                                                    row.title_id,
-                                                                    common::format_size(
-                                                                        row.size.max(0) as u64
-                                                                    ),
-                                                                    row.path
-                                                                ))
-                                                                .context_menu(|ui| {
-                                                                    self.row_context_menu(ui, row)
-                                                                });
                                                         });
                                                     });
+                                                // One click target for the complete grid card,
+                                                // including the blank icon/label padding.
+                                                remember_card_geometry(
+                                                    ctx,
+                                                    card_id,
+                                                    card.rect,
+                                                    _card_response.response.rect,
+                                                );
+                                                let response = card;
+                                                #[cfg(test)]
+                                                let hit_rect = response.rect;
+                                                if response.clicked() {
+                                                    self.selected = Some(row.id);
+                                                    ctx.memory_mut(|memory| {
+                                                        memory.request_focus(library_focus_id)
+                                                    });
+                                                    ctx.request_repaint();
+                                                }
+                                                if response.double_clicked() {
+                                                    self.run_file(row);
+                                                }
+                                                response
+                                                    .on_hover_text(format!(
+                                                        "{}\n{}\n{}",
+                                                        row.title_id,
+                                                        common::format_size(
+                                                            row.size.max(0) as u64
+                                                        ),
+                                                        row.path
+                                                    ))
+                                                    .context_menu(|ui| {
+                                                        self.row_context_menu(ui, row)
+                                                    });
+                                                #[cfg(test)]
+                                                if row.id == page_items[0].id {
+                                                    ctx.data_mut(|data| {
+                                                        data.insert_temp(
+                                                            egui::Id::new("nsl_test_grid_first_card"),
+                                                            _card_response.response.rect,
+                                                        );
+                                                        data.insert_temp(
+                                                            egui::Id::new("nsl_test_grid_first_card_hit_rect"),
+                                                            hit_rect,
+                                                        );
+                                                    });
+                                                }
                                                 #[cfg(test)]
                                                 if selected {
                                                     ctx.data_mut(|data| data.insert_temp(
@@ -9644,6 +9736,176 @@ mod runtime_tests {
             }
             assert_eq!(app.catalog_matching_indices, vec![0]);
         }
+    }
+
+    /// Clicks the same coordinate using real egui pointer events (press and
+    /// release), so selection cannot pass merely from matching cell bounds.
+    fn click_cell(ctx: &egui::Context, app: &mut NslApp, pos: egui::Pos2, width: f32, height: f32) {
+        for pressed in [true, false] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            });
+            app.ui_frame(ctx);
+            let _ = ctx.end_pass();
+        }
+    }
+
+    fn draw_card_test_frames(ctx: &egui::Context, app: &mut NslApp, count: usize) {
+        for _ in 0..count {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(ctx);
+            let _ = ctx.end_pass();
+        }
+    }
+
+    #[test]
+    fn store_card_background_selects_and_download_button_stays_independent() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![catalog::CatalogItem {
+            title: "Entire row target".into(),
+            topic_id: "select-whole-card".into(),
+            cover: String::new(),
+            ..Default::default()
+        }];
+        app.catalog_search_cache = None;
+        app.catalog_title_metadata_loaded = true;
+        app.torrent_engine = None; // never launch real downloads in UI QA.
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let row = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_row"))
+                .expect("first store row not rendered")
+        });
+        let download = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_download_button"))
+                .expect("store download button not rendered")
+        });
+        assert!(row.width() > 200.0 && download.left() > row.center().x);
+        let empty_padding = row.min + egui::vec2(3.0, 3.0);
+        click_cell(&ctx, &mut app, empty_padding, 1456.0, 900.0);
+        assert_eq!(app.catalog_selected.as_deref(), Some("select-whole-card"));
+        assert!(app.torrent_progress.is_empty());
+
+        // An explicit action button cannot be swallowed by row selection.
+        app.catalog_selected = None;
+        app.status.clear();
+        click_cell(&ctx, &mut app, download.center(), 1456.0, 900.0);
+        assert_eq!(
+            app.status, "토렌트 엔진을 사용할 수 없습니다",
+            "download button click was intercepted by the card"
+        );
+        assert!(
+            app.catalog_selected.is_none(),
+            "clicking the download action should not change row selection"
+        );
+    }
+
+    #[test]
+    fn download_row_background_selects_without_torrent_actions() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None;
+        app.torrent_progress = vec![
+            (
+                "download-a".into(),
+                torrent::TorrentProgress {
+                    name: "First game".into(),
+                    state: "일시정지".into(),
+                    paused: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "download-b".into(),
+                torrent::TorrentProgress {
+                    name: "Second game".into(),
+                    state: "완료".into(),
+                    finished: true,
+                    ..Default::default()
+                },
+            ),
+        ];
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let row = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_first_row"))
+                .expect("first download row missing")
+        });
+        click_cell(
+            &ctx,
+            &mut app,
+            row.min + egui::vec2(3.0, 3.0),
+            1456.0,
+            900.0,
+        );
+        assert_eq!(app.download_selected.as_deref(), Some("download-a"));
+        assert_eq!(app.torrent_progress.len(), 2);
+        assert!(!app.torrent_progress[0].1.finished);
+        assert!(app.torrent_progress[0].1.paused);
+    }
+
+    #[test]
+    fn grid_card_padding_selects_entire_cell_without_clicking_text_or_icon() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.view_mode = "grid".into();
+        app.selected = None;
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let card = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_first_card"))
+                .expect("first grid card missing")
+        });
+        let hit = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_grid_first_card_hit_rect"))
+                .expect("first grid hit region missing")
+        });
+        assert!(
+            hit.contains(card.min + egui::vec2(3.0, 3.0)),
+            "grid background region misses cell padding: hit={hit:?}, card={card:?}"
+        );
+        assert!(card.width() >= 120.0 && card.height() >= 120.0);
+        click_cell(
+            &ctx,
+            &mut app,
+            card.min + egui::vec2(3.0, 3.0),
+            1456.0,
+            900.0,
+        );
+        assert!(app.selected.is_some(), "grid card padding did not select");
+        draw_card_test_frames(&ctx, &mut app, 1);
+        let selected = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_selected_grid_rect"))
+                .expect("grid selection highlight was not painted")
+        });
+        assert!(
+            selected.contains(card.min + egui::vec2(3.0, 3.0))
+                && (selected.min - card.min).length() < 3.0
+                && (selected.size() - card.size()).length() < 20.0,
+            "grid selection background does not cover the clicked card: {selected:?} versus {card:?}"
+        );
     }
 
     #[test]

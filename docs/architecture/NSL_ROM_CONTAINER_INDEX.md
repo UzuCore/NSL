@@ -29,6 +29,8 @@ Both policies validate header/table bounds with checked arithmetic, cap entry co
 
 NSRP's HFS0 compatibility rule tolerates an over-declared named partition size by **at most one 0x200-byte sector**, never an arbitrary NCA or PFS0 entry. XCI root search now checks the additional 0x200 HEAD location and 0x200-aligned offsets in the conventional header region, without sweeping the game payload.
 
+For nested XCI/XCZ partitions, `xci.rs::scan_native_card` limits each child index to its containing partition's **absolute end**, not the whole game-card file. `xci.rs::package_index` applies the same bound when selecting a Control NCA or embedded icon from `secure`. This prevents an out-of-partition entry from reading bytes that belong to another partition even when the offset would fit the outer ROM file. A synthetic regression case explicitly tests this distinction.
+
 The native conversion writer (`native_package.rs`) retains its own strict, transform-aware index representation; it has not been casually replaced with a metadata-only parser. No NCA decryption or filesystem write paths have been changed.
 
 ## Validation and limits
@@ -36,5 +38,7 @@ The native conversion writer (`native_package.rs`) retains its own strict, trans
 Read-only local library header sampling first found 136 NSP/NSZ entries and identified one compatibility case. The follow-up **full database-corpus header check inspected 875/875 available NSP/NSZ files**, with **874 fully valid index tables and 1 file with one out-of-bounds unrelated entry**. Metadata mode safely keeps that file's valid index entries. **14/14 available XCI/XCZ root HFS0 indexes** were accepted by the strict structural validation model; all 14 contained `secure` and update/normal partitions. These checks only read package headers and a read-only SQLite snapshot, **not** decrypted game contents; they are independent rule checks rather than compiled Rust tests.
 
 Rustfmt and repository/source attribution checks passed. Isolated PowerShell ZIP verification passed both the legacy 6-file and new 7-file cases, plus invalid-manifest/extra-file/hash-mismatch rejections.
+
+Repeatable no-build checks are available through `python -B scripts/qa-rom-index-readonly.py`. They perform 511 synthetic corruption/boundary checks, inspect 875 available NSP/NSZ PFS0 headers (**15,052 safe entries**, 1 malformed entry omitted), inspect 14 XCI/XCZ root HFS0 tables and verify **17 real nested indexes** against their own partition end. All 17 passed both the original outer-file bound and the corrected partition-local bound. This is an independent format-rule comparison, **not execution of Rust unit tests**. Inputs are opened read-only, with size and modification-time checks before/after.
 
 **Manual-build policy:** no Cargo compilation, Clippy, executable launch, GitHub Actions run, or release creation has been performed. Before the next release, run `cargo test --locked --all-targets`, `cargo clippy --locked --all-targets -- -D warnings`, the optional local-corpus XCI/XCZ test, and isolated GUI/package smoke tests. Preserve original ROM files, user DB/config/keys and existing r22 binaries.

@@ -101,7 +101,14 @@ fn package_index(file: &mut File, path: &Path, size: u64) -> Option<Index> {
             .entries
             .iter()
             .find(|e| e.name.eq_ignore_ascii_case("secure"))?;
-        return read_index(file, root.data_start.checked_add(secure.offset)?, size);
+        let secure_start = root.data_start.checked_add(secure.offset)?;
+        let secure_end = secure_start.checked_add(secure.size)?;
+        if secure_end > size {
+            return None;
+        }
+        // Never expose an icon/NCA located outside the secure partition merely
+        // because its declared offset still fits within the whole XCI file.
+        return read_index(file, secure_start, secure_end);
     }
     let offsets = [0, 0x200, 0x400, 0x1000, 0x4000, 0x8000];
     offsets
@@ -222,7 +229,8 @@ fn scan_native_card(
         if partition_end > file_size {
             return None;
         }
-        let Some(index) = read_index(file, partition_base, file_size) else {
+        // The nested HFS0 must fit its own partition, not just the whole ROM.
+        let Some(index) = read_index(file, partition_base, partition_end) else {
             // XCI images commonly contain empty 512-byte `normal`/`update`
             // partitions. They are valid and do not invalidate `secure`.
             if partition.size <= 0x1000 {
@@ -341,6 +349,57 @@ pub fn scan(path: &Path) -> (Vec<Content>, (String, String, String)) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn synthetic_card_with_nested_secure(nested_length: u64, actual_payload: &[u8]) -> Vec<u8> {
+        let mut nested = Vec::new();
+        nested.extend_from_slice(b"PFS0");
+        nested.extend_from_slice(&1u32.to_le_bytes());
+        nested.extend_from_slice(&9u32.to_le_bytes());
+        nested.extend_from_slice(&0u32.to_le_bytes());
+        nested.extend_from_slice(&0u64.to_le_bytes());
+        nested.extend_from_slice(&nested_length.to_le_bytes());
+        nested.extend_from_slice(&0u32.to_le_bytes());
+        nested.extend_from_slice(&0u32.to_le_bytes());
+        nested.extend_from_slice(b"icon.png\0");
+        nested.extend_from_slice(actual_payload);
+
+        let mut bytes = vec![0u8; 0x400];
+        bytes.extend_from_slice(b"HFS0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&(nested.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 40]);
+        bytes.extend_from_slice(b"secure\0");
+        bytes.extend_from_slice(&nested);
+        bytes.extend_from_slice(&[0u8; 0x1000]); // following unrelated partition/data
+        bytes
+    }
+
+    #[test]
+    fn nested_secure_index_must_not_point_outside_its_partition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("nested-boundary.xci");
+        let bytes = synthetic_card_with_nested_secure(0x400, b"icon");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        // The 0x400-byte entry would still fit inside the outer file. It is
+        // invalid because the 'secure' partition contains only 4 bytes.
+        assert!(package_index(&mut file, &path, bytes.len() as u64).is_none());
+
+        let valid = synthetic_card_with_nested_secure(4, b"icon");
+        std::fs::write(&path, &valid).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let index =
+            package_index(&mut file, &path, valid.len() as u64).expect("valid nested secure index");
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].name, "icon.png");
+        assert_eq!(index.entries[0].size, 4);
+    }
 
     #[test]
     fn finds_game_card_root_at_nonstandard_aligned_header_offset() {

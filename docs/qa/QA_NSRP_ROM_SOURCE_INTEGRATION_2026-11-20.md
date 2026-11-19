@@ -56,3 +56,27 @@ This is an **independent Python rule comparison against the on-disk headers**, n
 3. After validation, use the user's manual `build.bat` or `workflow_dispatch`. Verify the new distribution contains `licenses/nsrp-MIT.txt` and valid executable SHA/manifest. Existing r22 remains unchanged until then.
 
 **Outcome:** useful NSRP parser algorithms incorporated in NSL and applied to live source paths; no external ROM-analysis executable needed. Build/runtime correctness of the new commit remains pending manual verification.
+
+## Follow-up: partition bounds and repeatable no-build regression
+
+During the follow-up review, `xci.rs::scan_native_card` and `xci.rs::package_index` were found to pass the entire image size as the nested index's limit. The latter could accept an embedded icon or NCA index entry extending beyond the `secure` partition, even though its offset stayed within the overall game-card image. The index is now bounded to the **end of its containing partition** in both paths. The original ROM remains read-only.
+
+New source tests: `nested_secure_index_must_not_point_outside_its_partition` (a malicious nested entry crossing into another partition must be rejected; a valid nested entry remains accepted). These Rust tests are authored but **not executed** pending the user's own build.
+
+New repeatable standalone QA: `scripts/qa-rom-index-readonly.py`. It uses Python's standard library, `mode=ro&immutable=1` SQLite access, read-only ROM header reads, no keys/decryption or extraction, and deterministic corrupt-input tests; it prints aggregated JSON without game names or absolute paths. Command: `python -B scripts/qa-rom-index-readonly.py`.
+
+| Extended check | Result |
+| --- | --- |
+| Synthetic corruption/bounds scenarios (500 mutations + 11 targeted cases) | **511 PASS** |
+| All available NSP/NSZ header reads | **875/875** |
+| Strict-valid NSP/NSZ indexes | **874** |
+| Partial NSP/NSZ indexes, sanitized valid entries retained | **1**, one malformed entry omitted |
+| Safe NSP/NSZ index entries collected | **15,052** |
+| XCI/XCZ root strict-valid | **14/14** |
+| XCI/XCZ real nested partition indexes (whole-file bound) | **17/17** |
+| Same nested partition indexes (partition-local bound) | **17/17** |
+| Small/empty game-card partitions skipped by existing scan policy | **25** |
+| `cargo fmt --all -- --check` | **PASS** |
+| Synthetic ZIP verify, new/legacy, invalid ZIP/manifest rejections | **PASS** |
+
+The counts refer to distinct *available* ROM files in the locally indexed corpus. The standalone script is an **independent Python rule model**, not a Rust runtime test or proof of successful NCA decryption. Actual source compilation, Clippy, Rust unit tests, game metadata GUI and final release remain reserved for manual execution. Prior Stage 20's 151-passing tests predate both the modularization and the NSRP parser changes.

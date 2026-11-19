@@ -75,7 +75,7 @@
 | Stage 20 GUI 검수 | 그리드·스토어·다운로드 × 창 너비 980/1280/1456px, **9/9 PASS** |
 | Stage 20 토렌트 E2E | localhost 전송, 일시정지·재개·복구, 부분 다운로드 등 격리 테스트 통과 |
 | P2 모듈화 (`af04b32`) | **메서드 62개를 10개 기능 모듈로 분리**, 원본 대조 및 Rustfmt 통과 |
-| NSRP 롬 파서 반영 | PFS0/HFS0 목차 읽기 공통화, 안전한 엔트리 검증, XCI 루트 탐색 범위 확장; **수동 빌드 검증 전** |
+| NSRP 롬 파서 반영 | PFS0/HFS0 공통화, XCI 탐색·하위 파티션 경계 강화; 읽기 전용 875개 NSP/NSZ·14개 XCI/XCZ 구조 검사 통과, **수동 빌드 검증 전** |
 | P2 모듈화 컴파일·테스트·릴리스 | **미실시** — 수동 빌드·회귀 검증 필요 |
 | 현재 GitHub 공식 최신 배포본 | **r22 (`d09c91a`)** — P2 모듈화는 아직 미포함 |
 
@@ -92,6 +92,7 @@ git clone https://github.com/UzuCore/NSL.git
 cd NSL
 
 # 모듈화된 최신 소스의 컴파일·회귀 검증 (수동 실행)
+python -B scripts/qa-rom-index-readonly.py  # 원본 롬을 수정하지 않는 독립 검수
 cargo fmt --all -- --check
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings

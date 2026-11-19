@@ -2026,47 +2026,62 @@ impl NslApp {
         }
         let mut budget = 1;
         self.ensure_catalog_cover(ui.ctx(), &item.topic_id, &mut budget);
-        if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
-            let image_size = cover.size_vec2();
-            let scale = (172.0 / image_size.x.max(1.0)).min(178.0 / image_size.y.max(1.0));
-            ui.vertical_centered(|ui| {
-                ui.add(egui::Image::new((cover.id(), image_size * scale)));
+        let header_width = ui.available_width();
+        let mut title_rect = egui::Rect::NOTHING;
+        ui.horizontal(|ui| {
+            let cover_size = egui::vec2(78.0, 100.0);
+            if let Some(cover) = self.catalog_cover_textures.get(&item.topic_id) {
+                let original = cover.size_vec2();
+                let scale =
+                    (cover_size.x / original.x.max(1.0)).min(cover_size.y / original.y.max(1.0));
+                ui.add(egui::Image::new((cover.id(), original * scale)));
+            } else {
+                ui.allocate_ui_with_layout(
+                    cover_size,
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        ui.label(egui::RichText::new("🎮").size(23.0));
+                    },
+                );
+            }
+            ui.vertical(|ui| {
+                ui.set_width((header_width - 90.0).max(95.0));
+                let title_label = ui.label(egui::RichText::new(&name).size(15.0).strong());
+                title_rect = title_label.rect;
+                if name != item.title {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&item.title)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text("카탈로그 원본: ".to_owned() + &item.title);
+                }
+                ui.add_space(4.0);
+                if let Some(owned) = &owned {
+                    let message = if owned.has_base {
+                        "● 라이브러리에 보유 중"
+                    } else {
+                        "● 업데이트 / DLC 보유"
+                    };
+                    ui.colored_label(ui.visuals().hyperlink_color, message);
+                } else {
+                    ui.label(
+                        egui::RichText::new("라이브러리에 없음")
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
             });
-            ui.add_space(5.0);
-        }
-        let title_label = ui.label(egui::RichText::new(&name).size(16.0).strong());
+        });
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
-            data.insert_temp(
-                egui::Id::new("nsl_test_store_detail_title"),
-                title_label.rect,
-            );
+            data.insert_temp(egui::Id::new("nsl_test_store_detail_title"), title_rect);
         });
         #[cfg(not(test))]
-        let _ = title_label;
-        if name != item.title {
-            ui.label(
-                egui::RichText::new(&item.title)
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            )
-            .on_hover_text("카탈로그 원본 이름 / 패키지 표기");
-        }
-        ui.add_space(5.0);
-        if let Some(owned) = &owned {
-            let message = if owned.has_base {
-                "● 라이브러리에 보유 중"
-            } else {
-                "● 관련 업데이트 / DLC 보유 중"
-            };
-            ui.colored_label(ui.visuals().hyperlink_color, message);
-        } else {
-            ui.label(
-                egui::RichText::new("라이브러리에 없음")
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-        }
+        let _ = title_rect;
         ui.add_space(6.0);
         ui.separator();
         ui.label(egui::RichText::new("게임 정보").strong());
@@ -2191,74 +2206,89 @@ impl NslApp {
                     self.catalog_search_pending =
                         Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
                 }
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("장르").strong());
+                ui.add_space(3.0);
                 let genre_label = STORE_GENRES
                     .iter()
                     .find(|(key, _)| *key == self.catalog_genre_filter)
                     .map(|(_, label)| *label)
                     .unwrap_or("전체 장르");
-                egui::ComboBox::from_id_salt("catalog_genre_filter")
-                    .selected_text(genre_label)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for &(key, label) in &STORE_GENRES {
-                            ui.selectable_value(
-                                &mut self.catalog_genre_filter,
-                                key.to_owned(),
-                                label,
-                            );
-                        }
-                    });
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("파일 형식").strong());
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [65.0, 24.0],
+                        egui::Label::new(egui::RichText::new("장르").strong()),
+                    );
+                    egui::ComboBox::from_id_salt("catalog_genre_filter")
+                        .selected_text(genre_label)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for &(key, label) in &STORE_GENRES {
+                                ui.selectable_value(
+                                    &mut self.catalog_genre_filter,
+                                    key.to_owned(),
+                                    label,
+                                );
+                            }
+                        });
+                });
                 let format_label = STORE_FORMATS
                     .iter()
                     .find(|(key, _)| *key == self.catalog_format_filter)
                     .map(|(_, label)| *label)
                     .unwrap_or("전체 형식");
-                egui::ComboBox::from_id_salt("catalog_format_filter")
-                    .selected_text(format_label)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for &(key, label) in &STORE_FORMATS {
-                            ui.selectable_value(
-                                &mut self.catalog_format_filter,
-                                key.to_owned(),
-                                label,
-                            );
-                        }
-                    });
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("지원 언어").strong())
-                    .on_hover_text("카탈로그/타이틀 DB에 명시된 언어로만 분류합니다. Multi만으로 특정 언어를 추정하지 않습니다.");
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [65.0, 24.0],
+                        egui::Label::new(egui::RichText::new("파일 형식").strong()),
+                    );
+                    egui::ComboBox::from_id_salt("catalog_format_filter")
+                        .selected_text(format_label)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for &(key, label) in &STORE_FORMATS {
+                                ui.selectable_value(
+                                    &mut self.catalog_format_filter,
+                                    key.to_owned(),
+                                    label,
+                                );
+                            }
+                        });
+                });
                 let language_label = STORE_LANGUAGES
                     .iter()
                     .find(|(key, _)| *key == self.catalog_language_filter)
                     .map(|(_, label)| *label)
                     .unwrap_or("전체 언어");
-                let language_combo = egui::ComboBox::from_id_salt("catalog_language_filter")
-                    .selected_text(language_label)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for &(key, label) in &STORE_LANGUAGES {
-                            ui.selectable_value(
-                                &mut self.catalog_language_filter,
-                                key.to_owned(),
-                                label,
-                            );
-                        }
-                    });
+                let mut language_rect = egui::Rect::NOTHING;
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [65.0, 24.0],
+                        egui::Label::new(egui::RichText::new("지원 언어").strong()),
+                    )
+                    .on_hover_text("카탈로그/타이틀 DB에 명시된 언어만 분류합니다. Multi만으로 특정 언어를 추정하지 않습니다.");
+                    let language_combo = egui::ComboBox::from_id_salt("catalog_language_filter")
+                        .selected_text(language_label)
+                        .width(ui.available_width())
+                        .show_ui(ui, |ui| {
+                            for &(key, label) in &STORE_LANGUAGES {
+                                ui.selectable_value(
+                                    &mut self.catalog_language_filter,
+                                    key.to_owned(),
+                                    label,
+                                );
+                            }
+                        });
+                    language_rect = language_combo.response.rect;
+                });
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(
                         egui::Id::new("nsl_test_store_language_filter"),
-                        language_combo.response.rect,
+                        language_rect,
                     );
                 });
                 #[cfg(not(test))]
-                let _ = language_combo;
-                ui.add_space(8.0);
+                let _ = language_rect;
+                ui.add_space(5.0);
                 if ui.button("검색·분류 초기화").clicked() {
                     self.catalog_search.clear();
                     self.catalog_search_committed.clear();

@@ -73,6 +73,9 @@ cargo clippy --locked --all-targets -- -D warnings
 ```text
 NSL/
 ├── src/                   Rust 앱·GUI·스캐너·파일 변환 소스
+│   ├── app/               앱 실행·스캔·스토어·다운로드·설정 등 기능별 모듈
+│   ├── main.rs            앱 상태, 공통 UI 함수, 진입점
+│   └── runtime_tests.rs   앱 통합 회귀 테스트
 ├── assets/icon.ico        프로그램 아이콘
 ├── scripts/               ZIP 생성·검증 및 업데이트 스크립트
 ├── licenses/              포함된 외부 구성요소의 라이선스 고지
@@ -84,6 +87,8 @@ NSL/
 ```
 
 빌드 결과물과 개인 설정·DB·키·게임 파일 등은 Git으로 배포하지 않습니다.
+
+앱 내부 모듈별 역할과 의존성 원칙은 [앱 소스 구조](docs/architecture/NSL_APP_MODULES.md)에 정리되어 있습니다.
 
 ## GitHub Actions 빌드 및 릴리스
 

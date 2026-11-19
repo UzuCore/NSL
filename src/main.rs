@@ -2356,12 +2356,17 @@ impl NslApp {
                     self.refresh_catalog_matches(ctx);
                     ctx.request_repaint();
                 }
+                // add_enabled() keeps the surrounding left-aligned layout:
+                // min_size expands the button, but does NOT center its text.
+                // add_sized() supplies a centered-and-justified child layout.
                 let refresh = ui
-                    .add_enabled(
-                        self.catalog_result.is_none(),
-                        egui::Button::new("카탈로그 새로고침")
-                            .min_size(egui::vec2(ui.available_width(), 29.0)),
-                    );
+                    .add_enabled_ui(self.catalog_result.is_none(), |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 29.0],
+                            egui::Button::new("카탈로그 새로고침"),
+                        )
+                    })
+                    .inner;
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(egui::Id::new("nsl_test_store_refresh_button"), refresh.rect);
@@ -2375,11 +2380,14 @@ impl NslApp {
                         .iter()
                         .any(|item| item.topic_id == id)
                 });
-                let download = ui.add_enabled(
-                    can_download,
-                    egui::Button::new("게임 다운로드")
-                        .min_size(egui::vec2(ui.available_width(), 29.0)),
-                );
+                let download = ui
+                    .add_enabled_ui(can_download, |ui| {
+                        ui.add_sized(
+                            [ui.available_width(), 29.0],
+                            egui::Button::new("게임 다운로드"),
+                        )
+                    })
+                    .inner;
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(
@@ -2796,6 +2804,16 @@ impl NslApp {
         }
     }
 
+    fn open_store_from_downloads(&mut self) {
+        self.folder_filter = "CATALOG".into();
+        self.current_page = 0;
+        self.config.settings.insert(
+            "last_tab_key".into(),
+            serde_json::Value::String("CATALOG".into()),
+        );
+        let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
+    }
+
     /// Search, transfer-state filters and aggregate progress live next to
     /// the downloads list, not in a toolbar above its first row.
     fn downloads_sidebar_ui(&mut self, ui: &mut egui::Ui) {
@@ -2950,13 +2968,7 @@ impl NslApp {
                     )
                     .clicked()
                 {
-                    self.folder_filter = "CATALOG".into();
-                    self.current_page = 0;
-                    self.config.settings.insert(
-                        "last_tab_key".into(),
-                        serde_json::Value::String("CATALOG".into()),
-                    );
-                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
+                    self.open_store_from_downloads();
                 }
                 ui.separator();
                 ui.label(
@@ -2970,18 +2982,136 @@ impl NslApp {
             });
     }
 
+    /// Consistent empty states for an idle queue and an unmatched filter.
+    /// Center a compact card in the content area instead of leaving a small
+    /// single-line panel at the top of an otherwise blank screen.
+    fn downloads_empty_state_ui(&mut self, ui: &mut egui::Ui, filtered: bool) {
+        let card_width = (ui.available_width() - 16.0).clamp(0.0, 480.0);
+        let card_height = 267.0;
+        ui.add_space(((ui.available_height() - card_height) * 0.5).max(12.0));
+        let side_padding = ((ui.available_width() - card_width) * 0.5).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(side_padding);
+            let card = egui::Frame::none()
+                .fill(ui.visuals().faint_bg_color)
+                .stroke(egui::Stroke::new(
+                    1.0_f32,
+                    ui.visuals().widgets.noninteractive.bg_stroke.color,
+                ))
+                .rounding(egui::Rounding::same(9.0))
+                .inner_margin(egui::Margin::symmetric(24.0, 23.0))
+                .show(ui, |ui| {
+                    ui.set_width((card_width - 48.0).max(0.0));
+                    ui.vertical_centered(|ui| {
+                        let (icon_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(62.0, 62.0),
+                            egui::Sense::hover(),
+                        );
+                        let accent = ui.visuals().hyperlink_color;
+                        ui.painter().circle_filled(
+                            icon_rect.center(),
+                            28.0,
+                            ui.visuals().widgets.inactive.weak_bg_fill,
+                        );
+                        ui.painter().circle_stroke(
+                            icon_rect.center(),
+                            28.0,
+                            egui::Stroke::new(1.0_f32, accent),
+                        );
+                        ui.painter().text(
+                            icon_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if filtered { "?" } else { "↓" },
+                            egui::FontId::proportional(29.0),
+                            accent,
+                        );
+                        ui.add_space(12.0);
+                        let title = ui.label(
+                            egui::RichText::new(if filtered {
+                                "검색 결과가 없습니다"
+                            } else {
+                                "다운로드 작업이 없습니다"
+                            })
+                            .size(18.0)
+                            .strong(),
+                        );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_download_empty_heading"),
+                                title.rect,
+                            );
+                        });
+                        #[cfg(not(test))]
+                        let _ = title;
+                        ui.add_space(7.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(if filtered {
+                                    "검색어 또는 진행 상태 필터를 변경해 다시 찾아보세요."
+                                } else {
+                                    "스토어에서 게임을 선택하고 다운로드를 시작하면\n진행 상황이 여기에 표시됩니다."
+                                })
+                                .color(ui.visuals().weak_text_color()),
+                            )
+                            .halign(egui::Align::Center)
+                            .wrap(),
+                        );
+                        ui.add_space(17.0);
+                        let action = ui.add_sized(
+                            [195.0_f32.min(ui.available_width()), 34.0],
+                            egui::Button::new(if filtered {
+                                "검색·분류 초기화"
+                            } else {
+                                "스토어 둘러보기"
+                            }),
+                        );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_download_empty_action"),
+                                action.rect,
+                            );
+                        });
+                        if action.clicked() {
+                            if filtered {
+                                self.download_search.clear();
+                                self.download_status_filter = "all".into();
+                                self.download_page = 0;
+                                self.download_scroll_reset = true;
+                                ui.ctx().request_repaint();
+                            } else {
+                                self.open_store_from_downloads();
+                            }
+                        }
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(if filtered {
+                                "오른쪽 패널에서도 검색 조건을 변경할 수 있습니다."
+                            } else {
+                                "진행률  ·  전송 속도  ·  일시정지  ·  완료"
+                            })
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    });
+                });
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_download_empty_card"),
+                    card.response.rect,
+                );
+            });
+            #[cfg(not(test))]
+            let _ = card;
+        });
+    }
+
     /// Dedicated downloads tab: the center is reserved for torrent rows.
     fn downloads_panel_ui(&mut self, ui: &mut egui::Ui) {
         if self.torrent_progress.is_empty() {
-            ui.add_space(8.0);
-            library_section_frame(ui).show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new("다운로드 작업이 없습니다")
-                        .size(14.0)
-                        .strong(),
-                );
-                ui.label("스토어 탭에서 게임 업데이트나 DLC를 받으면 여기에 표시됩니다.");
-            });
+            self.downloads_empty_state_ui(ui, false);
             return;
         }
         let query = self.download_search.trim().to_lowercase();
@@ -3028,10 +3158,7 @@ impl NslApp {
             )
         });
         if entries.is_empty() {
-            ui.add_space(8.0);
-            library_section_frame(ui).show(ui, |ui| {
-                ui.label("검색·분류 조건과 일치하는 다운로드가 없습니다.");
-            });
+            self.downloads_empty_state_ui(ui, true);
             return;
         }
         ui.add_space(6.0);
@@ -9963,7 +10090,7 @@ mod runtime_tests {
                     ..Default::default()
                 });
                 app.ui_frame(&ctx);
-                let _ = ctx.end_pass();
+                let output = ctx.end_pass();
                 let rect = ctx
                     .data_mut(|data| data.get_temp::<egui::Rect>(egui::Id::new(marker)))
                     .unwrap_or_else(|| panic!(
@@ -10004,6 +10131,43 @@ mod runtime_tests {
                         && reset.right() <= sidebar.right() - 12.0,
                     "{tab} results/reset ordering or search height failed at {width}: search={search:?} results={results:?} reset={reset:?}"
                 );
+                if tab == "CATALOG" {
+                    for (label, id) in [
+                        ("카탈로그 새로고침", "nsl_test_store_refresh_button"),
+                        ("게임 다운로드", "nsl_test_store_game_download_button"),
+                    ] {
+                        let button = ctx.data_mut(|data| {
+                            data.get_temp::<egui::Rect>(egui::Id::new(id)).unwrap()
+                        });
+                        // Inspect the actual painted glyph position, not just
+                        // the click rectangle: min_size alone formerly left
+                        // these two labels aligned to the left.
+                        let painted = output
+                            .shapes
+                            .iter()
+                            .filter_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) if text.galley.text() == label => {
+                                    Some(text)
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            painted.len(),
+                            1,
+                            "missing or duplicate button label={label} width={width}"
+                        );
+                        let glyph_center = painted[0].pos.x + painted[0].galley.size().x * 0.5;
+                        assert!(
+                            (glyph_center - button.center().x).abs() <= 2.0,
+                            "{label} text is not horizontally centered at {width}: painted={glyph_center}, button={button:?}"
+                        );
+                        assert!(
+                            (button.width() - reset.width()).abs() < 2.0,
+                            "{label} differs from reset button width at {width}: {button:?} vs {reset:?}"
+                        );
+                    }
+                }
                 assert!(
                     pagination.left() < sidebar.left()
                         && pagination.right() <= sidebar.left() + 1.0
@@ -10045,6 +10209,148 @@ mod runtime_tests {
             Some(selected_library_game),
             "switching management tabs must not lose the selected library game"
         );
+    }
+
+    #[test]
+    fn download_empty_state_is_centered_and_opens_store_without_torrent_side_effects() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None;
+        app.torrent_progress.clear();
+        app.download_search.clear();
+        let mut action = egui::Rect::NOTHING;
+        for (width, height) in [(1456.0, 900.0), (980.0, 680.0), (720.0, 600.0)] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+            let (card, title, button, sidebar) = ctx.data_mut(|data| {
+                (
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_empty_card"))
+                        .expect("empty queue card missing"),
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_empty_heading"))
+                        .expect("empty queue heading missing"),
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_empty_action"))
+                        .expect("empty queue store button missing"),
+                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_sidebar_rect"))
+                        .expect("download sidebar missing"),
+                )
+            });
+            assert!(
+                card.width() >= 250.0
+                    && card.width() <= 510.0
+                    && card.left() > 10.0
+                    && card.right() <= sidebar.left() - 2.0
+                    && card.top() > 85.0
+                    && card.bottom() <= height - 32.0,
+                "empty card overflows content area at {width}x{height}: card={card:?}, sidebar={sidebar:?}"
+            );
+            assert!(
+                (button.center().x - card.center().x).abs() < 2.0
+                    && (title.center().x - card.center().x).abs() < 2.0
+                    && button.top() > title.bottom(),
+                "empty card heading/button alignment failed at {width}: card={card:?}, title={title:?}, button={button:?}"
+            );
+            action = button;
+        }
+
+        // Activate the actual central call-to-action. The state change is
+        // identical to the existing "스토어로 이동" button in the sidebar.
+        for pressed in [true, false] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(720.0, 600.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(action.center()),
+                    egui::Event::PointerButton {
+                        pos: action.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        }
+        assert_eq!(app.folder_filter, "CATALOG");
+        assert_eq!(app.current_page, 0);
+        assert_eq!(
+            app.config
+                .settings
+                .get("last_tab_key")
+                .and_then(serde_json::Value::as_str),
+            Some("CATALOG")
+        );
+        assert!(app.torrent_progress.is_empty());
+    }
+
+    #[test]
+    fn download_filtered_empty_state_clears_only_filters_and_preserves_jobs() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None;
+        app.torrent_progress = vec![(
+            "still-there".into(),
+            torrent::TorrentProgress {
+                name: "Saved update".into(),
+                paused: true,
+                ..Default::default()
+            },
+        )];
+        app.download_search = "no matching title".into();
+        app.download_status_filter = "active".into();
+        app.download_page = 4;
+        let render = |app: &mut NslApp, events| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(980.0, 680.0),
+                )),
+                events,
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        };
+        render(&mut app, Vec::new());
+        let action = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_empty_action"))
+                .expect("filtered empty CTA missing")
+                .center()
+        });
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(action),
+                    egui::Event::PointerButton {
+                        pos: action,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.folder_filter, "DOWNLOADS");
+        assert!(app.download_search.is_empty());
+        assert_eq!(app.download_status_filter, "all");
+        assert_eq!(app.download_page, 0);
+        assert_eq!(app.torrent_progress.len(), 1);
+        assert_eq!(app.torrent_progress[0].0, "still-there");
     }
 
     #[test]

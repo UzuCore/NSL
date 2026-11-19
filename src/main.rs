@@ -4059,7 +4059,7 @@ impl NslApp {
                 ui.horizontal(|ui| {
                     ui.heading("⚙  설정");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("X  닫기").clicked() {
+                        if ui.button("X  닫기").on_hover_text("Esc로 닫기").clicked() {
                             self.settings_open = false;
                         }
                     });
@@ -5339,25 +5339,31 @@ impl NslApp {
             self.start_scan(true);
         }
         if escape {
-            // TextEdit changes its buffer during this frame, so clearing only
-            // `search` can leave the debounced/committed query filtering the
-            // list indefinitely until the user types again.
-            self.search.clear();
-            self.search_committed.clear();
-            self.search_pending = None;
-            self.search_focus = false;
-            self.current_page = 0;
-            self.filtered_key = None;
-            if self.folder_filter == "CATALOG" {
-                self.catalog_search.clear();
-                self.catalog_search_committed.clear();
-                self.catalog_search_pending = None;
-                self.catalog_search_cache = None;
-                self.catalog_page = 0;
-                self.catalog_scroll_reset = true;
-            } else if self.folder_filter == "DOWNLOADS" {
-                self.download_search.clear();
-                self.download_scroll_reset = true;
+            if self.settings_open {
+                // Match the settings panel's "X  닫기" button. Do not also
+                // erase the library/Store/Downloads filters behind the panel.
+                self.settings_open = false;
+            } else {
+                // TextEdit changes its buffer during this frame, so clearing
+                // only `search` can leave the committed query filtering the
+                // list indefinitely until the user types again.
+                self.search.clear();
+                self.search_committed.clear();
+                self.search_pending = None;
+                self.search_focus = false;
+                self.current_page = 0;
+                self.filtered_key = None;
+                if self.folder_filter == "CATALOG" {
+                    self.catalog_search.clear();
+                    self.catalog_search_committed.clear();
+                    self.catalog_search_pending = None;
+                    self.catalog_search_cache = None;
+                    self.catalog_page = 0;
+                    self.catalog_scroll_reset = true;
+                } else if self.folder_filter == "DOWNLOADS" {
+                    self.download_search.clear();
+                    self.download_scroll_reset = true;
+                }
             }
         }
         if enter && !ctx.wants_keyboard_input() {
@@ -7810,10 +7816,10 @@ impl NslApp {
                         );
                         ui.vertical(|ui| {
                             ui.label("빠른 스캔 F5");
-                            ui.label("설정 열기/닫기 Ctrl+O");
+                            ui.label("설정 열기/닫기 Ctrl+O · 설정 닫기 Esc");
                             ui.label("검색창 포커스 Ctrl+F");
                             ui.label("종료 Alt+F4");
-                            ui.label("검색어 초기화 Esc");
+                            ui.label("검색어 초기화 Esc (설정 화면 밖에서)");
                             ui.label("게임 선택 이동 ↑ ↓ ← →");
                             ui.label("한 화면 이동 Page Up / Page Down");
                             ui.label("처음 / 마지막 Home / End (Ctrl+Home / Ctrl+End)");
@@ -9872,6 +9878,58 @@ mod runtime_tests {
         assert!(app.catalog_search_pending.is_none());
         assert_eq!(app.current_page, 0);
         assert_eq!(app.catalog_page, 0);
+    }
+
+    #[test]
+    fn escape_closes_settings_without_touching_searches_or_filters_behind_it() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        // Escape from Settings behaves exactly like its close button, not the
+        // global search-clear shortcut used by the underlying library views.
+        for tab in ["", "CATALOG", "DOWNLOADS"] {
+            for category in [0, 1, 4, 6] {
+                app.folder_filter = tab.into();
+                app.settings_open = true;
+                app.settings_category = category;
+                app.search = "my library query".into();
+                app.search_committed = "my library query".into();
+                app.catalog_search = "my store query".into();
+                app.catalog_search_committed = "my store query".into();
+                app.download_search = "my download query".into();
+                app.catalog_genre_filter = "Action".into();
+                app.catalog_format_filter = "NSZ".into();
+                app.catalog_language_filter = "ko".into();
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![egui::Event::Key {
+                        key: egui::Key::Escape,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 780.0),
+                    )),
+                    ..Default::default()
+                });
+                app.ui_frame(&ctx);
+                let _ = ctx.end_pass();
+                assert!(
+                    !app.settings_open,
+                    "Esc failed to close settings at category={category}, tab={tab}"
+                );
+                assert_eq!(app.search, "my library query");
+                assert_eq!(app.search_committed, "my library query");
+                assert_eq!(app.catalog_search, "my store query");
+                assert_eq!(app.catalog_search_committed, "my store query");
+                assert_eq!(app.download_search, "my download query");
+                assert_eq!(app.catalog_genre_filter, "Action");
+                assert_eq!(app.catalog_format_filter, "NSZ");
+                assert_eq!(app.catalog_language_filter, "ko");
+            }
+        }
     }
 
     #[test]

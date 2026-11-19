@@ -554,6 +554,110 @@ const TITLE_FILES: [&str; 3] = ["titles.json", "versions.json", "KR.ko.json"];
 const MAX_TITLE_DB_BYTES: u64 = 512 * 1024 * 1024;
 const ROLLBACK_FOLDER: &str = ".nsl-title-rollback";
 const CACHE_FILE: &str = ".nsl-title-http-cache.json";
+const VERIFIED_REVISION_FILE: &str = ".nsl-title-verified.json";
+// Stat-based checks are an optimization, not a permanent substitute for
+// SHA-256. Recheck the full contents periodically even with unchanged stamps.
+const VERIFIED_REVISION_LIFETIME: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct TitleFileStamp {
+    bytes: u64,
+    modified_ns: u128,
+    created_ns: Option<u128>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VerifiedRevision {
+    version: u8,
+    checked_unix_secs: u64,
+    revision: String,
+    hashes: BTreeMap<String, String>,
+    stamps: BTreeMap<String, TitleFileStamp>,
+}
+
+fn title_file_stamp(path: &Path) -> Option<TitleFileStamp> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    Some(TitleFileStamp {
+        bytes: metadata.len(),
+        modified_ns: metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
+        created_ns: metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|time| time.as_nanos()),
+    })
+}
+
+fn verified_file_hashes(
+    dir: &Path,
+    db: &crate::database::Database,
+) -> Option<BTreeMap<String, String>> {
+    if dir.join(ROLLBACK_FOLDER).exists() || db.stats().ok()?.title_db_count == 0 {
+        return None;
+    }
+    let revision = db.title_revision().ok()??;
+    let cache: VerifiedRevision =
+        serde_json::from_slice(&fs::read(dir.join(VERIFIED_REVISION_FILE)).ok()?).ok()?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    if cache.version != 1
+        || cache.revision != revision
+        || now.checked_sub(cache.checked_unix_secs)? > VERIFIED_REVISION_LIFETIME.as_secs()
+        || cache.hashes.len() != TITLE_FILES.len()
+        || cache.stamps.len() != TITLE_FILES.len()
+        || revision_from_hashes(&cache.hashes) != revision
+    {
+        return None;
+    }
+    for name in TITLE_FILES {
+        if cache.hashes.get(name).is_none_or(|hash| {
+            hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) || cache.stamps.get(name) != title_file_stamp(&dir.join(name)).as_ref()
+        {
+            return None;
+        }
+    }
+    Some(cache.hashes)
+}
+
+fn remember_verified_revision(dir: &Path, revision: &str, hashes: &BTreeMap<String, String>) {
+    let Some(checked_unix_secs) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|time| time.as_secs())
+    else {
+        return;
+    };
+    let mut stamps = BTreeMap::new();
+    for name in TITLE_FILES {
+        let Some(stamp) = title_file_stamp(&dir.join(name)) else {
+            return;
+        };
+        stamps.insert(name.to_owned(), stamp);
+    }
+    if hashes.len() != TITLE_FILES.len() || revision_from_hashes(hashes) != revision {
+        return;
+    }
+    let cache = VerifiedRevision {
+        version: 1,
+        checked_unix_secs,
+        revision: revision.to_owned(),
+        hashes: hashes.clone(),
+        stamps,
+    };
+    // The source files and SQLite transaction are authoritative. Failure to
+    // cache a fingerprint must never make a successful import report failure.
+    if let Ok(bytes) = serde_json::to_vec(&cache) {
+        let _ = crate::database::atomic_write(&dir.join(VERIFIED_REVISION_FILE), &bytes);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -613,6 +717,8 @@ fn file_hash(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    #[cfg(test)]
+    TITLE_HASH_READS.with(|counter| counter.set(counter.get() + 1));
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 256 * 1024];
     loop {
@@ -623,6 +729,11 @@ fn file_hash(path: &Path) -> Result<Option<String>> {
         hasher.update(&buffer[..count]);
     }
     Ok(Some(format!("{:x}", hasher.finalize())))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TITLE_HASH_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn revision_from_hashes(hashes: &BTreeMap<String, String>) -> String {
@@ -642,7 +753,7 @@ fn revision_from_hashes(hashes: &BTreeMap<String, String>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn local_revision(dir: &Path) -> Result<String> {
+fn local_file_hashes(dir: &Path) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
     for name in TITLE_FILES {
         let hash = file_hash(&dir.join(name))?.unwrap_or_else(|| "missing".into());
@@ -654,7 +765,7 @@ pub fn local_revision(dir: &Path) -> Result<String> {
             .is_some_and(|hash| hash != "missing"),
         "로컬 titles.json 파일이 없습니다"
     );
-    Ok(revision_from_hashes(&hashes))
+    Ok(hashes)
 }
 
 pub fn import_local_if_needed(
@@ -666,8 +777,13 @@ pub fn import_local_if_needed(
     if let Some(progress) = progress {
         progress.begin("로컬 타이틀 DB 변경 확인", None, false);
     }
-    let revision = local_revision(dir)?;
+    if verified_file_hashes(dir, db).is_some() {
+        return Ok(UpdateOutcome::AlreadyLatest);
+    }
+    let hashes = local_file_hashes(dir)?;
+    let revision = revision_from_hashes(&hashes);
     if db.stats()?.title_db_count > 0 && db.title_revision()?.as_deref() == Some(&revision) {
+        remember_verified_revision(dir, &revision, &hashes);
         return Ok(UpdateOutcome::AlreadyLatest);
     }
     let entries = load_local_with_progress(dir, progress)?;
@@ -675,6 +791,7 @@ pub fn import_local_if_needed(
         progress.begin("로컬 타이틀 DB 레코드 반영", None, false);
     }
     db.load_titles_with_revision(&entries, None, Some(&revision))?;
+    remember_verified_revision(dir, &revision, &hashes);
     Ok(UpdateOutcome::Updated(entries.len()))
 }
 
@@ -867,10 +984,16 @@ where
         source: source.to_owned(),
         files: BTreeMap::new(),
     };
+    let verified_hashes = verified_file_hashes(dir, db);
     let mut any_changed = false;
     for (name, url) in title_urls(source) {
         let target = dir.join(name);
-        let prior_hash = file_hash(&target)?;
+        let prior_hash =
+            if let Some(hash) = verified_hashes.as_ref().and_then(|hashes| hashes.get(name)) {
+                Some(hash.clone())
+            } else {
+                file_hash(&target)?
+            };
         let cached_header = cached.files.get(name).filter(|header| {
             cached.source == source && prior_hash.as_deref() == Some(header.sha256.as_str())
         });
@@ -909,12 +1032,18 @@ where
             .map(|(name, header)| (name.clone(), header.sha256.clone()))
             .collect::<BTreeMap<_, _>>(),
     );
+    let next_hashes = next_cache
+        .files
+        .iter()
+        .map(|(name, header)| (name.clone(), header.sha256.clone()))
+        .collect::<BTreeMap<_, _>>();
     if !any_changed && stored_rows > 0 && db.title_revision()?.as_deref() == Some(revision.as_str())
     {
         let _ = crate::database::atomic_write(
             &dir.join(CACHE_FILE),
             &serde_json::to_vec_pretty(&next_cache)?,
         );
+        remember_verified_revision(dir, &revision, &next_hashes);
         return Ok(UpdateOutcome::AlreadyLatest);
     }
 
@@ -971,6 +1100,7 @@ where
         &dir.join(CACHE_FILE),
         &serde_json::to_vec_pretty(&next_cache)?,
     );
+    remember_verified_revision(dir, &revision, &next_hashes);
     Ok(UpdateOutcome::Updated(entries.len()))
 }
 #[cfg(test)]
@@ -1079,6 +1209,7 @@ mod tests {
         );
         let old_token = db.title_sync_token().unwrap();
         let old_titles = fs::read(dir.join("titles.json")).unwrap();
+        let hashes_before = TITLE_HASH_READS.with(std::cell::Cell::get);
         let mut conditional_requests = 0;
         let fetch =
             |_: &str, _: &str, _: &Path, old: Option<&RemoteHeader>, _: Option<&TaskProgress>| {
@@ -1096,6 +1227,11 @@ mod tests {
             UpdateOutcome::AlreadyLatest
         );
         assert_eq!(conditional_requests, 3);
+        assert_eq!(
+            TITLE_HASH_READS.with(std::cell::Cell::get),
+            hashes_before,
+            "verified HTTP 304 checks should not rehash unchanged local JSONs"
+        );
         assert_eq!(db.title_sync_token().unwrap(), old_token);
         assert_eq!(fs::read(dir.join("titles.json")).unwrap(), old_titles);
         assert_eq!(db.stats().unwrap().title_db_count, 1);
@@ -1284,6 +1420,103 @@ mod tests {
         assert_eq!(
             import_local_if_needed(&dir, &db, None).unwrap(),
             UpdateOutcome::Updated(1)
+        );
+    }
+
+    #[test]
+    fn verified_revision_cache_skips_hashes_and_expires_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("titledb");
+        fs::create_dir_all(&dir).unwrap();
+        let db = fixture_db(temp.path());
+        for name in TITLE_FILES {
+            fs::write(dir.join(name), fixture(name, "Original")).unwrap();
+        }
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::Updated(1)
+        );
+        let cache_path = dir.join(VERIFIED_REVISION_FILE);
+        assert!(cache_path.is_file());
+        let hashes_before = TITLE_HASH_READS.with(std::cell::Cell::get);
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::AlreadyLatest
+        );
+        assert_eq!(TITLE_HASH_READS.with(std::cell::Cell::get), hashes_before);
+
+        let mut cache: VerifiedRevision =
+            serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        cache.checked_unix_secs -= VERIFIED_REVISION_LIFETIME.as_secs() + 1;
+        fs::write(&cache_path, serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::AlreadyLatest
+        );
+        assert_eq!(
+            TITLE_HASH_READS.with(std::cell::Cell::get) - hashes_before,
+            TITLE_FILES.len() as u64,
+            "expired cache must rehash all inputs"
+        );
+
+        let original_count = TITLE_HASH_READS.with(std::cell::Cell::get);
+        fs::write(dir.join("titles.json"), fixture("titles.json", "Modified")).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("titles.json"))
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::Updated(1)
+        );
+        assert!(TITLE_HASH_READS.with(std::cell::Cell::get) > original_count);
+        assert!(db.title_revision().unwrap().is_some());
+
+        fs::write(&cache_path, b"invalid cache bytes").unwrap();
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::AlreadyLatest,
+            "corrupted fingerprint cache cannot change the source of truth"
+        );
+        db.clear_titles().unwrap();
+        assert_eq!(
+            import_local_if_needed(&dir, &db, None).unwrap(),
+            UpdateOutcome::Updated(1),
+            "a valid cache must not hide a cleared SQLite title database"
+        );
+    }
+
+    #[test]
+    #[ignore = "copies the real title JSONs into an isolated database for a read-only speed check"]
+    fn real_title_database_verified_cache_speed_and_parity() {
+        let original = Path::new(env!("CARGO_MANIFEST_DIR")).join("titledb");
+        let sandbox = tempfile::tempdir().unwrap();
+        let sandbox_titles = sandbox.path().join("titledb");
+        fs::create_dir_all(&sandbox_titles).unwrap();
+        for name in TITLE_FILES {
+            fs::copy(original.join(name), sandbox_titles.join(name)).unwrap();
+        }
+        let db = fixture_db(sandbox.path());
+        let full_start = std::time::Instant::now();
+        let imported = import_local_if_needed(&sandbox_titles, &db, None).unwrap();
+        let full_secs = full_start.elapsed().as_secs_f64();
+        assert!(matches!(imported, UpdateOutcome::Updated(count) if count > 40_000));
+        let first_hashes = TITLE_HASH_READS.with(std::cell::Cell::get);
+        let cache_start = std::time::Instant::now();
+        assert_eq!(
+            import_local_if_needed(&sandbox_titles, &db, None).unwrap(),
+            UpdateOutcome::AlreadyLatest
+        );
+        let cached_secs = cache_start.elapsed().as_secs_f64();
+        assert_eq!(TITLE_HASH_READS.with(std::cell::Cell::get), first_hashes);
+        assert!(cached_secs <= full_secs);
+        eprintln!(
+            "TITLE_DB_CACHE_BENCH rows={} first_import={:.3}s cached_check={:.4}s hashes_skipped=3",
+            db.stats().unwrap().title_db_count,
+            full_secs,
+            cached_secs
         );
     }
 

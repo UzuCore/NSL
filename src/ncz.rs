@@ -11,7 +11,11 @@ use aes::{
     Aes128,
 };
 use anyhow::{Context, Result};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::{
+    cell::RefCell,
+    io::{self, Read, Seek, SeekFrom, Write},
+    rc::Rc,
+};
 
 const HEADER: u64 = 0x4000;
 const IO_CHUNK: usize = 256 * 1024;
@@ -397,21 +401,191 @@ pub fn decompress<R: Read + Seek, W: Write>(
     Ok(position)
 }
 
-/// Bounded metadata/control NCA extraction for direct CNMT/NACP parsing.
-/// Never inflates large program/data archives while scanning a library.
-pub(crate) fn small_nca_bytes<R: Read + Seek>(
-    source: &mut R,
+/// Shares a compressed input cursor between the decoder and its restart
+/// path. The decoder is always dropped before seeking the source backwards.
+struct SharedInput<'a, R: Read + Seek> {
+    source: Rc<RefCell<&'a mut R>>,
+}
+
+impl<R: Read + Seek> Read for SharedInput<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.source.borrow_mut().read(bytes)
+    }
+}
+
+/// Read/seek the reconstructed NCA without materializing an entire Control
+/// archive (which may expand to hundreds of MiB). The NCZ header is kept in
+/// 16 KiB, and only the requested compressed stream ranges are decoded.
+/// Backward seeks restart decoding; NCA metadata reads are normally forward.
+pub(crate) struct SparseNca<'a, R: Read + Seek> {
+    source: Rc<RefCell<&'a mut R>>,
+    start: u64,
+    compressed_size: u64,
+    layout: Layout,
+    header: [u8; HEADER as usize],
+    decoder: Option<Box<dyn Read + 'a>>,
+    decoded_position: u64,
+    position: u64,
+    ciphers: Vec<Option<Aes128>>,
+}
+
+impl<'a, R: Read + Seek> SparseNca<'a, R> {
+    fn new(source: &'a mut R, start: u64, compressed_size: u64, limit: u64) -> Result<Self> {
+        let layout = inspect(source, start, compressed_size)?;
+        anyhow::ensure!(
+            layout.expanded_size <= limit,
+            "NCZ 메타데이터 복원 범위 초과"
+        );
+        source.seek(SeekFrom::Start(start))?;
+        let mut header = [0u8; HEADER as usize];
+        source.read_exact(&mut header)?;
+        let mut ciphers = Vec::with_capacity(layout.sections.len());
+        for section in &layout.sections {
+            let cipher = matches!(section.crypto, 3 | 4)
+                .then(|| Aes128::new_from_slice(&section.key))
+                .transpose()
+                .context("NCZ AES 키 크기 오류")?;
+            ciphers.push(cipher);
+        }
+        Ok(Self {
+            source: Rc::new(RefCell::new(source)),
+            start,
+            compressed_size,
+            layout,
+            header,
+            decoder: None,
+            decoded_position: HEADER,
+            position: 0,
+            ciphers,
+        })
+    }
+
+    fn reset_decoder(&mut self) -> io::Result<()> {
+        self.decoder = None;
+        {
+            let mut source = self.source.borrow_mut();
+            source.seek(SeekFrom::Start(self.layout.header_end))?;
+        }
+        let length = self.compressed_size - (self.layout.header_end - self.start);
+        let compressed = SharedInput {
+            source: Rc::clone(&self.source),
+        }
+        .take(length);
+        self.decoder = Some(match &self.layout.encoding {
+            Encoding::Solid => Box::new(zstd::stream::read::Decoder::new(compressed)?),
+            Encoding::Blocks {
+                block_size,
+                unpacked_size,
+                sizes,
+            } => Box::new(BlockReader::new(
+                compressed,
+                sizes.clone(),
+                *block_size,
+                *unpacked_size,
+            )?),
+        });
+        self.decoded_position = HEADER;
+        Ok(())
+    }
+
+    fn advance_decoder(&mut self) -> io::Result<()> {
+        if self.decoder.is_none() || self.decoded_position > self.position {
+            self.reset_decoder()?;
+        }
+        let mut discard = [0u8; IO_CHUNK];
+        while self.decoded_position < self.position {
+            let amount = ((self.position - self.decoded_position) as usize).min(discard.len());
+            self.decoder
+                .as_mut()
+                .expect("decoder initialized")
+                .read_exact(&mut discard[..amount])?;
+            self.decoded_position += amount as u64;
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read + Seek> Read for SparseNca<'_, R> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() || self.position >= self.layout.expanded_size {
+            return Ok(0);
+        }
+        if self.position < HEADER {
+            let amount = output.len().min((HEADER - self.position) as usize);
+            output[..amount].copy_from_slice(
+                &self.header[self.position as usize..self.position as usize + amount],
+            );
+            self.position += amount as u64;
+            return Ok(amount);
+        }
+        self.advance_decoder()?;
+        let mut end = self.layout.expanded_size;
+        let mut cipher = None;
+        for (index, section) in self.layout.sections.iter().enumerate() {
+            if self.position < section.start {
+                end = section.start;
+                break;
+            }
+            if self.position < section.start + section.size {
+                end = section.start + section.size;
+                cipher = self.ciphers[index]
+                    .as_ref()
+                    .map(|key| (key, &section.counter));
+                break;
+            }
+        }
+        let count = output.len().min((end - self.position) as usize);
+        let read = self
+            .decoder
+            .as_mut()
+            .expect("decoder initialized")
+            .read(&mut output[..count])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "NCZ 압축 데이터가 잘렸습니다",
+            ));
+        }
+        if let Some((cipher, counter)) = cipher {
+            reencrypt_ctr_with_cipher(cipher, &mut output[..read], self.position, counter);
+        }
+        self.position += read as u64;
+        self.decoded_position += read as u64;
+        Ok(read)
+    }
+}
+
+impl<R: Read + Seek> Seek for SparseNca<'_, R> {
+    fn seek(&mut self, seek: SeekFrom) -> io::Result<u64> {
+        let next = match seek {
+            SeekFrom::Start(position) => position as i128,
+            SeekFrom::Current(delta) => self.position as i128 + delta as i128,
+            SeekFrom::End(delta) => self.layout.expanded_size as i128 + delta as i128,
+        };
+        if !(0..=u64::MAX as i128).contains(&next) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "NCZ 탐색 범위 초과",
+            ));
+        }
+        self.position = next as u64;
+        Ok(self.position)
+    }
+}
+
+/// Decode only the ranges requested by a native NCA metadata extractor.
+/// Memory stays bounded by the NCZBLOCK size (at most 32 MiB per block),
+/// the decoder's reusable buffers and the small decrypted metadata tables.
+pub(crate) fn with_sparse_nca<'a, R: Read + Seek, T>(
+    source: &'a mut R,
     offset: u64,
     size: u64,
     max_expanded_bytes: u64,
-) -> Option<Vec<u8>> {
-    let length = inspect(source, offset, size).ok()?.expanded_size;
-    if length > max_expanded_bytes || length > usize::MAX as u64 {
-        return None;
-    }
-    let mut output = Vec::with_capacity(length as usize);
-    decompress(source, offset, size, &mut output).ok()?;
-    (output.len() as u64 == length).then_some(output)
+    extract: impl FnOnce(&mut SparseNca<'a, R>, u64) -> Option<T>,
+) -> Option<T> {
+    let mut reader = SparseNca::new(source, offset, size, max_expanded_bytes).ok()?;
+    let size = reader.layout.expanded_size;
+    extract(&mut reader, size)
 }
 
 #[cfg(test)]
@@ -507,6 +681,82 @@ mod tests {
                 original.len() as u64
             );
             assert_eq!(restored, original);
+        }
+    }
+
+    #[test]
+    fn sparse_nca_matches_original_at_forward_backward_and_boundary_seeks() {
+        let mut original = vec![0x99u8; HEADER as usize];
+        original.extend((0..0x21555u32).map(|value| (value % 251) as u8));
+        let sections = vec![
+            Section {
+                start: HEADER + 0x180,
+                size: 0x8000,
+                crypto: 3,
+                key: [0x5a; 16],
+                counter: [0x32; 16],
+            },
+            Section {
+                start: HEADER + 0x8180,
+                size: 0x193d5,
+                crypto: 4,
+                key: [0x14; 16],
+                counter: [0x11; 16],
+            },
+        ];
+        for blocks in [false, true] {
+            let encoded = sample_ncz(&original, &sections, blocks);
+            let offset = 0x345usize;
+            let mut container = vec![0xe1; offset];
+            container.extend(&encoded);
+            container.extend([0xee; 23]);
+            let mut source = Cursor::new(container);
+            with_sparse_nca(
+                &mut source,
+                offset as u64,
+                encoded.len() as u64,
+                original.len() as u64,
+                |reader, length| {
+                    assert_eq!(length as usize, original.len());
+                    for (position, amount) in [
+                        (0, 0x30),
+                        (HEADER - 5, 55),
+                        (HEADER + 0x17f, 33),
+                        (HEADER + 0x8180, 117),
+                        (HEADER + 0x180, 410),
+                        (HEADER + 0x10000, 1024),
+                        (HEADER + 0x35, 88),
+                        (original.len() as u64 - 100, 100),
+                    ] {
+                        reader.seek(SeekFrom::Start(position)).unwrap();
+                        let mut actual = vec![0; amount];
+                        reader.read_exact(&mut actual).unwrap();
+                        assert_eq!(
+                            actual,
+                            original[position as usize..position as usize + amount]
+                        );
+                    }
+                    reader.seek(SeekFrom::End(-16)).unwrap();
+                    let mut tail = [0; 16];
+                    reader.read_exact(&mut tail).unwrap();
+                    assert_eq!(&tail, &original[original.len() - 16..]);
+                    assert_eq!(reader.read(&mut tail).unwrap(), 0);
+                    reader.seek(SeekFrom::Start(0)).unwrap();
+                    let mut entire = Vec::new();
+                    reader.read_to_end(&mut entire).unwrap();
+                    assert_eq!(entire, original);
+                    Some(())
+                },
+            )
+            .expect("sparse reader should decode both NCZ encodings");
+            assert!(with_sparse_nca(
+                &mut source,
+                offset as u64,
+                encoded.len() as u64,
+                original.len() as u64 - 1,
+                |_reader, _length| Some(()),
+            )
+            .is_none());
         }
     }
 

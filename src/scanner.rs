@@ -432,7 +432,14 @@ struct PfsNca {
     size: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_INDEX_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn pfs_ncas(path: &Path) -> Option<Vec<PfsNca>> {
+    #[cfg(test)]
+    NATIVE_INDEX_READS.with(|counter| counter.set(counter.get() + 1));
     let mut file = File::open(path).ok()?;
     let file_size = file.metadata().ok()?.len();
     for base in [0u64, 0x200, 0x400, 0x1000, 0x4000, 0x8000] {
@@ -506,17 +513,38 @@ fn is_cnmt_candidate_size(size: u64) -> bool {
     (1024..=64 * 1024 * 1024).contains(&size)
 }
 
-/// Native NSP/NSZ title metadata, including bounded in-memory NCZ inflation.
-/// No intermediate NCA is written to disk and no command is spawned.
-fn native_nsp_contents(path: &Path) -> Vec<Content> {
-    #[cfg(test)]
-    let _perf = scan_profile::NSP_CONTENTS.start();
+/// A single package index and a single validated key cache serve both
+/// metadata paths. Each worker still opens its own file handle: sharing a
+/// seek cursor across the parallel NACP/CNMT readers would corrupt offsets.
+fn native_nsp_metadata(
+    path: &Path,
+    needs_names: bool,
+) -> (Vec<Content>, Option<(String, String, String)>) {
     let Some(entries) = pfs_ncas(path) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let Some(keys) = prod_keys().and_then(|p| crate::native_nca::cached_keys(&p)) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
+    if needs_names {
+        rayon::join(
+            || native_nsp_contents(path, &entries, &keys),
+            || native_nsp_names(path, &entries, &keys),
+        )
+    } else {
+        (native_nsp_contents(path, &entries, &keys), None)
+    }
+}
+
+/// Native NSP/NSZ title metadata, with bounded NCZ decoding. No NCA is
+/// extracted to disk and no external process is started.
+fn native_nsp_contents(
+    path: &Path,
+    entries: &[PfsNca],
+    keys: &crate::native_nca::Keys,
+) -> Vec<Content> {
+    #[cfg(test)]
+    let _perf = scan_profile::NSP_CONTENTS.start();
     let Ok(mut input) = File::open(path) else {
         return Vec::new();
     };
@@ -532,7 +560,7 @@ fn native_nsp_contents(path: &Path) -> Vec<Content> {
             entry.offset,
             entry.size,
             compressed,
-            &keys,
+            keys,
         ) {
             #[cfg(test)]
             scan_profile::NATIVE_CNMT_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -553,18 +581,20 @@ fn native_nsp_contents(path: &Path) -> Vec<Content> {
     result
 }
 
-fn native_nsp_names(path: &Path) -> Option<(String, String, String)> {
+fn native_nsp_names(
+    path: &Path,
+    entries: &[PfsNca],
+    keys: &crate::native_nca::Keys,
+) -> Option<(String, String, String)> {
     #[cfg(test)]
     let _perf = scan_profile::NSP_NAMES.start();
-    let mut entries = pfs_ncas(path)?;
-    entries.retain(|entry| {
+    let candidates = entries.iter().filter(|entry| {
         !entry.name.to_ascii_lowercase().contains(".cnmt.")
             && (64 * 1024..=512 * 1024 * 1024).contains(&entry.size)
     });
-    let keys = prod_keys().and_then(|p| crate::native_nca::cached_keys(&p))?;
     let mut input = File::open(path).ok()?;
-    for entry in entries.iter().take(32) {
-        if crate::native_nca::content_kind(&mut input, entry.offset, entry.size, &keys) != Some(2) {
+    for entry in candidates.take(32) {
+        if crate::native_nca::content_kind(&mut input, entry.offset, entry.size, keys) != Some(2) {
             continue;
         }
         let compressed = entry.name.to_ascii_lowercase().ends_with(".ncz");
@@ -573,7 +603,7 @@ fn native_nsp_names(path: &Path) -> Option<(String, String, String)> {
             entry.offset,
             entry.size,
             compressed,
-            &keys,
+            keys,
         ) {
             #[cfg(test)]
             scan_profile::NATIVE_NACP_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -666,11 +696,7 @@ pub fn scan_file_hashed(path: &Path, filename: &str, hash: String) -> Result<Sca
     let mut names = (nacp_ko, nacp_en, nacp_ja);
     let needs_names = names.0.is_empty() && names.1.is_empty() && names.2.is_empty();
     if nsp {
-        let (deep, extracted_names) = if needs_names {
-            rayon::join(|| native_nsp_contents(path), || native_nsp_names(path))
-        } else {
-            (native_nsp_contents(path), None)
-        };
+        let (deep, extracted_names) = native_nsp_metadata(path, needs_names);
         if !deep.is_empty() {
             contents = deep;
         }
@@ -795,6 +821,23 @@ mod tests {
         let path = dir.path().join(name);
         fs::write(&path, bytes).unwrap();
         (dir, path)
+    }
+
+    #[test]
+    fn native_metadata_parses_a_shared_package_index_only_once() {
+        let (_dir, path) = write_temp_file(
+            &pfs0(&[("control.nca", vec![0u8; 0xC00])]),
+            "shared-index.nsp",
+        );
+        let before = NATIVE_INDEX_READS.with(std::cell::Cell::get);
+        let (contents, names) = native_nsp_metadata(&path, true);
+        assert!(contents.is_empty());
+        assert!(names.is_none());
+        assert_eq!(
+            NATIVE_INDEX_READS.with(std::cell::Cell::get) - before,
+            1,
+            "parallel CNMT/NACP metadata readers must share one parsed PFS index"
+        );
     }
 
     #[test]

@@ -186,8 +186,9 @@ pub(crate) fn extract_cnmt_package<R: Read + Seek>(
     keys: &Keys,
 ) -> Option<Vec<Content>> {
     if compressed {
-        let data = crate::ncz::small_nca_bytes(reader, start, length, 64 * 1024 * 1024)?;
-        extract_cnmt(&mut std::io::Cursor::new(&data), 0, data.len() as u64, keys)
+        crate::ncz::with_sparse_nca(reader, start, length, 64 * 1024 * 1024, |nca, size| {
+            extract_cnmt(nca, 0, size, keys)
+        })
     } else {
         extract_cnmt(reader, start, length, keys)
     }
@@ -201,8 +202,9 @@ pub(crate) fn extract_cnmt_controls_package<R: Read + Seek>(
     keys: &Keys,
 ) -> Option<Vec<CnmtWithControl>> {
     if compressed {
-        let data = crate::ncz::small_nca_bytes(reader, start, length, 64 * 1024 * 1024)?;
-        extract_cnmt_with_controls(&mut std::io::Cursor::new(&data), 0, data.len() as u64, keys)
+        crate::ncz::with_sparse_nca(reader, start, length, 64 * 1024 * 1024, |nca, size| {
+            extract_cnmt_with_controls(nca, 0, size, keys)
+        })
     } else {
         extract_cnmt_with_controls(reader, start, length, keys)
     }
@@ -216,8 +218,9 @@ pub(crate) fn extract_nacp_package<R: Read + Seek>(
     keys: &Keys,
 ) -> Option<(String, String, String)> {
     if compressed {
-        let data = crate::ncz::small_nca_bytes(reader, start, length, 512 * 1024 * 1024)?;
-        extract_nacp(&mut std::io::Cursor::new(&data), 0, data.len() as u64, keys)
+        crate::ncz::with_sparse_nca(reader, start, length, 512 * 1024 * 1024, |nca, size| {
+            extract_nacp(nca, 0, size, keys)
+        })
     } else {
         extract_nacp(reader, start, length, keys)
     }
@@ -740,8 +743,9 @@ pub(crate) fn extract_icon_package<R: Read + Seek>(
     keys: &Keys,
 ) -> Option<Vec<u8>> {
     if compressed {
-        let data = crate::ncz::small_nca_bytes(reader, start, length, 256 * 1024 * 1024)?;
-        extract_icon(&mut std::io::Cursor::new(&data), 0, data.len() as u64, keys)
+        crate::ncz::with_sparse_nca(reader, start, length, 256 * 1024 * 1024, |nca, size| {
+            extract_icon(nca, 0, size, keys)
+        })
     } else {
         extract_icon(reader, start, length, keys)
     }

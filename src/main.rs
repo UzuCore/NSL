@@ -731,6 +731,7 @@ struct NslApp {
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
     download_search: String,
     download_status_filter: String,
+    download_page: usize,
     download_scroll_reset: bool,
     torrent_polled_at: Option<std::time::Instant>,
     download_delete_confirm: Option<(String, String)>,
@@ -941,6 +942,45 @@ fn download_matches_filters(
         && (query.is_empty()
             || progress.name.to_lowercase().contains(query)
             || key.to_lowercase().contains(query))
+}
+
+/// Use the library's compact previous / page / next layout in both management
+/// lists. Navigation belongs above the rows, never inside the right sidebar.
+const MANAGEMENT_PAGE_SIZE: usize = 100;
+
+fn management_pagination_ui(
+    ui: &mut egui::Ui,
+    current_page: &mut usize,
+    total_items: usize,
+) -> (egui::Rect, egui::Rect, bool) {
+    let total_pages = total_items.div_ceil(MANAGEMENT_PAGE_SIZE).max(1);
+    let previous = *current_page;
+    *current_page = (*current_page).min(total_pages - 1);
+    let mut next_button_rect = egui::Rect::NOTHING;
+    let layout = ui.horizontal(|ui| {
+        if ui
+            .add_enabled(*current_page > 0, egui::Button::new("이전"))
+            .clicked()
+        {
+            *current_page -= 1;
+        }
+        ui.label(format!(
+            "페이지 {} / {} · {}개 항목",
+            *current_page + 1,
+            total_pages,
+            common::format_count(total_items as i64)
+        ));
+        let next = ui.add_enabled(*current_page + 1 < total_pages, egui::Button::new("다음"));
+        next_button_rect = next.rect;
+        if next.clicked() {
+            *current_page += 1;
+        }
+    });
+    (
+        layout.response.rect,
+        next_button_rect,
+        *current_page != previous,
+    )
 }
 
 fn path_is_within(path: &str, folder: &str) -> bool {
@@ -1279,6 +1319,7 @@ impl NslApp {
             torrent_progress: Vec::new(),
             download_search: String::new(),
             download_status_filter: "all".into(),
+            download_page: 0,
             download_scroll_reset: false,
             torrent_polled_at: None,
             download_delete_confirm: None,
@@ -2119,17 +2160,6 @@ impl NslApp {
             }
         }
         if let Some(metadata) = &metadata {
-            if !metadata.description.trim().is_empty() {
-                ui.add_space(6.0);
-                ui.separator();
-                ui.label(egui::RichText::new("게임 소개").strong());
-                egui::ScrollArea::vertical()
-                    .id_salt(("catalog_description", &item.topic_id))
-                    .max_height(180.0)
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(&metadata.description).wrap());
-                    });
-            }
             if let Ok(urls) = serde_json::from_str::<Vec<String>>(&metadata.screenshots) {
                 let screenshots = urls
                     .iter()
@@ -2166,6 +2196,7 @@ impl NslApp {
     /// game-detail splitter. The catalog list below gets all remaining space.
     fn catalog_sidebar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.start_catalog_title_details();
+        ui.spacing_mut().item_spacing.y = 6.0;
         egui::ScrollArea::vertical()
             .id_salt("catalog_sidebar_scroll")
             .auto_shrink([false, false])
@@ -2289,7 +2320,13 @@ impl NslApp {
                 #[cfg(not(test))]
                 let _ = language_rect;
                 ui.add_space(5.0);
-                if ui.button("검색·분류 초기화").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new("검색·분류 초기화"),
+                    )
+                    .clicked()
+                {
                     self.catalog_search.clear();
                     self.catalog_search_committed.clear();
                     self.catalog_search_pending = None;
@@ -2298,44 +2335,30 @@ impl NslApp {
                     self.catalog_language_filter = "all".into();
                 }
                 self.refresh_catalog_matches(ctx);
-                let total_pages = self.catalog_matching_indices.len().div_ceil(100).max(1);
-                self.catalog_page = self.catalog_page.min(total_pages - 1);
                 ui.separator();
                 ui.label(format!(
                     "검색 결과 {}개",
                     common::format_count(self.catalog_matching_indices.len() as i64)
                 ));
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(self.catalog_page > 0, egui::Button::new("이전"))
-                        .clicked()
-                    {
-                        self.catalog_page -= 1;
-                        self.catalog_scroll_reset = true;
-                    }
-                    ui.label(format!("{} / {}", self.catalog_page + 1, total_pages));
-                    if ui
-                        .add_enabled(
-                            self.catalog_page + 1 < total_pages,
-                            egui::Button::new("다음"),
-                        )
-                        .clicked()
-                    {
-                        self.catalog_page += 1;
-                        self.catalog_scroll_reset = true;
-                    }
-                });
                 ui.separator();
                 if ui
                     .add_enabled(
                         self.catalog_result.is_none(),
-                        egui::Button::new("카탈로그 새로고침"),
+                        egui::Button::new("카탈로그 새로고침")
+                            .min_size(egui::vec2(ui.available_width(), 29.0)),
                     )
                     .clicked()
                 {
                     self.start_catalog_download();
                 }
-                if !self.torrent_progress.is_empty() && ui.button("다운로드 보기").clicked() {
+                if !self.torrent_progress.is_empty()
+                    && ui
+                        .add_sized(
+                            [ui.available_width(), 29.0],
+                            egui::Button::new("다운로드 보기"),
+                        )
+                        .clicked()
+                {
                     self.folder_filter = "DOWNLOADS".into();
                     self.current_page = 0;
                     self.config.settings.insert(
@@ -2346,6 +2369,7 @@ impl NslApp {
                 }
                 ui.separator();
                 ui.label(egui::RichText::new("선택한 게임").strong());
+                ui.add_space(3.0);
                 self.catalog_selected_details_ui(ui);
                 ui.separator();
                 ui.label(
@@ -2375,8 +2399,29 @@ impl NslApp {
             });
             return;
         }
-        ui.add_space(4.0);
-        let page_size = 100usize;
+        let (pagination_rect, next_button_rect, page_changed) = management_pagination_ui(
+            ui,
+            &mut self.catalog_page,
+            self.catalog_matching_indices.len(),
+        );
+        if page_changed {
+            self.catalog_scroll_reset = true;
+        }
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_catalog_pagination_rect"),
+                pagination_rect,
+            );
+            data.insert_temp(
+                egui::Id::new("nsl_test_catalog_pagination_next"),
+                next_button_rect,
+            );
+        });
+        #[cfg(not(test))]
+        let _ = (pagination_rect, next_button_rect);
+        ui.add_space(6.0);
+        let page_size = MANAGEMENT_PAGE_SIZE;
         // Keep only lightweight indices for the page. Clone heavyweight
         // catalog entries (magnet links and other strings) only for the rows
         // that the virtualized scroll area will actually display.
@@ -2387,6 +2432,13 @@ impl NslApp {
             .take(page_size)
             .copied()
             .collect();
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_catalog_visible_items"),
+                page_indices.len(),
+            )
+        });
         if page_indices.is_empty() {
             library_section_frame(ui).show(ui, |ui| {
                 ui.label("검색·분류 조건과 일치하는 타이틀이 없습니다.");
@@ -2710,6 +2762,7 @@ impl NslApp {
     /// Search, transfer-state filters and aggregate progress live next to
     /// the downloads list, not in a toolbar above its first row.
     fn downloads_sidebar_ui(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().item_spacing.y = 6.0;
         egui::ScrollArea::vertical()
             .id_salt("downloads_sidebar_scroll")
             .auto_shrink([false, false])
@@ -2739,6 +2792,7 @@ impl NslApp {
                     )
                 });
                 if search.changed() {
+                    self.download_page = 0;
                     self.download_scroll_reset = true;
                 }
                 ui.add_space(6.0);
@@ -2762,12 +2816,20 @@ impl NslApp {
                         }
                     });
                 if self.download_status_filter != previous_status {
+                    self.download_page = 0;
                     self.download_scroll_reset = true;
                 }
                 ui.add_space(8.0);
-                if ui.button("검색·분류 초기화").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new("검색·분류 초기화"),
+                    )
+                    .clicked()
+                {
                     self.download_search.clear();
                     self.download_status_filter = "all".into();
+                    self.download_page = 0;
                     self.download_scroll_reset = true;
                 }
                 let query = self.download_search.trim().to_lowercase();
@@ -2830,7 +2892,13 @@ impl NslApp {
                     ui.label(format!("전체 속도  {}/s", common::format_size(total_speed)));
                 }
                 ui.separator();
-                if ui.button("스토어로 이동").clicked() {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 29.0],
+                        egui::Button::new("스토어로 이동"),
+                    )
+                    .clicked()
+                {
                     self.folder_filter = "CATALOG".into();
                     self.current_page = 0;
                     self.config.settings.insert(
@@ -2866,14 +2934,48 @@ impl NslApp {
             return;
         }
         let query = self.download_search.trim().to_lowercase();
+        let matching_count = self
+            .torrent_progress
+            .iter()
+            .filter(|(key, progress)| {
+                download_matches_filters(key, progress, &query, &self.download_status_filter)
+            })
+            .count();
+        let (pagination_rect, next_button_rect, page_changed) =
+            management_pagination_ui(ui, &mut self.download_page, matching_count);
+        if page_changed {
+            self.download_scroll_reset = true;
+        }
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_download_pagination_rect"),
+                pagination_rect,
+            );
+            data.insert_temp(
+                egui::Id::new("nsl_test_download_pagination_next"),
+                next_button_rect,
+            );
+        });
+        #[cfg(not(test))]
+        let _ = (pagination_rect, next_button_rect);
         let entries: Vec<_> = self
             .torrent_progress
             .iter()
             .filter(|(key, progress)| {
                 download_matches_filters(key, progress, &query, &self.download_status_filter)
             })
+            .skip(self.download_page * MANAGEMENT_PAGE_SIZE)
+            .take(MANAGEMENT_PAGE_SIZE)
             .cloned()
             .collect();
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_download_visible_items"),
+                entries.len(),
+            )
+        });
         if entries.is_empty() {
             ui.add_space(8.0);
             library_section_frame(ui).show(ui, |ui| {
@@ -2881,7 +2983,7 @@ impl NslApp {
             });
             return;
         }
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         let mut download_scroll = egui::ScrollArea::vertical()
             .id_salt("downloads_rows")
             .auto_shrink([false, false]);
@@ -5362,6 +5464,7 @@ impl NslApp {
                     self.catalog_scroll_reset = true;
                 } else if self.folder_filter == "DOWNLOADS" {
                     self.download_search.clear();
+                    self.download_page = 0;
                     self.download_scroll_reset = true;
                 }
             }
@@ -6257,6 +6360,7 @@ impl NslApp {
                 .min_width(235.0)
                 .max_width(365.0)
                 .resizable(true)
+                .frame(management_sidebar_frame(&ctx.style()))
                 .show(ctx, |ui| {
                     ui.scope(|ui| {
                         outlined_action_style(ui);
@@ -6278,6 +6382,7 @@ impl NslApp {
                 .min_width(235.0)
                 .max_width(365.0)
                 .resizable(true)
+                .frame(management_sidebar_frame(&ctx.style()))
                 .show(ctx, |ui| {
                     ui.scope(|ui| {
                         outlined_action_style(ui);
@@ -8005,6 +8110,12 @@ fn library_section_frame(ui: &egui::Ui) -> egui::Frame {
         .inner_margin(egui::Margin::same(10.0))
 }
 
+fn management_sidebar_frame(style: &egui::Style) -> egui::Frame {
+    // Both management tabs share the same comfortable content inset. Using
+    // the SidePanel frame keeps the scroll area inside the padded viewport.
+    egui::Frame::side_top_panel(style).inner_margin(egui::Margin::symmetric(14.0, 12.0))
+}
+
 fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_tasks: &[&str]) {
     let statistics = format!(
         "파일: {}  |  게임: {}  업데이트: {}  DLC: {}  |  {}  |  DB: {}",
@@ -9278,7 +9389,6 @@ mod runtime_tests {
             "0100D2C0115B6000".into(),
             database::CatalogTitleDetails {
                 name: "Localized catalog name".into(),
-                description: "Game description text with enough length to wrap. ".repeat(18),
                 screenshots: "[\"https://example.org/one.jpg\"]".into(),
                 release_date: "20261119".into(),
                 languages: "Korean, English".into(),
@@ -9378,6 +9488,161 @@ mod runtime_tests {
         progress.finished = true;
         assert!(download_matches_filters("job-a", &progress, "", "finished"));
         assert!(!download_matches_filters("job-a", &progress, "", "active"));
+    }
+
+    #[test]
+    fn download_paging_clicks_and_clamps_to_filtered_job_count() {
+        let (mut app, _dir) = seeded_app();
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None;
+        app.torrent_progress = (0..237)
+            .map(|i| {
+                let finished = i < 12;
+                (
+                    format!("test-{i:03}"),
+                    torrent::TorrentProgress {
+                        name: format!("Download task {i:03}"),
+                        finished,
+                        state: if finished {
+                            "완료"
+                        } else {
+                            "다운로드 중"
+                        }
+                        .into(),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let ctx = run_app_ticks(&mut app, 3);
+        assert_eq!(app.download_page, 0);
+        let next = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_pagination_next"))
+                .expect("download next-page button missing")
+                .center()
+        });
+        let render = |app: &mut NslApp, events: Vec<egui::Event>| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        };
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(next),
+                    egui::Event::PointerButton {
+                        pos: next,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.download_page, 1, "next should advance from page 1 to 2");
+        app.download_page = 2;
+        render(&mut app, vec![]);
+        assert_eq!(
+            ctx.data_mut(|data| {
+                data.get_temp::<usize>(egui::Id::new("nsl_test_download_visible_items"))
+            }),
+            Some(37),
+            "last page must contain only the remaining 37 tasks"
+        );
+        app.download_status_filter = "finished".into();
+        render(&mut app, vec![]);
+        assert_eq!(
+            app.download_page, 0,
+            "short filter must clamp to first page"
+        );
+        assert_eq!(
+            ctx.data_mut(|data| {
+                data.get_temp::<usize>(egui::Id::new("nsl_test_download_visible_items"))
+            }),
+            Some(12),
+        );
+        app.download_search = "not-found".into();
+        render(&mut app, vec![]);
+        assert_eq!(app.download_page, 0);
+        assert_eq!(
+            ctx.data_mut(|data| {
+                data.get_temp::<usize>(egui::Id::new("nsl_test_download_visible_items"))
+            }),
+            Some(0),
+        );
+        assert_eq!(app.torrent_progress.len(), 237);
+    }
+
+    #[test]
+    fn store_left_paging_click_and_filter_reset_keep_all_catalog_rows() {
+        let (mut app, _dir) = seeded_app();
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = (0..225)
+            .map(|i| catalog::CatalogItem {
+                title: format!("Catalog game {i:03}"),
+                topic_id: format!("page-test-{i:03}"),
+                magnet: format!("magnet:?xt=urn:btih:{i:040x}"),
+                genre: "Action".into(),
+                ..Default::default()
+            })
+            .collect();
+        app.catalog_search_cache = None;
+        let ctx = run_app_ticks(&mut app, 3);
+        assert_eq!(app.catalog_matching_indices.len(), 225);
+        let next = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_pagination_next"))
+                .expect("store next-page button missing")
+                .center()
+        });
+        let render = |app: &mut NslApp, events: Vec<egui::Event>| {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 800.0),
+                )),
+                events,
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        };
+        for pressed in [true, false] {
+            render(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(next),
+                    egui::Event::PointerButton {
+                        pos: next,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert_eq!(app.catalog_page, 1, "store next button should advance page");
+        app.catalog_page = 2;
+        render(&mut app, vec![]);
+        assert_eq!(
+            ctx.data_mut(|data| {
+                data.get_temp::<usize>(egui::Id::new("nsl_test_catalog_visible_items"))
+            }),
+            Some(25),
+            "last catalog page should contain only the remaining 25 games"
+        );
+        app.catalog_genre_filter = "Puzzle".into();
+        render(&mut app, vec![]);
+        assert_eq!(app.catalog_page, 0);
+        assert!(app.catalog_matching_indices.is_empty());
+        assert_eq!(app.catalog_state.items.len(), 225);
     }
 
     #[test]
@@ -9510,6 +9775,11 @@ mod runtime_tests {
             ("DOWNLOADS", "nsl_test_download_last_row"),
         ] {
             app.folder_filter = tab.into();
+            let pagination_marker = if tab == "CATALOG" {
+                "nsl_test_catalog_pagination_rect"
+            } else {
+                "nsl_test_download_pagination_rect"
+            };
             let sidebar_marker = if tab == "CATALOG" {
                 "nsl_test_store_sidebar_rect"
             } else {
@@ -9537,12 +9807,14 @@ mod runtime_tests {
                         app.folder_filter, app.catalog_state.items.len(),
                         app.catalog_matching_indices.len(), app.catalog_page, app.settings_open,
                     ));
-                let (sidebar, search) = ctx.data_mut(|data| {
+                let (sidebar, search, pagination) = ctx.data_mut(|data| {
                     (
                         data.get_temp::<egui::Rect>(egui::Id::new(sidebar_marker))
                             .expect("management right sidebar missing"),
                         data.get_temp::<egui::Rect>(egui::Id::new(search_marker))
                             .expect("management sidebar search missing"),
+                        data.get_temp::<egui::Rect>(egui::Id::new(pagination_marker))
+                            .expect("management list pagination missing"),
                     )
                 });
                 assert!(
@@ -9554,8 +9826,16 @@ mod runtime_tests {
                     "{tab} panel does not touch the right edge: {sidebar:?}"
                 );
                 assert!(
-                    search.left() >= sidebar.left() && search.right() <= sidebar.right(),
-                    "{tab} search is not inside the sidebar: {search:?}, {sidebar:?}"
+                    search.left() >= sidebar.left() + 12.0
+                        && search.right() <= sidebar.right() - 12.0,
+                    "{tab} search lacks sidebar padding: search={search:?}, sidebar={sidebar:?}"
+                );
+                assert!(
+                    pagination.left() < sidebar.left()
+                        && pagination.right() <= sidebar.left() + 1.0
+                        && pagination.top() > 70.0
+                        && pagination.bottom() < rect.top(),
+                    "{tab} paging is not above the left-side list: pagination={pagination:?}, row={rect:?}, sidebar={sidebar:?}"
                 );
                 assert!(
                     rect.is_finite() && rect.left() >= -1.0 && rect.right() <= width + 1.0,
@@ -9882,6 +10162,27 @@ mod runtime_tests {
         assert!(app.catalog_search_pending.is_none());
         assert_eq!(app.current_page, 0);
         assert_eq!(app.catalog_page, 0);
+        app.folder_filter = "DOWNLOADS".into();
+        app.download_search = "previous query".into();
+        app.download_page = 3;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 860.0),
+            )),
+            ..Default::default()
+        });
+        app.ui_frame(&ctx);
+        let _ = ctx.end_pass();
+        assert!(app.download_search.is_empty());
+        assert_eq!(app.download_page, 0);
     }
 
     #[test]

@@ -88,7 +88,6 @@ pub struct CatalogTitleDetails {
     pub num_players: String,
     pub rating: String,
     pub region: String,
-    pub description: String,
     pub screenshots: String,
     pub languages: String,
 }
@@ -306,8 +305,8 @@ impl Database {
         )?)
     }
     /// A Store catalog can contain thousands of uninstalled titles. Resolve
-    /// their metadata by indexed title_id lookups in bounded SQLite batches,
-    /// instead of scanning 46k descriptions or issuing a query per UI row.
+    /// their metadata by indexed title_id lookups in bounded SQLite batches.
+    /// Full descriptions are intentionally excluded from Store metadata.
     pub fn catalog_title_details(
         &self,
         base_title_ids: &HashSet<String>,
@@ -326,7 +325,7 @@ impl Database {
             let sql = format!(
                 "SELECT title_id,COALESCE(name,''),COALESCE(version,0),\
                  COALESCE(release_date,''),COALESCE(num_players,''),COALESCE(rating,''),\
-                 COALESCE(region,''),COALESCE(description,''),COALESCE(screenshots,'[]'),\
+                 COALESCE(region,''),COALESCE(screenshots,'[]'),\
                  COALESCE(languages,'') FROM title_db WHERE title_id IN ({placeholders})"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -340,9 +339,8 @@ impl Database {
                         num_players: row.get(4)?,
                         rating: row.get(5)?,
                         region: row.get(6)?,
-                        description: row.get(7)?,
-                        screenshots: row.get(8)?,
-                        languages: row.get(9)?,
+                        screenshots: row.get(7)?,
+                        languages: row.get(8)?,
                     },
                 ))
             })?;
@@ -1015,7 +1013,17 @@ mod tests {
         assert_eq!(details.release_date, "20261119");
         assert_eq!(details.num_players, "1-4");
         assert_eq!(details.rating, "E");
-        assert_eq!(details.description, "게임 설명\n두 번째 줄");
+        // Removing Store descriptions must not change the original title DB.
+        let source_description: String = db
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT description FROM title_db WHERE title_id=?1",
+                ["0100D2C0115B6000"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_description, "게임 설명\n두 번째 줄");
         assert!(details.screenshots.contains("one.jpg"));
         assert_eq!(details.languages, "Korean, English");
         assert_eq!(db.stats().unwrap().title_db_count, 3);

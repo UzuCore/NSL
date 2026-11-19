@@ -107,7 +107,7 @@ def make_fixture(kind="PFS0", entries=(("game.nca", b"game"),)):
                      + table + strings + data)
 
 
-def synthetic_tests():
+def synthetic_tests(mutation_count=500):
     from io import BytesIO
 
     def parse(bytes_, kind=None, strict=True, base=0, end=None):
@@ -147,6 +147,18 @@ def synthetic_tests():
     assert parse(hfs, "HFS0") is None
     checks += 1
 
+    # Reject impossible table counts and string lengths before allocating a
+    # table, plus a file name without a terminating NUL in its string table.
+    for field_at, value in ((4, MAX_FILES + 1), (8, MAX_STRINGS + 1)):
+        invalid = make_fixture()
+        invalid[field_at:field_at + 4] = struct.pack("<I", value)
+        assert parse(invalid) is None
+        checks += 1
+    no_nul = make_fixture()
+    no_nul[16 + 24 + len("game.nca")] = ord("X")
+    assert parse(no_nul) is None
+    checks += 1
+
     # Nested PFS0 offset must stay inside its own 'secure' partition. A
     # malicious cross-partition entry would fit the complete XCI image, but
     # must not be visible in the secure partition's index.
@@ -173,15 +185,22 @@ def synthetic_tests():
     # name and size offsets. The parser must never return an out-of-bounds
     # record or allocate based on an unchecked header.
     randomizer = random.Random(0x4E535250)
-    for _ in range(500):
-        data = make_fixture("PFS0", (("valid.nca", b"abcd"), ("two.ncz", b"123")))
+    for i in range(mutation_count):
+        if i % 2:
+            data = make_fixture("HFS0", (("secure", b"abcd"), ("normal", b"123")))
+        else:
+            data = make_fixture("PFS0", (("valid.nca", b"abcd"), ("two.ncz", b"123")))
         for _ in range(randomizer.randint(1, 5)):
             at = randomizer.randrange(len(data))
             data[at] ^= 1 << randomizer.randrange(8)
         result = parse(data, strict=randomizer.choice((True, False)))
         if result:
-            for _, start, length in result["entries"]:
+            for name, start, length in result["entries"]:
                 assert start + length <= len(data)
+                assert start >= 0
+                assert length >= 0
+                assert name and name not in (".", "..")
+                assert not any(c in "/\\:" or unicodedata.category(c) == "Cc" for c in name)
         checks += 1
     return checks
 
@@ -272,6 +291,11 @@ def library_corpus(db: Path, max_files: int):
                         counters["card_partition_global_rejected"] += 1
                     if local_index:
                         counters["card_partition_bounded_valid"] += 1
+                        counters["card_partition_safe_entries"] += len(local_index["entries"])
+                        for nested_name, _, _ in local_index["entries"]:
+                            nested_lower = nested_name.lower()
+                            if nested_lower.endswith((".cnmt.nca", ".cnmt.ncz")):
+                                counters[f"card_cnmt_{name.lower()}"] += 1
                     else:
                         counters["card_partition_bounded_rejected"] += 1
         after = path.stat()
@@ -288,13 +312,25 @@ def main():
     parser.add_argument("--db", type=Path, default=Path(__file__).resolve().parents[1] / "library.db")
     parser.add_argument("--max-files", type=int, default=0,
                         help="limit number of DB rows to inspect (0 = all)")
+    parser.add_argument("--mutations", type=int, default=500,
+                        help="deterministic synthetic corruptions (default 500; max 100000)")
+    parser.add_argument("--require-corpus", action="store_true",
+                        help="fail if the library database or real ROM samples are unavailable")
     args = parser.parse_args()
     if args.max_files < 0:
         parser.error("--max-files must be nonnegative")
+    if not 0 <= args.mutations <= 100000:
+        parser.error("--mutations must be between 0 and 100000")
+    corpus = library_corpus(args.db, args.max_files)
+    if args.require_corpus and (
+        corpus.get("status") != "checked"
+        or corpus.get("package_read", 0) + corpus.get("card_read", 0) == 0
+    ):
+        parser.error("a readable library database with available ROM files is required")
     result = {
         "script": "NSL PFS0/HFS0 read-only rules QA (not Rust execution)",
-        "synthetic_checks": synthetic_tests(),
-        "corpus": library_corpus(args.db, args.max_files),
+        "synthetic_checks": synthetic_tests(args.mutations),
+        "corpus": corpus,
     }
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
 

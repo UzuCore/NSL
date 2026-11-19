@@ -75,7 +75,7 @@
 | Stage 20 GUI 검수 | 그리드·스토어·다운로드 × 창 너비 980/1280/1456px, **9/9 PASS** |
 | Stage 20 토렌트 E2E | localhost 전송, 일시정지·재개·복구, 부분 다운로드 등 격리 테스트 통과 |
 | P2 모듈화 (`af04b32`) | **메서드 62개를 10개 기능 모듈로 분리**, 원본 대조 및 Rustfmt 통과 |
-| NSRP 롬 파서 반영 | PFS0/HFS0 공통화, XCI 탐색·하위 파티션 경계 강화; 읽기 전용 875개 NSP/NSZ·14개 XCI/XCZ 구조 검사 통과, **수동 빌드 검증 전** |
+| NSRP 롬 파서 반영 | PFS0/HFS0 공통화, XCI 탐색·하위 파티션 경계 강화; 읽기 전용 875개 NSP/NSZ·14개 XCI/XCZ 및 하위 인덱스 17개 구조 검수, **수동 빌드 검증 전** |
 | P2 모듈화 컴파일·테스트·릴리스 | **미실시** — 수동 빌드·회귀 검증 필요 |
 | 현재 GitHub 공식 최신 배포본 | **r22 (`d09c91a`)** — P2 모듈화는 아직 미포함 |
 
@@ -133,6 +133,8 @@ NSL/
 스토어는 `src/app/store.rs`, 다운로드는 `src/app/downloads.rs`, 전체 화면 흐름은 `src/app/frame.rs`에서 관리합니다. 앱 내부 10개 모듈의 상세한 역할과 의존성 원칙은 [앱 소스 구조](docs/architecture/NSL_APP_MODULES.md), 모듈화 시점의 검증 범위는 [P2 검수 기록](docs/qa/QA_MODULARIZATION_P2_2026-11-20.md)에 정리되어 있습니다.
 
 롬 컨테이너 읽기 흐름, NSRP 참고 범위 및 엄격 검증/라이브러리 메타데이터 복구 정책은 [롬 컨테이너 파서 구조](docs/architecture/NSL_ROM_CONTAINER_INDEX.md)에 정리했습니다. 원본 NSRP 코드는 MIT 라이선스이며, 해당 저작권 고지는 `licenses/nsrp-MIT.txt`와 신규 배포 ZIP에 포함됩니다.
+
+별도 빌드 없이 실행한 확장 검수의 범위와 한계는 [롬 파서 읽기 전용 검수 기록](docs/qa/QA_NSL_ROM_READONLY_VALIDATION_2026-11-20.md)에 정리했습니다. 실파일 검증을 강제하려면 `python -B scripts/qa-rom-index-readonly.py --require-corpus --mutations 2000`을 사용하세요.
 
 ## GitHub Actions 빌드 및 릴리스
 

@@ -10,6 +10,19 @@ $task = [IO.Path]::GetFullPath($TaskDir)
 $package = Join-Path $task 'package'
 $backupRoot = Join-Path $task 'backup'
 $pendingRoot = Join-Path $task 'pending'
+# Keep this helper independent of Get-FileHash module autoloading. Windows
+# PowerShell launched from pwsh/other shells may inherit a PSModulePath that
+# does not expose the cmdlet even though the .NET SHA-256 API is available.
+function Get-NslSha256([string]$filePath) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [IO.File]::OpenRead($filePath)
+    try {
+        return [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '')
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
 # Deliberately exclude library.db, config.json, local title database,
 # keys, screenshots, icons, torrent state and downloads.
 $files = @('nsl.exe', 'nsl-manifest.json')
@@ -31,7 +44,7 @@ try {
         $expectedHash -notmatch '^[0-9a-fA-F]{64}$') {
         throw 'The staged NSL update manifest is invalid.'
     }
-    $sourceHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash
+    $sourceHash = Get-NslSha256 $sourceExe
     if ($sourceHash -cne $expectedHash.ToUpperInvariant()) {
         throw 'The staged NSL executable does not match its SHA-256 manifest.'
     }
@@ -83,7 +96,7 @@ try {
             }
         }
     }
-    $installedHash = (Get-FileHash -LiteralPath (Join-Path $base 'nsl.exe') -Algorithm SHA256).Hash
+    $installedHash = Get-NslSha256 (Join-Path $base 'nsl.exe')
     if ($installedHash -cne $sourceHash) {
         throw 'Installed NSL executable SHA-256 differs from the verified update.'
     }

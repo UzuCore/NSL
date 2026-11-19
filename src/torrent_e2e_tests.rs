@@ -195,11 +195,16 @@ fn transfer_pause_restart_resume_delete_preserves_other_files() {
         id == key && p.progress_bytes > 0 && !p.finished
     });
     eprintln!("STAGE9_TORRENT_FIRST={}", first.progress_bytes);
+    assert!(
+        first.active_seeders.unwrap_or(0) + first.active_peers.unwrap_or(0) > 0,
+        "a localhost transfer with received data must show at least one live peer"
+    );
     engine.pause(&key);
     let (_, paused) = wait_for(&engine, Duration::from_secs(12), |id, p| {
         id == key && p.paused
     });
     assert!(paused.progress_bytes >= first.progress_bytes);
+    assert_eq!((paused.active_seeders, paused.active_peers), (None, None));
     eprintln!("STAGE9_TORRENT_PAUSED={}", paused.progress_bytes);
     engine.resume(&key);
     let (_, resumed) = wait_for(&engine, Duration::from_secs(15), |id, p| {
@@ -221,6 +226,10 @@ fn transfer_pause_restart_resume_delete_preserves_other_files() {
         id.starts_with('r') && p.finished
     });
     assert_eq!(finished.total_bytes, data.len() as u64);
+    assert_eq!(
+        (finished.active_seeders, finished.active_peers),
+        (None, None)
+    );
     eprintln!("STAGE9_TORRENT_RESTORED={}", finished.progress_bytes);
     let output = client_dir.join("sample").join("payload.bin");
     assert_eq!(std::fs::read(&output).unwrap(), data);

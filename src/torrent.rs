@@ -26,10 +26,26 @@ pub struct TorrentProgress {
     pub total_bytes: u64,
     pub progress_bytes: u64,
     pub download_speed_bps: u64,
+    /// Currently connected seeders; None if the live connection state is unavailable.
+    pub active_seeders: Option<u32>,
+    /// Currently connected non-seeding peers (excludes active_seeders).
+    pub active_peers: Option<u32>,
     pub finished: bool,
     pub paused: bool,
     pub state: String,
     pub error: Option<String>,
+}
+
+/// Split rqbit's connected-peer total into seeders and non-seeding peers.
+/// A paused, completed or failed torrent has no valid live connection count.
+fn connected_peer_counts(live: Option<(u32, u32)>, inactive: bool) -> (Option<u32>, Option<u32>) {
+    match (live, inactive) {
+        (Some((total, seeders)), false) => {
+            let seeders = seeders.min(total);
+            (Some(seeders), Some(total - seeders))
+        }
+        _ => (None, None),
+    }
 }
 
 /// `(job key, progress)` pairs as delivered to the UI.
@@ -440,10 +456,21 @@ async fn watch_torrent(
             .as_ref()
             .map(|live| live.download_speed.as_bytes())
             .unwrap_or(0);
+        let (active_seeders, active_peers) = connected_peer_counts(
+            stats.live.as_ref().map(|live| {
+                (
+                    live.snapshot.peer_stats.live,
+                    live.snapshot.peer_stats.live_seeders,
+                )
+            }),
+            paused || stats.finished || stats.error.is_some(),
+        );
         let update = TorrentProgress {
             name: name.to_owned(),
             total_bytes: stats.total_bytes,
             progress_bytes: stats.progress_bytes,
+            active_seeders,
+            active_peers,
             finished: stats.finished,
             paused,
             state: if paused {
@@ -841,6 +868,25 @@ mod tests {
         assert!(!p.finished);
         assert_eq!(p.total_bytes, 0);
         assert!(p.error.is_none());
+        assert_eq!((p.active_seeders, p.active_peers), (None, None));
+    }
+
+    #[test]
+    fn peer_counts_are_live_per_torrent_nonseeding_and_not_invented_when_idle() {
+        assert_eq!(
+            connected_peer_counts(Some((8, 3)), false),
+            (Some(3), Some(5))
+        );
+        assert_eq!(
+            connected_peer_counts(Some((0, 0)), false),
+            (Some(0), Some(0))
+        );
+        assert_eq!(
+            connected_peer_counts(Some((2, 5)), false),
+            (Some(2), Some(0))
+        );
+        assert_eq!(connected_peer_counts(None, false), (None, None));
+        assert_eq!(connected_peer_counts(Some((8, 3)), true), (None, None));
     }
 
     #[test]

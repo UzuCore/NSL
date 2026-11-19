@@ -239,10 +239,26 @@ impl TorrentFilePicker {
                 self.all_selected(false);
             }
             ui.separator();
-            if ui.small_button("모두 펼치기").clicked() {
+            let expand_all = ui.button("모두 펼치기");
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_torrent_expand_all"),
+                    expand_all.rect,
+                );
+            });
+            if expand_all.clicked() {
                 self.set_all_expanded(true);
             }
-            if ui.small_button("모두 접기").clicked() {
+            let collapse_all = ui.button("모두 접기");
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_torrent_collapse_all"),
+                    collapse_all.rect,
+                );
+            });
+            if collapse_all.clicked() {
                 self.set_all_expanded(false);
             }
         });
@@ -690,6 +706,90 @@ mod tests {
                     name.width() < 260.0,
                     "short filename must not stretch across whole name column: screen={screen_width}, path={path}, name={name:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn picker_toolbar_buttons_have_equal_height_and_work_at_all_window_widths() {
+        for width in [720.0_f32, 980.0, 1456.0] {
+            let mut picker = TorrentFilePicker::new(preview()).unwrap();
+            let context = egui::Context::default();
+            let paint = |picker: &mut TorrentFilePicker, context: &egui::Context| {
+                context.begin_pass(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 760.0),
+                    )),
+                    ..Default::default()
+                });
+                egui::CentralPanel::default().show(context, |ui| {
+                    ui.set_width((width - 48.0).min(650.0));
+                    picker.ui(ui);
+                });
+                let _ = context.end_pass();
+            };
+            let button_rect = |name: &str| {
+                context.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new(name))
+                        .unwrap_or_else(|| panic!("missing toolbar button: {name}"))
+                })
+            };
+            paint(&mut picker, &context);
+            let buttons = [
+                button_rect("nsl_test_torrent_select_all"),
+                button_rect("nsl_test_torrent_clear_all"),
+                button_rect("nsl_test_torrent_expand_all"),
+                button_rect("nsl_test_torrent_collapse_all"),
+            ];
+            for pair in buttons.windows(2) {
+                assert!(
+                    (pair[0].height() - pair[1].height()).abs() < 0.5,
+                    "button padding/height differs at {width}: {buttons:?}"
+                );
+                assert!(pair[1].left() > pair[0].right());
+            }
+
+            for (index, expected) in [3usize, 2, 1, 0].into_iter().enumerate() {
+                // Expand, collapse, clear selection and reselect must all be
+                // real pointer clicks, not just direct method calls.
+                let target = match index {
+                    0 => buttons[2],
+                    1 => buttons[3],
+                    2 => buttons[1],
+                    _ => buttons[0],
+                };
+                let click_time = context.input(|input| input.time) + 1.0;
+                for (phase, pressed) in [true, false].into_iter().enumerate() {
+                    context.begin_pass(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 760.0),
+                        )),
+                        time: Some(click_time + phase as f64 * 0.03),
+                        events: vec![
+                            egui::Event::PointerMoved(target.center()),
+                            egui::Event::PointerButton {
+                                pos: target.center(),
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                        ..Default::default()
+                    });
+                    egui::CentralPanel::default().show(&context, |ui| {
+                        ui.set_width((width - 48.0).min(650.0));
+                        picker.ui(ui);
+                    });
+                    let _ = context.end_pass();
+                }
+                match expected {
+                    3 => assert!(picker.is_expanded("game/dlc/extra")),
+                    2 => assert!(!picker.is_expanded("game/dlc/extra")),
+                    1 => assert_eq!(picker.selected_count(), 0),
+                    _ => assert_eq!(picker.selected_count(), picker.total_files()),
+                }
             }
         }
     }

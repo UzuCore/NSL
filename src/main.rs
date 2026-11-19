@@ -814,6 +814,13 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn download_connection_label(progress: &torrent::TorrentProgress) -> String {
+    match (progress.active_seeders, progress.active_peers) {
+        (Some(seeders), Some(peers)) => format!("시드 {seeders} · 피어 {peers}"),
+        _ => "시드 — · 피어 —".into(),
+    }
+}
+
 /// The source catalog bundles many updates and DLCs, so filter using its
 /// actual genre/format metadata rather than guessing a content type.
 const STORE_GENRES: [(&str, &str); 12] = [
@@ -2893,46 +2900,33 @@ impl NslApp {
         key: &str,
         progress: &torrent::TorrentProgress,
     ) {
-        let Some(engine) = &self.torrent_engine else {
-            return;
-        };
         let is_done = progress.finished || progress.error.is_some();
         if !is_done {
             if progress.paused {
                 if ui.small_button("재개").clicked() {
-                    engine.resume(key);
-                    self.status = "다운로드 재개 요청됨".into();
+                    if let Some(engine) = &self.torrent_engine {
+                        engine.resume(key);
+                        self.status = "다운로드 재개 요청됨".into();
+                    }
                 }
             } else if ui.small_button("중지").clicked() {
-                engine.pause(key);
-                self.status = "다운로드 일시정지 요청됨".into();
-            }
-            let delete_files_too = self
-                .config
-                .settings
-                .get("download_delete_files")
-                .and_then(|v| v.as_str())
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let label = if delete_files_too {
-                "삭제 (파일 포함)"
-            } else {
-                "삭제"
-            };
-            if ui.small_button(label).clicked() {
-                if delete_files_too {
-                    self.download_delete_confirm = Some((key.to_owned(), progress.name.clone()));
-                } else {
-                    engine.cancel(key, false);
-                    self.status = "다운로드 삭제 요청됨 · 받은 파일은 유지됩니다".into();
-                    let _ = self.log_sender.send(format!(
-                        "🗑 다운로드 삭제 · {}",
-                        truncate_label(&progress.name, 60)
-                    ));
+                if let Some(engine) = &self.torrent_engine {
+                    engine.pause(key);
+                    self.status = "다운로드 일시정지 요청됨".into();
                 }
             }
-        } else if ui.small_button("목록에서 지우기").clicked() {
-            engine.dismiss(key);
+        }
+        // Always confirm before removing even a finished or failed download.
+        let delete = ui.small_button("삭제");
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("nsl_test_download_delete_button", key)),
+                delete.rect,
+            );
+        });
+        if delete.clicked() {
+            self.download_delete_confirm = Some((key.to_owned(), progress.name.clone()));
         }
     }
 
@@ -3335,18 +3329,44 @@ impl NslApp {
                                 .truncate()
                                 .sense(egui::Sense::click()),
                         );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new(("nsl_test_download_name", key)),
+                                label_response.rect,
+                            );
+                        });
                         clicked_content |= label_response.clicked();
                         label_response.on_hover_text(label);
                         ui.horizontal(|ui| self.download_row_buttons(ui, key, progress));
                     } else {
                         ui.horizontal(|ui| {
                             let label_width = (ui.available_width() - 205.0).max(96.0);
-                            let label_response = ui.add_sized(
-                                [label_width, 22.0],
-                                egui::Label::new(egui::RichText::new(label).size(13.0).strong())
-                                    .truncate()
-                                    .sense(egui::Sense::click()),
-                            );
+                            // add_sized centers even a short child Label in the
+                            // wide name column. Allocate the width but lay out
+                            // from the left, as in the torrent file picker.
+                            let label_response = ui
+                                .allocate_ui_with_layout(
+                                    egui::vec2(label_width, 22.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(label).size(13.0).strong(),
+                                            )
+                                            .truncate()
+                                            .sense(egui::Sense::click()),
+                                        )
+                                    },
+                                )
+                                .inner;
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::new(("nsl_test_download_name", key)),
+                                    label_response.rect,
+                                );
+                            });
                             clicked_content |= label_response.clicked();
                             label_response.on_hover_text(label);
                             ui.with_layout(
@@ -3407,6 +3427,25 @@ impl NslApp {
                                 .sense(egui::Sense::click()),
                             )
                             .clicked();
+                        let connections = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(download_connection_label(progress))
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new(("nsl_test_download_connections", key)),
+                                connections.rect,
+                            );
+                        });
+                        clicked_content |= connections.clicked();
+                        connections.on_hover_text(
+                            "현재 연결된 시드와 비시더 피어 수 · 전체 토렌트 네트워크 수 아님 · 연결 정보가 없으면 —",
+                        );
                         if let Some(error) = &progress.error {
                             let error_response = ui.add(
                                 egui::Label::new(
@@ -5223,7 +5262,7 @@ impl NslApp {
                             if ui
                                 .checkbox(
                                     &mut delete_files,
-                                    "다운로드 탭의 「삭제」에서 받은 파일도 함께 삭제",
+                                    "「삭제」 확인창에서 파일까지 삭제 옵션을 우선 표시",
                                 )
                                 .changed()
                             {
@@ -5236,8 +5275,10 @@ impl NslApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "끔(기본): 토렌트만 제거하고 받은 파일은 그대로 둡니다.\n\
-                                     씀: 받은 파일까지 완전히 삭제합니다. 되돌릴 수 없으니 주의하세요.",
+                                    "삭제 버튼은 항상 확인창을 엽니다.\n\
+                                     끔(기본): 파일을 유지하는 선택지를 먼저 표시합니다.\n\
+                                     켬: 파일까지 삭제하는 선택지를 먼저 표시합니다.\n\
+                                     실제 파일 삭제는 확인창에서 직접 선택해야 실행됩니다.",
                                 )
                                 .color(egui::Color32::GRAY),
                             );
@@ -8027,6 +8068,13 @@ impl NslApp {
             }
         }
         if let Some((key, name)) = self.download_delete_confirm.clone() {
+            let prefer_delete_files = self
+                .config
+                .settings
+                .get("download_delete_files")
+                .and_then(|value| value.as_str())
+                == Some("1");
+            let mut choice: Option<Option<bool>> = None;
             show_centered_popup(
                 ctx,
                 "download_delete_confirm",
@@ -8036,28 +8084,82 @@ impl NslApp {
                 |ui| {
                     ui.label(format!("「{}」", truncate_label(&name, 60)));
                     ui.label(
-                        "이 다운로드를 삭제하면서 받은 파일까지 완전히 삭제합니다. 되돌릴 수 없습니다.",
+                        "목록만 삭제하면 받은 파일은 그대로 유지됩니다.\n파일까지 삭제하면 내려받은 파일이 영구 삭제됩니다.",
                     );
                     popup_footer(ui, |ui| {
                         ui.horizontal(|ui| {
-                            if ui.button("파일까지 삭제").clicked() {
-                                self.download_delete_confirm = None;
-                                if let Some(engine) = &self.torrent_engine {
-                                    engine.cancel(&key, true);
+                            // The setting only changes button order; it never
+                            // deletes any files without an explicit choice.
+                            let options = if prefer_delete_files {
+                                [true, false]
+                            } else {
+                                [false, true]
+                            };
+                            for delete_files in options {
+                                let caption = if delete_files {
+                                    "파일까지 삭제"
+                                } else {
+                                    "목록만 삭제 (파일 유지)"
+                                };
+                                let button = ui.button(caption);
+                                #[cfg(test)]
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new((
+                                            "nsl_test_download_delete_option",
+                                            delete_files,
+                                        )),
+                                        button.rect,
+                                    );
+                                });
+                                if button.clicked() {
+                                    choice = Some(Some(delete_files));
                                 }
-                                self.status = "다운로드 및 파일 삭제 요청됨".into();
-                                let _ = self.log_sender.send(format!(
-                                    "🗑 다운로드 + 파일 삭제 · {}",
-                                    truncate_label(&name, 60)
-                                ));
                             }
-                            if ui.button("취소").clicked() {
-                                self.download_delete_confirm = None;
+                            let cancel = ui.button("취소");
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::new("nsl_test_download_delete_cancel"),
+                                    cancel.rect,
+                                );
+                            });
+                            if cancel.clicked() {
+                                choice = Some(None);
                             }
                         });
                     });
                 },
             );
+            if let Some(confirmed) = choice {
+                self.download_delete_confirm = None;
+                if let Some(delete_files) = confirmed {
+                    if let Some(engine) = &self.torrent_engine {
+                        if delete_files {
+                            engine.cancel(&key, true);
+                        } else {
+                            engine.dismiss(&key);
+                        }
+                        self.status = if delete_files {
+                            "다운로드 및 파일 삭제 요청됨"
+                        } else {
+                            "다운로드 목록 삭제 요청됨 · 받은 파일은 유지됩니다"
+                        }
+                        .into();
+                        let _ = self.log_sender.send(format!(
+                            "🗑 다운로드 {} · {}",
+                            if delete_files {
+                                "및 파일 삭제"
+                            } else {
+                                "목록 삭제 (파일 유지)"
+                            },
+                            truncate_label(&name, 60)
+                        ));
+                    } else {
+                        self.status = "토렌트 엔진을 사용할 수 없습니다".into();
+                    }
+                }
+            }
         }
         if let Some(changes) = self.bulk_rename_preview.clone() {
             show_centered_popup(
@@ -10290,6 +10392,175 @@ mod runtime_tests {
     }
 
     #[test]
+    fn download_name_starts_at_card_left_and_peer_counts_do_not_overlap_actions() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None;
+        for label in ["Short", &"Long download title ".repeat(35)] {
+            let progress = torrent::TorrentProgress {
+                name: label.into(),
+                state: "다운로드".into(),
+                active_seeders: Some(3),
+                active_peers: Some(5),
+                total_bytes: 20_000,
+                progress_bytes: 2_000,
+                ..Default::default()
+            };
+            assert_eq!(download_connection_label(&progress), "시드 3 · 피어 5");
+            app.torrent_progress = vec![("stage20-geometry".into(), progress)];
+            for (width, height) in [(720.0, 720.0), (980.0, 760.0), (1456.0, 900.0)] {
+                draw_card_test_frames_at(&ctx, &mut app, 3, width, height);
+                let (row, name, delete, connections) = ctx.data_mut(|data| {
+                    (
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_first_row"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "nsl_test_download_name",
+                            "stage20-geometry",
+                        )))
+                        .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "nsl_test_download_delete_button",
+                            "stage20-geometry",
+                        )))
+                        .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "nsl_test_download_connections",
+                            "stage20-geometry",
+                        )))
+                        .unwrap(),
+                    )
+                });
+                assert!(
+                    name.left() >= row.left() && name.left() - row.left() < 34.0,
+                    "name centered instead of left aligned: {label} {width}: {row:?} {name:?}"
+                );
+                assert!(
+                    name.right() <= row.right() && connections.right() <= row.right(),
+                    "card contents overflow: {width}: {row:?} {name:?} {connections:?}"
+                );
+                assert!(
+                    !name.intersects(delete),
+                    "name overlaps delete button: {width}: {name:?} {delete:?}"
+                );
+            }
+        }
+
+        let mut progress = torrent::TorrentProgress {
+            active_seeders: Some(0),
+            active_peers: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(download_connection_label(&progress), "시드 0 · 피어 0");
+        progress.active_peers = None;
+        assert_eq!(download_connection_label(&progress), "시드 — · 피어 —");
+        progress.active_seeders = None;
+        assert_eq!(download_connection_label(&progress), "시드 — · 피어 —");
+    }
+
+    #[test]
+    fn download_delete_button_opens_dialog_for_all_states_and_respects_file_choice() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "DOWNLOADS".into();
+        app.torrent_engine = None; // A real download can never run during this UI QA.
+        for (state, paused, finished, error) in [
+            ("다운로드", false, false, None),
+            ("일시정지", true, false, None),
+            ("완료", false, true, None),
+            ("오류", false, false, Some("테스트 오류".to_string())),
+        ] {
+            app.torrent_progress = vec![(
+                "stage20-delete".into(),
+                torrent::TorrentProgress {
+                    name: format!("{state} 테스트"),
+                    state: state.into(),
+                    paused,
+                    finished,
+                    error,
+                    total_bytes: 100,
+                    progress_bytes: if finished { 100 } else { 10 },
+                    ..Default::default()
+                },
+            )];
+            for (setting, first_option) in [("0", false), ("1", true)] {
+                app.config.settings.insert(
+                    "download_delete_files".into(),
+                    serde_json::Value::String(setting.into()),
+                );
+                app.download_delete_confirm = None;
+                draw_card_test_frames(&ctx, &mut app, 3);
+                let delete = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new((
+                        "nsl_test_download_delete_button",
+                        "stage20-delete",
+                    )))
+                    .expect("all download states must show the same 삭제 button")
+                });
+                click_cell(&ctx, &mut app, delete.center(), 1456.0, 900.0);
+                assert_eq!(
+                    app.download_delete_confirm
+                        .as_ref()
+                        .map(|(key, _)| key.as_str()),
+                    Some("stage20-delete"),
+                    "{state} status must confirm removal"
+                );
+                draw_card_test_frames(&ctx, &mut app, 2);
+                let (keep, files, cancel) = ctx.data_mut(|data| {
+                    (
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "nsl_test_download_delete_option",
+                            false,
+                        )))
+                        .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new((
+                            "nsl_test_download_delete_option",
+                            true,
+                        )))
+                        .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new(
+                            "nsl_test_download_delete_cancel",
+                        ))
+                        .unwrap(),
+                    )
+                });
+                // popup_footer is right-to-left: the first/priority option
+                // appears at the right edge; cancel stays at the left edge.
+                assert_eq!(files.left() < keep.left(), !first_option);
+                assert!(cancel.right() < files.right() && cancel.right() < keep.right());
+                click_cell(&ctx, &mut app, cancel.center(), 1456.0, 900.0);
+                assert!(app.download_delete_confirm.is_none());
+                assert_eq!(
+                    app.torrent_progress.len(),
+                    1,
+                    "cancel must not remove entry"
+                );
+
+                // A confirmed choice is different from dismissing the popup,
+                // and must never silently run without a torrent engine.
+                draw_card_test_frames(&ctx, &mut app, 2);
+                let delete = ctx.data_mut(|data| {
+                    data.get_temp::<egui::Rect>(egui::Id::new((
+                        "nsl_test_download_delete_button",
+                        "stage20-delete",
+                    )))
+                    .unwrap()
+                });
+                click_cell(&ctx, &mut app, delete.center(), 1456.0, 900.0);
+                draw_card_test_frames(&ctx, &mut app, 2);
+                let chosen = if first_option { files } else { keep };
+                click_cell(&ctx, &mut app, chosen.center(), 1456.0, 900.0);
+                assert!(app.download_delete_confirm.is_none());
+                assert_eq!(app.status, "토렌트 엔진을 사용할 수 없습니다");
+                assert_eq!(app.torrent_progress.len(), 1);
+            }
+        }
+    }
+
+    #[test]
     fn loaded_grid_icon_and_store_cover_are_clickable_whole_card_targets() {
         let (mut app, _dir) = seeded_app();
         let ctx = run_app_ticks(&mut app, 2);
@@ -11045,6 +11316,7 @@ mod runtime_tests {
                     paused: false,
                     state: "다운로드 중".into(),
                     error: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -11058,6 +11330,7 @@ mod runtime_tests {
                     paused: true,
                     state: "일시정지".into(),
                     error: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -11071,6 +11344,7 @@ mod runtime_tests {
                     paused: false,
                     state: "완료".into(),
                     error: None,
+                    ..Default::default()
                 },
             ),
             (
@@ -11084,6 +11358,7 @@ mod runtime_tests {
                     paused: false,
                     state: "오류".into(),
                     error: Some("로컬 테스트 오류".into()),
+                    ..Default::default()
                 },
             ),
         ];

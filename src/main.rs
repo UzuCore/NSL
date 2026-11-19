@@ -7907,9 +7907,11 @@ impl NslApp {
                 "store_select_torrent_files",
                 "다운로드 파일 선택",
                 None,
-                |window| window.resizable(true).max_width(780.0),
+                |window| window.resizable(true).min_width(620.0).max_width(880.0),
                 |ui| {
-                    ui.set_min_width(520.0);
+                    // Wider than a generic confirmation dialog: the tree
+                    // needs room for 30px nested indents and a size column.
+                    ui.set_min_width(620.0);
                     ui.label(
                         egui::RichText::new(truncate_label(&dialog.item.title, 85))
                             .strong()
@@ -10499,6 +10501,70 @@ mod runtime_tests {
                 .unwrap()
                 .selected_count(),
             3
+        );
+        let root_checkbox = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new(("nsl_test_torrent_node_checkbox", "game")))
+                .expect("root folder checkbox missing")
+        });
+        let nested_checkbox = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_torrent_node_checkbox",
+                "game/base",
+            )))
+            .expect("nested folder checkbox missing")
+        });
+        assert!(
+            nested_checkbox.center().x - root_checkbox.center().x >= 27.0,
+            "nested folder needs a full explorer-style indent: root={root_checkbox:?} child={nested_checkbox:?}"
+        );
+        let plus = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_torrent_node_expander",
+                "game/base",
+            )))
+            .expect("nested folder + control missing")
+        });
+        assert!(plus.width() >= 17.0 && plus.height() >= 17.0);
+        click_cell(&ctx, &mut app, plus.center(), 1456.0, 900.0);
+        assert!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .is_expanded("game/base"),
+            "clicking + must expand the nested directory"
+        );
+        draw_card_test_frames(&ctx, &mut app, 2);
+        let grandchild_checkbox = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_torrent_node_checkbox",
+                "game/base/a.nsp",
+            )))
+            .expect("expanded grandchild file missing")
+        });
+        assert!(
+            grandchild_checkbox.center().x - nested_checkbox.center().x >= 27.0,
+            "file nested two levels must be further indented: root={root_checkbox:?}, nested={nested_checkbox:?}, grandchild={grandchild_checkbox:?}, expander={plus:?}"
+        );
+        let minus = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_torrent_node_expander",
+                "game/base",
+            )))
+            .expect("nested folder minus control missing")
+        });
+        click_cell(&ctx, &mut app, minus.center(), 1456.0, 900.0);
+        assert!(
+            !app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .is_expanded("game/base"),
+            "clicking minus must collapse the nested directory"
         );
         let clear = ctx.data_mut(|data| {
             data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_clear_all"))

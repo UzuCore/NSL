@@ -696,6 +696,7 @@ struct NslApp {
     pending_icon_prefetch: bool,
     pending_screenshot_prefetch: bool,
     update_check_result: Option<Receiver<std::result::Result<updater::ReleaseInfo, String>>>,
+    update_check_automatic: bool,
     update_info: Option<updater::ReleaseInfo>,
     update_prepare_result: Option<Receiver<std::result::Result<PathBuf, String>>>,
     update_ready: Option<PathBuf>,
@@ -1126,6 +1127,7 @@ impl NslApp {
             pending_icon_prefetch: false,
             pending_screenshot_prefetch: false,
             update_check_result: None,
+            update_check_automatic: false,
             update_info: None,
             update_prepare_result: None,
             update_ready: None,
@@ -1224,6 +1226,18 @@ impl NslApp {
                     .log_sender
                     .send(format!("⚠ 토렌트 엔진 시작 실패: {error}"));
             }
+        }
+        // Start-up checks run off the UI thread and only offer an update;
+        // installing/restarting always requires the user's explicit approval.
+        if !cfg!(debug_assertions)
+            && app
+                .config
+                .settings
+                .get("auto_update_check")
+                .and_then(|value| value.as_str())
+                != Some("0")
+        {
+            app.start_update_check(true);
         }
         Ok(app)
     }
@@ -3329,13 +3343,20 @@ impl NslApp {
             let _ = tx.send(Ok((renamed, failed)));
         });
     }
-    fn start_update_check(&mut self) {
+    fn start_update_check(&mut self, automatic: bool) {
         if self.update_check_result.is_some() {
+            if !automatic {
+                self.update_check_automatic = false;
+                self.status = "업데이트 확인 중".into();
+            }
             return;
         }
+        self.update_check_automatic = automatic;
         let (tx, rx) = mpsc::channel();
         self.update_check_result = Some(rx);
-        self.status = "업데이트 확인 중".into();
+        if !automatic {
+            self.status = "업데이트 확인 중".into();
+        }
         let log = self.log_sender.clone();
         std::thread::spawn(move || {
             let result = updater::check_latest().map_err(|e| e.to_string());
@@ -3836,6 +3857,40 @@ impl NslApp {
                                             ),
                                         );
                                     }
+                                    ui.end_row();
+
+                                    settings_row_label(ui, "프로그램 업데이트");
+                                    let mut auto_update_check = self
+                                        .config
+                                        .settings
+                                        .get("auto_update_check")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("1")
+                                        == "1";
+                                    ui.vertical(|ui| {
+                                        if ui
+                                            .checkbox(
+                                                &mut auto_update_check,
+                                                "시작 시 새 버전 자동 확인",
+                                            )
+                                            .changed()
+                                        {
+                                            self.config.settings.insert(
+                                                "auto_update_check".into(),
+                                                serde_json::Value::String(
+                                                    if auto_update_check { "1" } else { "0" }
+                                                        .into(),
+                                                ),
+                                            );
+                                        }
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "백그라운드에서 버전만 확인합니다. 설치는 승인이 필요합니다.",
+                                            )
+                                            .small()
+                                            .color(ui.visuals().weak_text_color()),
+                                        );
+                                    });
                                     ui.end_row();
 
                                     settings_row_label(ui, "스캔 항목");
@@ -5174,6 +5229,7 @@ impl NslApp {
         let update_check_done = poll_background(&self.update_check_result, "update check");
         if let Some(done) = update_check_done {
             self.update_check_result = None;
+            let automatic = std::mem::take(&mut self.update_check_automatic);
             match done {
                 Ok(info) if info.is_newer && info.download_url.is_some() => {
                     self.update_info = Some(info);
@@ -5185,9 +5241,15 @@ impl NslApp {
                     );
                 }
                 Ok(info) => {
-                    self.status = format!("현재 커밋 {}가 최신입니다", info.current_version);
+                    if !automatic {
+                        self.status = format!("현재 커밋 {}가 최신입니다", info.current_version);
+                    }
                 }
-                Err(e) => self.status = format!("업데이트 확인 실패: {e}"),
+                Err(e) => {
+                    if !automatic {
+                        self.status = format!("업데이트 확인 실패: {e}");
+                    }
+                }
             }
         } else if self.update_check_result.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -7677,7 +7739,7 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                             )
                             .clicked()
                         {
-                            app.start_update_check();
+                            app.start_update_check(false);
                             ui.close_menu();
                         }
                         ui.separator();

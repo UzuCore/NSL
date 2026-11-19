@@ -70,6 +70,46 @@ struct PackageManifest {
     sha256: HashMap<String, String>,
 }
 
+/// Decide where to replace nsl.exe. A portable ZIP stores user data beside
+/// the executable, but project builds in target/release and dist deliberately
+/// share the project root's data and need to replace their own binary.
+fn install_directory(base_dir: &Path, running_exe: &Path) -> Result<PathBuf> {
+    let data_dir = base_dir
+        .canonicalize()
+        .context("could not resolve the NSL data directory")?;
+    let executable = running_exe
+        .canonicalize()
+        .context("could not resolve the running NSL executable")?;
+    anyhow::ensure!(
+        executable.file_name().and_then(|name| name.to_str()) == Some("nsl.exe"),
+        "in-place updates require the nsl.exe executable"
+    );
+    let binary_dir = executable
+        .parent()
+        .ok_or_else(|| anyhow!("could not resolve the NSL executable folder"))?;
+    if binary_dir == data_dir {
+        return Ok(binary_dir.to_owned());
+    }
+    let recognized_development_layout = [
+        data_dir.join("target").join("release"),
+        data_dir.join("dist"),
+    ]
+    .into_iter()
+    .any(|candidate| {
+        candidate
+            .canonicalize()
+            .is_ok_and(|path| path == binary_dir)
+    });
+    anyhow::ensure!(
+        recognized_development_layout
+            && data_dir.join("library.db").is_file()
+            && data_dir.join("config.json").is_file()
+            && data_dir.join("titledb").is_dir(),
+        "NSL executable is outside its installation or recognized development folder"
+    );
+    Ok(binary_dir.to_owned())
+}
+
 fn hash_file(path: &Path) -> Result<String> {
     let mut reader = io::BufReader::new(fs::File::open(path)?);
     let mut hash = Sha256::new();
@@ -342,15 +382,11 @@ pub fn download_and_prepare_with_progress(
 pub fn launch_apply_and_exit(task_dir: &Path, base_dir: &Path) -> Result<()> {
     let base = base_dir
         .canonicalize()
-        .context("could not resolve app folder")?;
-    let running = std::env::current_exe()
-        .context("could not resolve current executable")?
-        .canonicalize()?;
-    if running.file_name().and_then(|name| name.to_str()) != Some("nsl.exe")
-        || running.parent() != Some(base.as_path())
-    {
-        anyhow::bail!("in-place updates require the packaged nsl.exe build");
-    }
+        .context("could not resolve app data folder")?;
+    let install_dir = install_directory(
+        &base,
+        &std::env::current_exe().context("could not resolve current executable")?,
+    )?;
     let task = task_dir
         .canonicalize()
         .context("could not resolve staged update folder")?;
@@ -385,9 +421,11 @@ pub fn launch_apply_and_exit(task_dir: &Path, base_dir: &Path) -> Result<()> {
         ])
         .arg(&script)
         .arg("-BaseDir")
-        .arg(&base)
+        .arg(&install_dir)
         .arg("-TaskDir")
         .arg(&task)
+        .arg("-WaitForPid")
+        .arg(std::process::id().to_string())
         .current_dir(&base)
         .spawn()
         .context("could not start update replacement script")?;
@@ -429,6 +467,36 @@ mod tests {
             "Git build must embed full commit SHA"
         );
         assert_eq!(build_commit_short().len(), 7);
+    }
+
+    #[test]
+    fn update_installer_respects_portable_and_project_executable_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("library.db"), b"placeholder").unwrap();
+        fs::write(root.join("config.json"), b"{}").unwrap();
+        fs::create_dir_all(root.join("titledb")).unwrap();
+        for relative in ["", "dist", "target/release"] {
+            let bin_dir = root.join(relative);
+            fs::create_dir_all(&bin_dir).unwrap();
+            let exe = bin_dir.join("nsl.exe");
+            fs::write(&exe, b"sample").unwrap();
+            assert_eq!(
+                install_directory(root, &exe).unwrap(),
+                bin_dir.canonicalize().unwrap(),
+                "unexpected install directory for {relative}"
+            );
+        }
+        let arbitrary = root.join("other");
+        fs::create_dir_all(&arbitrary).unwrap();
+        let arbitrary_exe = arbitrary.join("nsl.exe");
+        fs::write(&arbitrary_exe, b"sample").unwrap();
+        assert!(install_directory(root, &arbitrary_exe).is_err());
+        let renamed = root.join("dist").join("renamed.exe");
+        fs::write(&renamed, b"sample").unwrap();
+        assert!(install_directory(root, &renamed).is_err());
+        fs::remove_file(root.join("config.json")).unwrap();
+        assert!(install_directory(root, &root.join("target/release/nsl.exe")).is_err());
     }
 
     #[test]

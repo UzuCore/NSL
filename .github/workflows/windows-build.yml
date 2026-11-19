@@ -30,6 +30,10 @@ jobs:
         shell: pwsh
         run: .\scripts\verify-package.ps1 -PackageZip .\dist\nsl-win64.zip -StagingDir .\build\package
 
+      - name: Verify automatic update replacement and rollback
+        shell: pwsh
+        run: .\scripts\test-auto-update.ps1 -RunDelayedFailure
+
       - name: Upload Windows distribution
         uses: actions/upload-artifact@v4
         with:

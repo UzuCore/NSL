@@ -708,6 +708,9 @@ struct NslApp {
     catalog_matching_indices: Vec<usize>,
     catalog_search_pending: Option<std::time::Instant>,
     catalog_page: usize,
+    catalog_genre_filter: String,
+    catalog_format_filter: String,
+    catalog_scroll_reset: bool,
     catalog_selected: Option<String>,
     catalog_cover_dir: PathBuf,
     catalog_cover_textures: HashMap<String, egui::TextureHandle>,
@@ -717,6 +720,9 @@ struct NslApp {
     catalog_cover_queue: Option<Receiver<(usize, Vec<String>)>>,
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
+    download_search: String,
+    download_status_filter: String,
+    download_scroll_reset: bool,
     torrent_polled_at: Option<std::time::Instant>,
     download_delete_confirm: Option<(String, String)>,
     cache_info: Option<String>,
@@ -740,6 +746,81 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
         let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{cut}…")
     }
+}
+
+/// The source catalog bundles many updates and DLCs, so filter using its
+/// actual genre/format metadata rather than guessing a content type.
+const STORE_GENRES: [(&str, &str); 12] = [
+    ("all", "전체 장르"),
+    ("Action", "액션"),
+    ("Adventure", "어드벤처"),
+    ("Role-Playing", "RPG"),
+    ("Simulator", "시뮬레이션"),
+    ("Strategy", "전략"),
+    ("Puzzle", "퍼즐"),
+    ("Racing", "레이싱"),
+    ("Shooter", "슈팅"),
+    ("Sports", "스포츠"),
+    ("Visual Novel", "비주얼 노벨"),
+    ("Homebrew", "홈브류"),
+];
+const STORE_FORMATS: [(&str, &str); 6] = [
+    ("all", "전체 형식"),
+    ("NSP", "NSP"),
+    ("NSZ", "NSZ"),
+    ("XCI", "XCI"),
+    ("XCZ", "XCZ"),
+    ("NRO", "NRO"),
+];
+const DOWNLOAD_STATUSES: [(&str, &str); 5] = [
+    ("all", "전체 작업"),
+    ("active", "진행 중"),
+    ("paused", "일시정지"),
+    ("finished", "완료"),
+    ("failed", "실패"),
+];
+
+fn catalog_matches_filters(
+    item: &catalog::CatalogItem,
+    query: &str,
+    genre: &str,
+    format: &str,
+) -> bool {
+    (query.is_empty()
+        || item.title.to_lowercase().contains(query)
+        || item
+            .base_title_id()
+            .is_some_and(|id| id.to_ascii_lowercase().contains(query)))
+        && (genre == "all"
+            || item
+                .genre
+                .to_ascii_lowercase()
+                .contains(&genre.to_ascii_lowercase()))
+        && (format == "all"
+            || item.image_format.to_ascii_uppercase().contains(format)
+            || item
+                .title
+                .to_ascii_uppercase()
+                .contains(&format!("[{format}]")))
+}
+
+fn download_matches_filters(
+    key: &str,
+    progress: &torrent::TorrentProgress,
+    query: &str,
+    status: &str,
+) -> bool {
+    let matches_status = match status {
+        "active" => !progress.finished && !progress.paused && progress.error.is_none(),
+        "paused" => !progress.finished && progress.paused && progress.error.is_none(),
+        "finished" => progress.finished && progress.error.is_none(),
+        "failed" => progress.error.is_some(),
+        _ => true,
+    };
+    matches_status
+        && (query.is_empty()
+            || progress.name.to_lowercase().contains(query)
+            || key.to_lowercase().contains(query))
 }
 
 fn path_is_within(path: &str, folder: &str) -> bool {
@@ -1057,6 +1138,9 @@ impl NslApp {
             catalog_matching_indices: Vec::new(),
             catalog_search_pending: None,
             catalog_page: 0,
+            catalog_genre_filter: "all".into(),
+            catalog_format_filter: "all".into(),
+            catalog_scroll_reset: false,
             catalog_selected: None,
             catalog_cover_dir: base_dir.join("icons").join("store"),
             catalog_cover_textures: HashMap::new(),
@@ -1066,6 +1150,9 @@ impl NslApp {
             catalog_cover_queue: None,
             torrent_engine: None,
             torrent_progress: Vec::new(),
+            download_search: String::new(),
+            download_status_filter: "all".into(),
+            download_scroll_reset: false,
             torrent_polled_at: None,
             download_delete_confirm: None,
             cache_info: None,
@@ -1643,136 +1730,239 @@ impl NslApp {
         }
     }
 
-    /// Store tab: browse the torrent catalog and start downloads.
-    fn catalog_panel_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let subtitle = if self.catalog_state.items.is_empty() {
-            "게임 카탈로그".to_owned()
-        } else {
-            format!(
-                "{}개 항목 · 갱신 {}",
-                common::format_count(self.catalog_state.items.len() as i64),
-                self.catalog_state
-                    .updated_at
-                    .map(|date| {
-                        chrono::DateTime::<chrono::Local>::from(date)
-                            .format("%Y-%m-%d %H:%M")
-                            .to_string()
-                    })
-                    .unwrap_or_else(|| "-".into())
-            )
-        };
-        library_section_header(ui, "스토어", &subtitle, |ui| {
-            if ui
-                .add_enabled(self.catalog_result.is_none(), egui::Button::new("새로고침"))
-                .clicked()
-            {
-                self.start_catalog_download();
-            }
-            if !self.torrent_progress.is_empty() && ui.button("다운로드").clicked() {
-                self.folder_filter = "DOWNLOADS".into();
-                self.current_page = 0;
-                self.config.settings.insert(
-                    "last_tab_key".into(),
-                    serde_json::Value::String("DOWNLOADS".into()),
-                );
-                let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
-            }
-        });
-        if self.catalog_state.items.is_empty() {
-            ui.add_space(8.0);
-            library_section_frame(ui).show(ui, |ui| {
-                ui.label(egui::RichText::new("게임 카탈로그").size(14.0).strong());
-                if self.catalog_result.is_some() {
-                    ui.label("카탈로그를 다운로드하는 중… (최초 1회 약 20MB)");
-                } else if self.catalog_load_result.is_some() {
-                    ui.label("저장된 게임 목록을 불러오는 중…");
-                } else {
-                    ui.label("카탈로그를 내려받아 게임 업데이트와 DLC를 바로 받을 수 있습니다.");
-                    if ui.button("카탈로그 다운로드").clicked() {
-                        self.start_catalog_download();
-                    }
-                }
-            });
-            return;
-        }
-        ui.add_space(4.0);
-        let search_before = self.catalog_search.clone();
-        ui.add_sized(
-            [ui.available_width().min(420.0), 24.0],
-            egui::TextEdit::singleline(&mut self.catalog_search)
-                .id(egui::Id::new("catalog_search"))
-                .hint_text("카탈로그 검색 (게임 이름 또는 타이틀 ID)…"),
-        );
-        if self.catalog_search != search_before {
-            self.catalog_search_pending =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
-        }
-        let mut search_applied = false;
+    fn refresh_catalog_matches(&mut self, ctx: &egui::Context) {
         if let Some(deadline) = self.catalog_search_pending {
             if std::time::Instant::now() >= deadline {
                 self.catalog_search_pending = None;
-                if self.catalog_search_committed != self.catalog_search {
-                    self.catalog_search_committed = self.catalog_search.clone();
-                    search_applied = true;
-                }
+                self.catalog_search_committed
+                    .clone_from(&self.catalog_search);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
             }
         }
-        if search_applied {
-            self.catalog_page = 0;
-        }
-        if self.catalog_search_pending.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        }
-        ui.add_space(4.0);
         let query = self.catalog_search_committed.trim().to_lowercase();
-        if self.catalog_search_cache.as_ref() != Some(&query) {
+        let filter_key = format!(
+            "{query}\u{1f}{}\u{1f}{}",
+            self.catalog_genre_filter, self.catalog_format_filter
+        );
+        if self.catalog_search_cache.as_ref() != Some(&filter_key) {
             self.catalog_matching_indices = self
                 .catalog_state
                 .items
                 .iter()
                 .enumerate()
                 .filter(|(_, item)| {
-                    query.is_empty()
-                        || item.title.to_lowercase().contains(&query)
-                        || item
-                            .base_title_id()
-                            .is_some_and(|id| id.to_lowercase().contains(&query))
+                    catalog_matches_filters(
+                        item,
+                        &query,
+                        &self.catalog_genre_filter,
+                        &self.catalog_format_filter,
+                    )
                 })
                 .map(|(index, _)| index)
                 .collect();
-            self.catalog_search_cache = Some(query);
+            self.catalog_search_cache = Some(filter_key);
+            self.catalog_page = 0;
+            self.catalog_scroll_reset = true;
         }
+    }
+
+    /// Store controls live in their own sidebar, independent of the saved
+    /// game-detail splitter. The catalog list below gets all remaining space.
+    fn catalog_sidebar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::ScrollArea::vertical()
+            .id_salt("catalog_sidebar_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading(egui::RichText::new("스토어").size(18.0).strong());
+                ui.label(
+                    egui::RichText::new(format!(
+                        "카탈로그 {}개 항목",
+                        common::format_count(self.catalog_state.items.len() as i64)
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                if let Some(updated_at) = self.catalog_state.updated_at {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "갱신: {}",
+                            chrono::DateTime::<chrono::Local>::from(updated_at)
+                                .format("%Y-%m-%d %H:%M")
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("타이틀 검색").strong());
+                let search = ui.add_sized(
+                    [ui.available_width(), 27.0],
+                    egui::TextEdit::singleline(&mut self.catalog_search)
+                        .id(egui::Id::new("catalog_search"))
+                        .hint_text("게임 이름 또는 타이틀 ID"),
+                );
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_store_sidebar_search"), search.rect)
+                });
+                if search.changed() {
+                    self.catalog_search_pending =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("장르").strong());
+                let genre_label = STORE_GENRES
+                    .iter()
+                    .find(|(key, _)| *key == self.catalog_genre_filter)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("전체 장르");
+                egui::ComboBox::from_id_salt("catalog_genre_filter")
+                    .selected_text(genre_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for &(key, label) in &STORE_GENRES {
+                            ui.selectable_value(
+                                &mut self.catalog_genre_filter,
+                                key.to_owned(),
+                                label,
+                            );
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("파일 형식").strong());
+                let format_label = STORE_FORMATS
+                    .iter()
+                    .find(|(key, _)| *key == self.catalog_format_filter)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("전체 형식");
+                egui::ComboBox::from_id_salt("catalog_format_filter")
+                    .selected_text(format_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for &(key, label) in &STORE_FORMATS {
+                            ui.selectable_value(
+                                &mut self.catalog_format_filter,
+                                key.to_owned(),
+                                label,
+                            );
+                        }
+                    });
+                ui.add_space(8.0);
+                if ui.button("검색·분류 초기화").clicked() {
+                    self.catalog_search.clear();
+                    self.catalog_search_committed.clear();
+                    self.catalog_search_pending = None;
+                    self.catalog_genre_filter = "all".into();
+                    self.catalog_format_filter = "all".into();
+                }
+                self.refresh_catalog_matches(ctx);
+                let total_pages = self.catalog_matching_indices.len().div_ceil(100).max(1);
+                self.catalog_page = self.catalog_page.min(total_pages - 1);
+                ui.separator();
+                ui.label(format!(
+                    "검색 결과 {}개",
+                    common::format_count(self.catalog_matching_indices.len() as i64)
+                ));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.catalog_page > 0, egui::Button::new("이전"))
+                        .clicked()
+                    {
+                        self.catalog_page -= 1;
+                        self.catalog_scroll_reset = true;
+                    }
+                    ui.label(format!("{} / {}", self.catalog_page + 1, total_pages));
+                    if ui
+                        .add_enabled(
+                            self.catalog_page + 1 < total_pages,
+                            egui::Button::new("다음"),
+                        )
+                        .clicked()
+                    {
+                        self.catalog_page += 1;
+                        self.catalog_scroll_reset = true;
+                    }
+                });
+                ui.separator();
+                if ui
+                    .add_enabled(
+                        self.catalog_result.is_none(),
+                        egui::Button::new("카탈로그 새로고침"),
+                    )
+                    .clicked()
+                {
+                    self.start_catalog_download();
+                }
+                if !self.torrent_progress.is_empty() && ui.button("다운로드 보기").clicked() {
+                    self.folder_filter = "DOWNLOADS".into();
+                    self.current_page = 0;
+                    self.config.settings.insert(
+                        "last_tab_key".into(),
+                        serde_json::Value::String("DOWNLOADS".into()),
+                    );
+                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
+                }
+                if let Some(topic_id) = self.catalog_selected.as_deref() {
+                    if let Some(item) = self
+                        .catalog_state
+                        .items
+                        .iter()
+                        .find(|item| item.topic_id == topic_id)
+                        .cloned()
+                    {
+                        ui.separator();
+                        ui.label(egui::RichText::new("선택한 타이틀").strong());
+                        ui.label(&item.title);
+                        for (label, value) in [
+                            ("ID", item.title_id.as_deref().unwrap_or("-")),
+                            ("장르", item.genre.as_str()),
+                            ("형식", item.image_format.as_str()),
+                            ("크기", item.size.as_str()),
+                        ] {
+                            if !value.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(format!("{label}: {value}"))
+                                        .small()
+                                        .color(ui.visuals().weak_text_color()),
+                                );
+                            }
+                        }
+                        if ui.button("선택한 항목 다운로드").clicked() {
+                            self.start_catalog_torrent(&item);
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "저장 위치: {}\\<게임 폴더>",
+                        self.base_dir.join("downloads").display()
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+    }
+
+    /// Store tab: show catalog items only; controls are in the right sidebar.
+    fn catalog_panel_ui(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        if self.catalog_state.items.is_empty() {
+            ui.add_space(8.0);
+            library_section_frame(ui).show(ui, |ui| {
+                ui.label(egui::RichText::new("카탈로그 준비").size(14.0).strong());
+                if self.catalog_result.is_some() {
+                    ui.label("카탈로그를 다운로드하는 중… (최초 1회 약 20MB)");
+                } else if self.catalog_load_result.is_some() {
+                    ui.label("저장된 게임 목록을 불러오는 중…");
+                } else {
+                    ui.label("오른쪽 패널에서 카탈로그를 갱신해 게임 목록을 불러오세요.");
+                }
+            });
+            return;
+        }
+        ui.add_space(4.0);
         let page_size = 100usize;
-        let page_count = self
-            .catalog_matching_indices
-            .len()
-            .div_ceil(page_size)
-            .max(1);
-        self.catalog_page = self.catalog_page.min(page_count - 1);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(self.catalog_page > 0, egui::Button::new("이전"))
-                .clicked()
-            {
-                self.catalog_page -= 1;
-            }
-            ui.label(format!(
-                "페이지 {} / {} · {}개 일치",
-                self.catalog_page + 1,
-                page_count,
-                self.catalog_matching_indices.len()
-            ));
-            if ui
-                .add_enabled(
-                    self.catalog_page + 1 < page_count,
-                    egui::Button::new("다음"),
-                )
-                .clicked()
-            {
-                self.catalog_page += 1;
-            }
-        });
-        ui.separator();
         // Keep only lightweight indices for the page. Clone heavyweight
         // catalog entries (magnet links and other strings) only for the rows
         // that the virtualized scroll area will actually display.
@@ -1783,14 +1973,23 @@ impl NslApp {
             .take(page_size)
             .copied()
             .collect();
-        let download_root = self.base_dir.join("downloads");
+        if page_indices.is_empty() {
+            library_section_frame(ui).show(ui, |ui| {
+                ui.label("검색·분류 조건과 일치하는 타이틀이 없습니다.");
+            });
+            return;
+        }
         let selected_topic = self.catalog_selected.clone();
         let mut cover_jobs = Vec::new();
         let now = std::time::Instant::now();
-        let _catalog_scroll = egui::ScrollArea::vertical()
+        let mut catalog_scroll = egui::ScrollArea::vertical()
             .id_salt("catalog_rows")
-            .auto_shrink([false, false])
-            .show_rows(ui, 72.0, page_indices.len(), |ui, row_range| {
+            .auto_shrink([false, false]);
+        if std::mem::take(&mut self.catalog_scroll_reset) {
+            catalog_scroll = catalog_scroll.vertical_scroll_offset(0.0);
+        }
+        let _catalog_scroll =
+            catalog_scroll.show_rows(ui, 72.0, page_indices.len(), |ui, row_range| {
                 let mut cover_budget = ICON_LOAD_BUDGET;
                 for &index in &page_indices[row_range] {
                     let item = self.catalog_state.items[index].clone();
@@ -1877,7 +2076,7 @@ impl NslApp {
                         });
                     });
                     #[cfg(test)]
-                    ctx.data_mut(|data| {
+                    _ctx.data_mut(|data| {
                         data.insert_temp(
                             egui::Id::new("nsl_test_catalog_last_row"),
                             _response.response.rect,
@@ -1892,21 +2091,13 @@ impl NslApp {
                 }
             });
         #[cfg(test)]
-        ctx.data_mut(|data| {
+        _ctx.data_mut(|data| {
             data.insert_temp(
                 egui::Id::new("nsl_test_catalog_viewport"),
                 _catalog_scroll.inner_rect,
             )
         });
         self.start_cover_prefetch(cover_jobs);
-        ui.label(
-            egui::RichText::new(format!(
-                "저장 위치: {}\\<게임 폴더> · 받은 파일은 스캔 폴더로 옮겨주세요.",
-                download_root.display(),
-            ))
-            .small()
-            .color(ui.visuals().weak_text_color()),
-        );
     }
 
     /// Load a store cover into the texture cache if it is on disk.
@@ -2079,30 +2270,129 @@ impl NslApp {
         }
     }
 
-    /// Dedicated downloads tab.
-    fn downloads_panel_ui(&mut self, ui: &mut egui::Ui) {
-        let subtitle = format!("{}개 작업", self.torrent_progress.len());
-        library_section_header(ui, "다운로드", &subtitle, |ui| {
-            if ui.button("스토어 열기").clicked() {
-                self.folder_filter = "CATALOG".into();
-                self.current_page = 0;
-                self.config.settings.insert(
-                    "last_tab_key".into(),
-                    serde_json::Value::String("CATALOG".into()),
-                );
-                let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
-            }
-        });
-        let save_dir = self.base_dir.join("downloads");
-        if self.torrent_progress.is_empty() {
-            ui.add_space(8.0);
-            library_section_frame(ui).show(ui, |ui| {
+    /// Search, transfer-state filters and aggregate progress live next to
+    /// the downloads list, not in a toolbar above its first row.
+    fn downloads_sidebar_ui(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("downloads_sidebar_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.heading(egui::RichText::new("다운로드").size(18.0).strong());
                 ui.label(
-                    egui::RichText::new("진행 중인 다운로드가 없습니다")
-                        .size(14.0)
-                        .strong(),
+                    egui::RichText::new(format!(
+                        "총 {}개 작업",
+                        common::format_count(self.torrent_progress.len() as i64)
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
                 );
-                ui.label("스토어 탭에서 게임 업데이트나 DLC를 받으면 여기에 표시됩니다.");
+                ui.separator();
+                ui.label(egui::RichText::new("타이틀 검색").strong());
+                let search = ui.add_sized(
+                    [ui.available_width(), 27.0],
+                    egui::TextEdit::singleline(&mut self.download_search)
+                        .id(egui::Id::new("download_search"))
+                        .hint_text("다운로드 이름 검색"),
+                );
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_download_sidebar_search"),
+                        search.rect,
+                    )
+                });
+                if search.changed() {
+                    self.download_scroll_reset = true;
+                }
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("진행 상태").strong());
+                let status_label = DOWNLOAD_STATUSES
+                    .iter()
+                    .find(|(key, _)| *key == self.download_status_filter)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("전체 작업");
+                let previous_status = self.download_status_filter.clone();
+                egui::ComboBox::from_id_salt("download_status_filter")
+                    .selected_text(status_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for &(key, label) in &DOWNLOAD_STATUSES {
+                            ui.selectable_value(
+                                &mut self.download_status_filter,
+                                key.to_owned(),
+                                label,
+                            );
+                        }
+                    });
+                if self.download_status_filter != previous_status {
+                    self.download_scroll_reset = true;
+                }
+                ui.add_space(8.0);
+                if ui.button("검색·분류 초기화").clicked() {
+                    self.download_search.clear();
+                    self.download_status_filter = "all".into();
+                    self.download_scroll_reset = true;
+                }
+                let query = self.download_search.trim().to_lowercase();
+                let count = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(key, progress)| {
+                        download_matches_filters(
+                            key,
+                            progress,
+                            &query,
+                            &self.download_status_filter,
+                        )
+                    })
+                    .count();
+                ui.separator();
+                ui.label(format!(
+                    "검색 결과 {}개",
+                    common::format_count(count as i64)
+                ));
+                let active = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(_, p)| !p.finished && !p.paused && p.error.is_none())
+                    .count();
+                let paused = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(_, p)| !p.finished && p.paused && p.error.is_none())
+                    .count();
+                let finished = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(_, p)| p.finished && p.error.is_none())
+                    .count();
+                let failed = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(_, p)| p.error.is_some())
+                    .count();
+                for (label, count) in [
+                    ("진행 중", active),
+                    ("일시정지", paused),
+                    ("완료", finished),
+                    ("실패", failed),
+                ] {
+                    ui.label(
+                        egui::RichText::new(format!("{label}  {count}"))
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                    );
+                }
+                let total_speed: u64 = self
+                    .torrent_progress
+                    .iter()
+                    .filter(|(_, p)| !p.finished && !p.paused && p.error.is_none())
+                    .map(|(_, p)| p.download_speed_bps)
+                    .sum();
+                if active > 0 {
+                    ui.label(format!("전체 속도  {}/s", common::format_size(total_speed)));
+                }
+                ui.separator();
                 if ui.button("스토어로 이동").clicked() {
                     self.folder_filter = "CATALOG".into();
                     self.current_page = 0;
@@ -2112,173 +2402,151 @@ impl NslApp {
                     );
                     let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
                 }
-            });
-            ui.label(
-                egui::RichText::new(format!("저장 위치: {}\\<게임 폴더>", save_dir.display()))
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-            return;
-        }
-        let active = self
-            .torrent_progress
-            .iter()
-            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
-            .count();
-        let paused = self
-            .torrent_progress
-            .iter()
-            .filter(|(_, p)| p.paused && !p.finished)
-            .count();
-        let finished = self
-            .torrent_progress
-            .iter()
-            .filter(|(_, p)| p.finished)
-            .count();
-        let failed = self
-            .torrent_progress
-            .iter()
-            .filter(|(_, p)| p.error.is_some())
-            .count();
-        let total_speed: u64 = self
-            .torrent_progress
-            .iter()
-            .filter(|(_, p)| !p.finished && p.error.is_none() && !p.paused)
-            .map(|(_, p)| p.download_speed_bps)
-            .sum();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-            if active > 0 {
+                ui.separator();
                 ui.label(
                     egui::RichText::new(format!(
-                        "진행 중 {active} · 합계 {}/s",
-                        common::format_size(total_speed)
+                        "저장 위치: {}\\<게임 폴더>",
+                        self.base_dir.join("downloads").display()
                     ))
                     .small()
-                    .color(ui.visuals().text_color()),
+                    .color(ui.visuals().weak_text_color()),
                 );
-            }
-            if paused > 0 {
-                ui.label(egui::RichText::new(format!("일시정지 {paused}")).small());
-            }
-            if finished > 0 {
-                ui.label(egui::RichText::new(format!("완료 {finished}")).small());
-            }
-            if failed > 0 {
-                ui.colored_label(
-                    egui::Color32::LIGHT_RED,
-                    egui::RichText::new(format!("실패 {failed}")).small(),
+            });
+    }
+
+    /// Dedicated downloads tab: the center is reserved for torrent rows.
+    fn downloads_panel_ui(&mut self, ui: &mut egui::Ui) {
+        if self.torrent_progress.is_empty() {
+            ui.add_space(8.0);
+            library_section_frame(ui).show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("다운로드 작업이 없습니다")
+                        .size(14.0)
+                        .strong(),
                 );
-            }
-        });
+                ui.label("스토어 탭에서 게임 업데이트나 DLC를 받으면 여기에 표시됩니다.");
+            });
+            return;
+        }
+        let query = self.download_search.trim().to_lowercase();
+        let entries: Vec<_> = self
+            .torrent_progress
+            .iter()
+            .filter(|(key, progress)| {
+                download_matches_filters(key, progress, &query, &self.download_status_filter)
+            })
+            .cloned()
+            .collect();
+        if entries.is_empty() {
+            ui.add_space(8.0);
+            library_section_frame(ui).show(ui, |ui| {
+                ui.label("검색·분류 조건과 일치하는 다운로드가 없습니다.");
+            });
+            return;
+        }
         ui.add_space(4.0);
-        egui::ScrollArea::vertical()
+        let mut download_scroll = egui::ScrollArea::vertical()
             .id_salt("downloads_rows")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let entries = self.torrent_progress.clone();
-                for (key, progress) in &entries {
-                    let row_width = ui.available_width();
-                    let frame = library_section_frame(ui);
-                    let _row = frame.show(ui, |ui| {
-                        ui.set_width((row_width - 20.0).max(200.0));
-                        let label = if progress.name.is_empty() {
-                            key.as_str()
-                        } else {
-                            &progress.name
-                        };
-                        let compact = ui.available_width() < 440.0;
-                        if compact {
-                            ui.add(
+            .auto_shrink([false, false]);
+        if std::mem::take(&mut self.download_scroll_reset) {
+            download_scroll = download_scroll.vertical_scroll_offset(0.0);
+        }
+        download_scroll.show(ui, |ui| {
+            for (key, progress) in &entries {
+                let row_width = ui.available_width();
+                let frame = library_section_frame(ui);
+                let _row = frame.show(ui, |ui| {
+                    ui.set_width((row_width - 20.0).max(200.0));
+                    let label = if progress.name.is_empty() {
+                        key.as_str()
+                    } else {
+                        &progress.name
+                    };
+                    let compact = ui.available_width() < 440.0;
+                    if compact {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(label).size(13.0).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(label);
+                        ui.horizontal(|ui| self.download_row_buttons(ui, key, progress));
+                    } else {
+                        ui.horizontal(|ui| {
+                            let label_width = (ui.available_width() - 205.0).max(96.0);
+                            ui.add_sized(
+                                [label_width, 22.0],
                                 egui::Label::new(egui::RichText::new(label).size(13.0).strong())
                                     .truncate(),
                             )
                             .on_hover_text(label);
-                            ui.horizontal(|ui| self.download_row_buttons(ui, key, progress));
-                        } else {
-                            ui.horizontal(|ui| {
-                                let label_width = (ui.available_width() - 205.0).max(96.0);
-                                ui.add_sized(
-                                    [label_width, 22.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(label).size(13.0).strong(),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(label);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| self.download_row_buttons(ui, key, progress),
-                                );
-                            });
-                        }
-                        if progress.total_bytes > 0 {
-                            let fraction =
-                                progress.progress_bytes as f32 / progress.total_bytes.max(1) as f32;
-                            if progress.finished {
-                                ui.add(
-                                    egui::ProgressBar::new(1.0)
-                                        .desired_height(17.0)
-                                        .desired_width(ui.available_width())
-                                        .fill(egui::Color32::from_rgb(46, 160, 67))
-                                        .text(format!(
-                                            "완료 {}",
-                                            common::format_size(progress.total_bytes)
-                                        )),
-                                );
-                            } else {
-                                ui.add(
-                                    egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
-                                        .desired_height(17.0)
-                                        .desired_width(ui.available_width())
-                                        .text(format!(
-                                            "{} / {} · {}/s",
-                                            common::format_size(progress.progress_bytes),
-                                            common::format_size(progress.total_bytes),
-                                            common::format_size(progress.download_speed_bps),
-                                        )),
-                                );
-                            }
-                        } else {
-                            ui.label(
-                                egui::RichText::new("크기 확인 중… (메타데이터 받는 중)")
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| self.download_row_buttons(ui, key, progress),
                             );
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(&progress.state)
-                                    .small()
-                                    .color(ui.visuals().weak_text_color()),
-                            );
-                            if let Some(error) = &progress.error {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(error)
-                                            .small()
-                                            .color(egui::Color32::LIGHT_RED),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(error);
-                            }
                         });
+                    }
+                    if progress.total_bytes > 0 {
+                        let fraction =
+                            progress.progress_bytes as f32 / progress.total_bytes.max(1) as f32;
+                        if progress.finished {
+                            ui.add(
+                                egui::ProgressBar::new(1.0)
+                                    .desired_height(17.0)
+                                    .desired_width(ui.available_width())
+                                    .fill(egui::Color32::from_rgb(46, 160, 67))
+                                    .text(format!(
+                                        "완료 {}",
+                                        common::format_size(progress.total_bytes)
+                                    )),
+                            );
+                        } else {
+                            ui.add(
+                                egui::ProgressBar::new(fraction.clamp(0.0, 1.0))
+                                    .desired_height(17.0)
+                                    .desired_width(ui.available_width())
+                                    .text(format!(
+                                        "{} / {} · {}/s",
+                                        common::format_size(progress.progress_bytes),
+                                        common::format_size(progress.total_bytes),
+                                        common::format_size(progress.download_speed_bps),
+                                    )),
+                            );
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("크기 확인 중… (메타데이터 받는 중)")
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(&progress.state)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                        if let Some(error) = &progress.error {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(error)
+                                        .small()
+                                        .color(egui::Color32::LIGHT_RED),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(error);
+                        }
                     });
-                    #[cfg(test)]
-                    ui.ctx().data_mut(|data| {
-                        data.insert_temp(
-                            egui::Id::new("nsl_test_download_last_row"),
-                            _row.response.rect,
-                        )
-                    });
-                }
-            });
-        ui.label(
-            egui::RichText::new(format!("저장 위치: {}\\<게임 폴더>", save_dir.display()))
-                .small()
-                .color(ui.visuals().weak_text_color()),
-        );
+                });
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_download_last_row"),
+                        _row.response.rect,
+                    )
+                });
+            }
+        });
     }
 
     fn start_titledb_download(&mut self) {
@@ -4578,7 +4846,13 @@ impl NslApp {
             )
         });
         if ctrl_f {
-            self.search_focus = true;
+            if !self.settings_open && self.folder_filter == "CATALOG" {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("catalog_search")));
+            } else if !self.settings_open && self.folder_filter == "DOWNLOADS" {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("download_search")));
+            } else {
+                self.search_focus = true;
+            }
         }
         if ctrl_o {
             self.settings_open = !self.settings_open;
@@ -4602,6 +4876,10 @@ impl NslApp {
                 self.catalog_search_pending = None;
                 self.catalog_search_cache = None;
                 self.catalog_page = 0;
+                self.catalog_scroll_reset = true;
+            } else if self.folder_filter == "DOWNLOADS" {
+                self.download_search.clear();
+                self.download_scroll_reset = true;
             }
         }
         if enter && !ctx.wants_keyboard_input() {
@@ -5399,9 +5677,8 @@ impl NslApp {
             saved_detail_width = 440.0;
             self.reset_panel_width = false;
         }
-        // Catalog/downloads are full-width management views, not game detail
-        // tabs. A previously selected library game must not keep a 320–900px
-        // unrelated detail pane open while browsing those two views.
+        // Management views get their own right-hand controls; keep the
+        // library detail panel and its saved sash width completely separate.
         if !self.settings_open
             && self.folder_filter != "CATALOG"
             && self.folder_filter != "DOWNLOADS"
@@ -5457,6 +5734,49 @@ impl NslApp {
                     }
                 }
             }
+        }
+        if !self.settings_open && self.folder_filter == "CATALOG" {
+            let sidebar = egui::SidePanel::right("catalog_controls")
+                .default_width(282.0)
+                .min_width(235.0)
+                .max_width(365.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.scope(|ui| {
+                        outlined_action_style(ui);
+                        self.catalog_sidebar_ui(ui, ctx);
+                    });
+                });
+            #[cfg(test)]
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_store_sidebar_rect"),
+                    sidebar.response.rect,
+                );
+            });
+            #[cfg(not(test))]
+            let _ = sidebar;
+        } else if !self.settings_open && self.folder_filter == "DOWNLOADS" {
+            let sidebar = egui::SidePanel::right("download_controls")
+                .default_width(282.0)
+                .min_width(235.0)
+                .max_width(365.0)
+                .resizable(true)
+                .show(ctx, |ui| {
+                    ui.scope(|ui| {
+                        outlined_action_style(ui);
+                        self.downloads_sidebar_ui(ui);
+                    });
+                });
+            #[cfg(test)]
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_download_sidebar_rect"),
+                    sidebar.response.rect,
+                );
+            });
+            #[cfg(not(test))]
+            let _ = sidebar;
         }
         let central_panel = egui::CentralPanel::default();
         let central_panel = if self.settings_open {
@@ -7158,26 +7478,6 @@ fn outlined_action_style(ui: &mut egui::Ui) {
     }
 }
 
-fn library_section_header(
-    ui: &mut egui::Ui,
-    title: &str,
-    subtitle: &str,
-    actions: impl FnOnce(&mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title).size(15.0).strong());
-        if !subtitle.is_empty() && ui.available_width() > 400.0 {
-            ui.label(
-                egui::RichText::new(subtitle)
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-            );
-        }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
-    });
-    ui.separator();
-}
-
 fn library_section_frame(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::none()
         .fill(ui.visuals().faint_bg_color)
@@ -7500,24 +7800,31 @@ fn top_bar(app: &mut NslApp, ui: &mut egui::Ui, ctx: &egui::Context, active_task
                     if ui.button("로그").clicked() {
                         app.log_open = !app.log_open;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let search = ui.add_sized(
-                            [
-                                if compact_top_bar { 170.0 } else { 220.0 },
-                                ui.spacing().interact_size.y,
-                            ],
-                            egui::TextEdit::singleline(&mut app.search)
-                                .id(egui::Id::new("library_search"))
-                                .vertical_align(egui::Align::Center)
-                                .hint_text("검색..."),
-                        );
-                        if app.search_focus {
-                            search.request_focus();
-                            app.search_focus = false;
-                        }
-                        ui.label("검색");
-                        ui.separator();
-                    });
+                    // Management tabs search inside their right panels. Hide
+                    // the unrelated library-search widget to avoid two
+                    // competing search fields on those screens.
+                    if app.settings_open
+                        || (app.folder_filter != "CATALOG" && app.folder_filter != "DOWNLOADS")
+                    {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let search = ui.add_sized(
+                                [
+                                    if compact_top_bar { 170.0 } else { 220.0 },
+                                    ui.spacing().interact_size.y,
+                                ],
+                                egui::TextEdit::singleline(&mut app.search)
+                                    .id(egui::Id::new("library_search"))
+                                    .vertical_align(egui::Align::Center)
+                                    .hint_text("검색..."),
+                            );
+                            if app.search_focus {
+                                search.request_focus();
+                                app.search_focus = false;
+                            }
+                            ui.label("검색");
+                            ui.separator();
+                        });
+                    }
                 },
             );
         });
@@ -8263,12 +8570,131 @@ mod runtime_tests {
     }
 
     #[test]
+    fn store_sidebar_filters_real_genre_and_format_without_guessing_dlc() {
+        let action_nsz = catalog::CatalogItem {
+            title: "Alpha [NSZ] + Update + DLC".into(),
+            title_id: Some("0100D2C0115B6000".into()),
+            genre: "Action, Adventure".into(),
+            image_format: ".NSZ (compressed)".into(),
+            ..Default::default()
+        };
+        let puzzle_xci = catalog::CatalogItem {
+            title: "Beta [XCI]".into(),
+            title_id: Some("0100D2C0115B7000".into()),
+            genre: "Puzzle".into(),
+            image_format: "XCI".into(),
+            ..Default::default()
+        };
+        assert!(catalog_matches_filters(&action_nsz, "", "all", "all"));
+        assert!(catalog_matches_filters(
+            &action_nsz,
+            "alpha",
+            "Action",
+            "NSZ"
+        ));
+        assert!(catalog_matches_filters(
+            &action_nsz,
+            "0100d2c0115b6",
+            "Adventure",
+            "NSZ"
+        ));
+        assert!(!catalog_matches_filters(
+            &action_nsz,
+            "beta",
+            "Action",
+            "NSZ"
+        ));
+        assert!(!catalog_matches_filters(&action_nsz, "", "Puzzle", "NSZ"));
+        assert!(!catalog_matches_filters(&action_nsz, "", "Action", "NSP"));
+        assert!(catalog_matches_filters(
+            &puzzle_xci,
+            "beta",
+            "Puzzle",
+            "XCI"
+        ));
+        assert!(!catalog_matches_filters(&puzzle_xci, "", "Action", "XCI"));
+    }
+
+    #[test]
+    fn download_sidebar_filters_search_and_mutually_exclusive_states() {
+        let mut progress = torrent::TorrentProgress {
+            name: "Alpha Update DLC".into(),
+            state: "다운로드 중".into(),
+            ..Default::default()
+        };
+        assert!(download_matches_filters("job-a", &progress, "", "all"));
+        assert!(download_matches_filters(
+            "job-a", &progress, "update", "active"
+        ));
+        assert!(download_matches_filters(
+            "job-a", &progress, "job-a", "active"
+        ));
+        assert!(!download_matches_filters("job-a", &progress, "beta", "all"));
+        assert!(!download_matches_filters("job-a", &progress, "", "paused"));
+        progress.paused = true;
+        assert!(download_matches_filters("job-a", &progress, "", "paused"));
+        assert!(!download_matches_filters("job-a", &progress, "", "active"));
+        progress.error = Some("network error".into());
+        assert!(download_matches_filters("job-a", &progress, "", "failed"));
+        assert!(!download_matches_filters("job-a", &progress, "", "paused"));
+        progress.paused = false;
+        progress.error = None;
+        progress.finished = true;
+        assert!(download_matches_filters("job-a", &progress, "", "finished"));
+        assert!(!download_matches_filters("job-a", &progress, "", "active"));
+    }
+
+    #[test]
+    fn store_sidebar_filter_changes_reset_pagination_and_center_rows() {
+        let (mut app, _dir) = seeded_app();
+        app.catalog_state.items = vec![
+            catalog::CatalogItem {
+                title: "Alpha [NSZ]".into(),
+                topic_id: "a".into(),
+                genre: "Action".into(),
+                image_format: "NSZ".into(),
+                ..Default::default()
+            },
+            catalog::CatalogItem {
+                title: "Beta [XCI]".into(),
+                topic_id: "b".into(),
+                genre: "Puzzle".into(),
+                image_format: "XCI".into(),
+                ..Default::default()
+            },
+        ];
+        app.folder_filter = "CATALOG".into();
+        app.catalog_genre_filter = "Action".into();
+        app.catalog_format_filter = "NSZ".into();
+        app.catalog_page = 99;
+        app.catalog_search_cache = None;
+        let ctx = run_app_ticks(&mut app, 3);
+        assert_eq!(app.catalog_matching_indices, vec![0]);
+        assert_eq!(app.catalog_page, 0);
+        assert!(ctx
+            .data_mut(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_first_row"))
+            })
+            .is_some());
+        app.catalog_genre_filter = "Puzzle".into();
+        run_app_ticks(&mut app, 2);
+        assert_eq!(app.catalog_matching_indices.len(), 0);
+        app.catalog_format_filter = "XCI".into();
+        run_app_ticks(&mut app, 2);
+        assert_eq!(app.catalog_matching_indices, vec![1]);
+        app.catalog_search = "alpha".into();
+        app.catalog_search_committed = "alpha".into();
+        run_app_ticks(&mut app, 2);
+        assert!(app.catalog_matching_indices.is_empty());
+    }
+
+    #[test]
     fn store_and_download_tabs_have_consistent_compact_rows_at_three_widths() {
         let (mut app, _dir) = seeded_app();
         let ctx = run_app_ticks(&mut app, 2);
         wait_for_rows(&mut app, &ctx);
-        // Enter both views while a library game is selected: its detail
-        // sidebar must not consume the management views' remaining width.
+        // Management views have independent right-hand controls even when
+        // the library still has a selected game and a saved detail width.
         let selected_library_game = app.rows.iter().find(|row| row.has_base).unwrap().id;
         app.selected = Some(selected_library_game);
         // The real torrent worker normally supplies the live snapshot each
@@ -8348,6 +8774,16 @@ mod runtime_tests {
             ("DOWNLOADS", "nsl_test_download_last_row"),
         ] {
             app.folder_filter = tab.into();
+            let sidebar_marker = if tab == "CATALOG" {
+                "nsl_test_store_sidebar_rect"
+            } else {
+                "nsl_test_download_sidebar_rect"
+            };
+            let search_marker = if tab == "CATALOG" {
+                "nsl_test_store_sidebar_search"
+            } else {
+                "nsl_test_download_sidebar_search"
+            };
             for width in [1456.0, 980.0, 720.0] {
                 ctx.begin_pass(egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -8365,14 +8801,37 @@ mod runtime_tests {
                         app.folder_filter, app.catalog_state.items.len(),
                         app.catalog_matching_indices.len(), app.catalog_page, app.settings_open,
                     ));
+                let (sidebar, search) = ctx.data_mut(|data| {
+                    (
+                        data.get_temp::<egui::Rect>(egui::Id::new(sidebar_marker))
+                            .expect("management right sidebar missing"),
+                        data.get_temp::<egui::Rect>(egui::Id::new(search_marker))
+                            .expect("management sidebar search missing"),
+                    )
+                });
+                assert!(
+                    sidebar.width() >= 234.0 && sidebar.width() <= 366.0,
+                    "{tab} sidebar width at {width}: {sidebar:?}"
+                );
+                assert!(
+                    (sidebar.right() - width).abs() < 3.0,
+                    "{tab} panel does not touch the right edge: {sidebar:?}"
+                );
+                assert!(
+                    search.left() >= sidebar.left() && search.right() <= sidebar.right(),
+                    "{tab} search is not inside the sidebar: {search:?}, {sidebar:?}"
+                );
                 assert!(
                     rect.is_finite() && rect.left() >= -1.0 && rect.right() <= width + 1.0,
                     "{tab} row spills off screen at {width}: {rect:?}"
                 );
-                assert!(rect.right() > width - 65.0,
-                    "{tab} did not use full width; unrelated game detail pane may still be visible: {rect:?}");
                 assert!(
-                    rect.height() >= 60.0 && rect.height() < 160.0,
+                    rect.right() <= sidebar.left() + 1.0
+                        && rect.right() >= sidebar.left() - 65.0,
+                    "{tab} row does not occupy the available center width: row={rect:?}, sidebar={sidebar:?}"
+                );
+                assert!(
+                    rect.height() >= 60.0 && rect.height() < 175.0,
                     "{tab} row height differs from library compact layout: {rect:?}"
                 );
                 assert!(

@@ -2125,7 +2125,6 @@ impl NslApp {
         let _ = title_rect;
         ui.add_space(6.0);
         ui.separator();
-        ui.label(egui::RichText::new("게임 정보").strong());
         Self::catalog_details_field(ui, "타이틀 ID", item.title_id.as_deref().unwrap_or(""));
         Self::catalog_details_field(ui, "출시 시기", &item.year);
         Self::catalog_details_field(ui, "장르", &item.genre);
@@ -2177,18 +2176,22 @@ impl NslApp {
                 }
             }
         }
-        ui.add_space(8.0);
-        if ui
-            .add_sized(
-                [ui.available_width(), 29.0],
-                egui::Button::new("선택한 게임 다운로드"),
-            )
-            .clicked()
-        {
-            self.start_catalog_torrent(&item);
-        }
         if item.url.starts_with("https://") || item.url.starts_with("http://") {
-            ui.hyperlink_to("원본 게시물 보기", &item.url);
+            ui.add_space(8.0);
+            let original_button = ui.add_sized(
+                [ui.available_width(), 29.0],
+                egui::Button::new("원본 게시물 보기"),
+            );
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nsl_test_store_original_post_button"),
+                    original_button.rect,
+                );
+            });
+            if original_button.clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(item.url));
+            }
         }
     }
 
@@ -2222,11 +2225,12 @@ impl NslApp {
                     );
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("타이틀 검색").strong());
                 let search = ui.add_sized(
-                    [ui.available_width(), 27.0],
+                    [ui.available_width(), 30.0],
                     egui::TextEdit::singleline(&mut self.catalog_search)
                         .id(egui::Id::new("catalog_search"))
+                        .min_size(egui::vec2(0.0, 30.0))
+                        .vertical_align(egui::Align::Center)
                         .hint_text("게임 이름 또는 타이틀 ID"),
                 );
                 #[cfg(test)]
@@ -2320,55 +2324,88 @@ impl NslApp {
                 #[cfg(not(test))]
                 let _ = language_rect;
                 ui.add_space(5.0);
-                if ui
+                self.refresh_catalog_matches(ctx);
+                ui.separator();
+                let results = ui.label(format!(
+                    "검색 결과 {}개",
+                    common::format_count(self.catalog_matching_indices.len() as i64)
+                ));
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_store_result_count"), results.rect);
+                });
+                #[cfg(not(test))]
+                let _ = results;
+                ui.add_space(3.0);
+                let reset = ui
                     .add_sized(
                         [ui.available_width(), 28.0],
                         egui::Button::new("검색·분류 초기화"),
-                    )
-                    .clicked()
-                {
+                    );
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_store_reset_button"), reset.rect);
+                });
+                if reset.clicked() {
                     self.catalog_search.clear();
                     self.catalog_search_committed.clear();
                     self.catalog_search_pending = None;
                     self.catalog_genre_filter = "all".into();
                     self.catalog_format_filter = "all".into();
                     self.catalog_language_filter = "all".into();
+                    self.refresh_catalog_matches(ctx);
+                    ctx.request_repaint();
                 }
-                self.refresh_catalog_matches(ctx);
-                ui.separator();
-                ui.label(format!(
-                    "검색 결과 {}개",
-                    common::format_count(self.catalog_matching_indices.len() as i64)
-                ));
-                ui.separator();
-                if ui
+                let refresh = ui
                     .add_enabled(
                         self.catalog_result.is_none(),
                         egui::Button::new("카탈로그 새로고침")
                             .min_size(egui::vec2(ui.available_width(), 29.0)),
-                    )
-                    .clicked()
-                {
+                    );
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_store_refresh_button"), refresh.rect);
+                });
+                if refresh.clicked() {
                     self.start_catalog_download();
                 }
-                if !self.torrent_progress.is_empty()
-                    && ui
-                        .add_sized(
-                            [ui.available_width(), 29.0],
-                            egui::Button::new("다운로드 보기"),
-                        )
-                        .clicked()
-                {
-                    self.folder_filter = "DOWNLOADS".into();
-                    self.current_page = 0;
-                    self.config.settings.insert(
-                        "last_tab_key".into(),
-                        serde_json::Value::String("DOWNLOADS".into()),
+                let can_download = self.catalog_selected.as_deref().is_some_and(|id| {
+                    self.catalog_state
+                        .items
+                        .iter()
+                        .any(|item| item.topic_id == id)
+                });
+                let download = ui.add_enabled(
+                    can_download,
+                    egui::Button::new("게임 다운로드")
+                        .min_size(egui::vec2(ui.available_width(), 29.0)),
+                );
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_store_game_download_button"),
+                        download.rect,
                     );
-                    let _ = database::save_config(&self.base_dir.join("config.json"), &self.config);
+                });
+                if download.clicked() {
+                    if let Some(item) = self.catalog_selected.as_deref().and_then(|id| {
+                        self.catalog_state
+                            .items
+                            .iter()
+                            .find(|item| item.topic_id == id)
+                            .cloned()
+                    }) {
+                        self.start_catalog_torrent(&item);
+                    }
                 }
                 ui.separator();
-                ui.label(egui::RichText::new("선택한 게임").strong());
+                let heading = ui.label(egui::RichText::new("게임 정보").strong());
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_store_game_info_heading"), heading.rect);
+                });
+                #[cfg(not(test))]
+                let _ = heading;
                 ui.add_space(3.0);
                 self.catalog_selected_details_ui(ui);
                 ui.separator();
@@ -2777,11 +2814,12 @@ impl NslApp {
                     .color(ui.visuals().weak_text_color()),
                 );
                 ui.separator();
-                ui.label(egui::RichText::new("타이틀 검색").strong());
                 let search = ui.add_sized(
-                    [ui.available_width(), 27.0],
+                    [ui.available_width(), 30.0],
                     egui::TextEdit::singleline(&mut self.download_search)
                         .id(egui::Id::new("download_search"))
+                        .min_size(egui::vec2(0.0, 30.0))
+                        .vertical_align(egui::Align::Center)
                         .hint_text("다운로드 이름 검색"),
                 );
                 #[cfg(test)]
@@ -2819,19 +2857,6 @@ impl NslApp {
                     self.download_page = 0;
                     self.download_scroll_reset = true;
                 }
-                ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 28.0],
-                        egui::Button::new("검색·분류 초기화"),
-                    )
-                    .clicked()
-                {
-                    self.download_search.clear();
-                    self.download_status_filter = "all".into();
-                    self.download_page = 0;
-                    self.download_scroll_reset = true;
-                }
                 let query = self.download_search.trim().to_lowercase();
                 let count = self
                     .torrent_progress
@@ -2846,10 +2871,36 @@ impl NslApp {
                     })
                     .count();
                 ui.separator();
-                ui.label(format!(
+                let results = ui.label(format!(
                     "검색 결과 {}개",
                     common::format_count(count as i64)
                 ));
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_download_result_count"),
+                        results.rect,
+                    );
+                });
+                #[cfg(not(test))]
+                let _ = results;
+                ui.add_space(3.0);
+                let reset = ui.add_sized(
+                    [ui.available_width(), 28.0],
+                    egui::Button::new("검색·분류 초기화"),
+                );
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("nsl_test_download_reset_button"), reset.rect);
+                });
+                if reset.clicked() {
+                    self.download_search.clear();
+                    self.download_status_filter = "all".into();
+                    self.download_page = 0;
+                    self.download_scroll_reset = true;
+                    ui.ctx().request_repaint();
+                }
+                ui.separator();
                 let active = self
                     .torrent_progress
                     .iter()
@@ -9383,6 +9434,7 @@ mod runtime_tests {
             interface_lang: "Korean, English [KOR / ENG]".into(),
             image_format: "NSZ".into(),
             size: "3.21 GB".into(),
+            url: "https://example.org/switch-game-post".into(),
             ..Default::default()
         }];
         app.catalog_title_details.insert(
@@ -9410,16 +9462,37 @@ mod runtime_tests {
             });
             app.ui_frame(&ctx);
             let _ = ctx.end_pass();
-            let (sidebar, language, title) = ctx.data_mut(|data| {
-                (
-                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_sidebar_rect"))
+            let (sidebar, language, title, result_count, reset, refresh, download, heading, post) =
+                ctx.data_mut(|data| {
+                    (
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_sidebar_rect"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new(
+                            "nsl_test_store_language_filter",
+                        ))
                         .unwrap(),
-                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_language_filter"))
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_detail_title"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_result_count"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_reset_button"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_refresh_button"))
+                            .unwrap(),
+                        data.get_temp::<egui::Rect>(egui::Id::new(
+                            "nsl_test_store_game_download_button",
+                        ))
                         .unwrap(),
-                    data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_detail_title"))
+                        data.get_temp::<egui::Rect>(egui::Id::new(
+                            "nsl_test_store_game_info_heading",
+                        ))
                         .unwrap(),
-                )
-            });
+                        data.get_temp::<egui::Rect>(egui::Id::new(
+                            "nsl_test_store_original_post_button",
+                        ))
+                        .unwrap(),
+                    )
+                });
             assert!(
                 language.left() >= sidebar.left()
                     && language.right() <= sidebar.right()
@@ -9427,8 +9500,89 @@ mod runtime_tests {
                     && title.right() <= sidebar.right(),
                 "Store sidebar details/control spill outside panel at {width}: panel={sidebar:?}, language={language:?}, title={title:?}"
             );
+            assert!(
+                result_count.bottom() < reset.top()
+                    && reset.bottom() < refresh.top()
+                    && refresh.bottom() < download.top()
+                    && download.bottom() < heading.top()
+                    && heading.bottom() < title.top()
+                    && title.bottom() < post.top(),
+                "Store order result -> reset -> refresh -> download -> game info -> external post failed at {width}: {result_count:?} {reset:?} {refresh:?} {download:?} {heading:?} {title:?} {post:?}"
+            );
+            for rect in [result_count, reset, refresh, download, heading, post] {
+                assert!(
+                    rect.left() >= sidebar.left() + 12.0 && rect.right() <= sidebar.right() - 12.0,
+                    "Store content overflows padded sidebar at {width}: rect={rect:?}, sidebar={sidebar:?}"
+                );
+            }
             assert_eq!(app.catalog_matching_indices, vec![0]);
         }
+    }
+
+    #[test]
+    fn store_original_post_button_opens_selected_web_url() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "CATALOG".into();
+        app.catalog_state.items = vec![catalog::CatalogItem {
+            title: "Link button test".into(),
+            topic_id: "post-button-qa".into(),
+            url: "https://example.org/original-topic".into(),
+            ..Default::default()
+        }];
+        app.catalog_selected = Some("post-button-qa".into());
+        // Disable asynchronous metadata edits while sending pointer events.
+        // Otherwise a background DB lookup may move the button mid-click.
+        app.catalog_title_metadata_loaded = true;
+        app.catalog_title_load_result = None;
+        app.catalog_search_cache = None;
+        for _ in 0..3 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let _ = ctx.end_pass();
+        }
+        let button = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_store_original_post_button"))
+                .expect("original post must be rendered as a button")
+        });
+        let click_at = button.center();
+        assert!(button.width() > 150.0 && click_at.y < 900.0);
+        for pressed in [true, false] {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1456.0, 900.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(click_at),
+                    egui::Event::PointerButton {
+                        pos: click_at,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            });
+            app.ui_frame(&ctx);
+            let output = ctx.end_pass();
+            if !pressed {
+                let url = output
+                    .platform_output
+                    .open_url
+                    .expect("clicking the original post button must open the URL");
+                assert_eq!(url.url, "https://example.org/original-topic");
+                assert!(url.new_tab);
+            }
+        }
+        assert!(app.torrent_progress.is_empty());
     }
 
     #[test]
@@ -9790,6 +9944,16 @@ mod runtime_tests {
             } else {
                 "nsl_test_download_sidebar_search"
             };
+            let results_marker = if tab == "CATALOG" {
+                "nsl_test_store_result_count"
+            } else {
+                "nsl_test_download_result_count"
+            };
+            let reset_marker = if tab == "CATALOG" {
+                "nsl_test_store_reset_button"
+            } else {
+                "nsl_test_download_reset_button"
+            };
             for width in [1456.0, 980.0, 720.0] {
                 ctx.begin_pass(egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -9807,7 +9971,7 @@ mod runtime_tests {
                         app.folder_filter, app.catalog_state.items.len(),
                         app.catalog_matching_indices.len(), app.catalog_page, app.settings_open,
                     ));
-                let (sidebar, search, pagination) = ctx.data_mut(|data| {
+                let (sidebar, search, pagination, results, reset) = ctx.data_mut(|data| {
                     (
                         data.get_temp::<egui::Rect>(egui::Id::new(sidebar_marker))
                             .expect("management right sidebar missing"),
@@ -9815,6 +9979,10 @@ mod runtime_tests {
                             .expect("management sidebar search missing"),
                         data.get_temp::<egui::Rect>(egui::Id::new(pagination_marker))
                             .expect("management list pagination missing"),
+                        data.get_temp::<egui::Rect>(egui::Id::new(results_marker))
+                            .expect("management search count missing"),
+                        data.get_temp::<egui::Rect>(egui::Id::new(reset_marker))
+                            .expect("management reset button missing"),
                     )
                 });
                 assert!(
@@ -9829,6 +9997,12 @@ mod runtime_tests {
                     search.left() >= sidebar.left() + 12.0
                         && search.right() <= sidebar.right() - 12.0,
                     "{tab} search lacks sidebar padding: search={search:?}, sidebar={sidebar:?}"
+                );
+                assert!(
+                    search.height() >= 26.0 && results.bottom() < reset.top()
+                        && reset.left() >= sidebar.left() + 12.0
+                        && reset.right() <= sidebar.right() - 12.0,
+                    "{tab} results/reset ordering or search height failed at {width}: search={search:?} results={results:?} reset={reset:?}"
                 );
                 assert!(
                     pagination.left() < sidebar.left()

@@ -166,61 +166,19 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
         .unwrap_or(false);
     let offsets = if is_xci { &XCI_OFFSETS } else { &NSP_OFFSETS };
     for base in offsets {
-        if base + 16 > size || file.seek(SeekFrom::Start(*base)).is_err() {
+        let Some(index) = crate::container_index::read_for_metadata(file, *base, size, None) else {
             continue;
-        }
-        let mut header = [0u8; 16];
-        if file.read_exact(&mut header).is_err()
-            || (&header[..4] != b"PFS0" && &header[..4] != b"HFS0")
-        {
-            continue;
-        }
-        let count = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
-        let str_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-        if count == 0 || count > 16384 || str_size > 64 * 1024 * 1024 {
-            continue;
-        }
-        let entries_start = *base + 16;
-        let entry_size = if &header[..4] == b"HFS0" { 0x40 } else { 0x18 };
-        let table_size = count.saturating_mul(entry_size);
-        if entries_start
-            .saturating_add(table_size as u64)
-            .saturating_add(str_size as u64)
-            > size
-        {
-            continue;
-        }
-        let mut table = vec![0u8; table_size];
-        if file.read_exact(&mut table).is_err() {
-            continue;
-        }
-        let mut strings = vec![0u8; str_size];
-        if file.read_exact(&mut strings).is_err() {
-            continue;
-        }
-        let data_start = entries_start + table_size as u64 + str_size as u64;
+        };
         let mut result = Vec::new();
         let mut seen = HashSet::new();
-        for i in 0..count {
-            let p = i * entry_size;
-            let off = u64::from_le_bytes(table[p..p + 8].try_into().unwrap());
-            let len = u64::from_le_bytes(table[p + 8..p + 16].try_into().unwrap());
-            let no = u32::from_le_bytes(table[p + 16..p + 20].try_into().unwrap()) as usize;
-            if no >= strings.len() || data_start.saturating_add(off).saturating_add(len) > size {
-                continue;
-            }
-            let end = strings[no..]
-                .iter()
-                .position(|x| *x == 0)
-                .map(|n| no + n)
-                .unwrap_or(strings.len());
-            let name = String::from_utf8_lossy(&strings[no..end]).to_string();
-            let lower = name.to_ascii_lowercase();
+        for entry in &index.entries {
+            let len = entry.size;
+            let absolute = index.data_start + entry.offset;
+            let lower = entry.name.to_ascii_lowercase();
             let mut content = None;
             if lower.ends_with(".tik") && len <= 1_048_576 {
                 let mut buf = vec![0; len as usize];
-                if file.seek(SeekFrom::Start(data_start + off)).is_ok()
-                    && file.read_exact(&mut buf).is_ok()
+                if file.seek(SeekFrom::Start(absolute)).is_ok() && file.read_exact(&mut buf).is_ok()
                 {
                     if let Some(tid) = ticket_tid(&buf) {
                         content = Some(Content {
@@ -234,9 +192,7 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
             }
             if lower.ends_with(".cnmt") && (13..=1_048_576).contains(&len) {
                 let mut b = [0; 13];
-                if file.seek(SeekFrom::Start(data_start + off)).is_ok()
-                    && file.read_exact(&mut b).is_ok()
-                {
+                if file.seek(SeekFrom::Start(absolute)).is_ok() && file.read_exact(&mut b).is_ok() {
                     let tid = format!("{:016X}", u64::from_le_bytes(b[..8].try_into().unwrap()));
                     let ver = u32::from_le_bytes(b[8..12].try_into().unwrap()) as i64;
                     let kind = match b[12] {
@@ -256,9 +212,7 @@ fn container_contents(file: &mut File, path: &Path) -> Vec<Content> {
             }
             if lower.ends_with(".cnmt.xml") && len <= 1_048_576 {
                 let mut b = vec![0; len as usize];
-                if file.seek(SeekFrom::Start(data_start + off)).is_ok()
-                    && file.read_exact(&mut b).is_ok()
-                {
+                if file.seek(SeekFrom::Start(absolute)).is_ok() && file.read_exact(&mut b).is_ok() {
                     let s = String::from_utf8_lossy(&b);
                     let re = xml_title_id_regex();
                     if let Some(c) = re.captures(&s) {
@@ -326,58 +280,19 @@ fn container_nacp(file: &mut File, path: &Path) -> (String, String, String) {
         [0, 0x200, 0x400, 0x1000, 0x4000, 0x8000]
     };
     for base in offsets {
-        if base + 16 > size || file.seek(SeekFrom::Start(base)).is_err() {
+        let Some(index) = crate::container_index::read_for_metadata(file, base, size, None) else {
             continue;
-        }
-        let mut h = [0; 16];
-        if file.read_exact(&mut h).is_err() || (&h[..4] != b"PFS0" && &h[..4] != b"HFS0") {
-            continue;
-        }
-        let n = u32::from_le_bytes(h[4..8].try_into().unwrap()) as usize;
-        let sl = u32::from_le_bytes(h[8..12].try_into().unwrap()) as usize;
-        if n == 0 || n > 16384 || sl > 64 * 1024 * 1024 {
-            continue;
-        }
-        let start = base + 16;
-        let es = if &h[..4] == b"HFS0" { 0x40 } else { 0x18 };
-        let tb = n * es;
-        if start + tb as u64 + sl as u64 > size {
-            continue;
-        }
-        let mut table = vec![0; tb];
-        if file.read_exact(&mut table).is_err() {
-            continue;
-        }
-        let mut strings = vec![0; sl];
-        if file.read_exact(&mut strings).is_err() {
-            continue;
-        }
-        let data = start + tb as u64 + sl as u64;
-        for i in 0..n {
-            let p = i * es;
-            let off = u64::from_le_bytes(table[p..p + 8].try_into().unwrap());
-            let len = u64::from_le_bytes(table[p + 8..p + 16].try_into().unwrap());
-            let no = u32::from_le_bytes(table[p + 16..p + 20].try_into().unwrap()) as usize;
-            if no >= sl
-                || len < NACP_REQUIRED_LEN as u64
-                || len > 0x10000
-                || data + off + len > size
-            {
-                continue;
-            }
-            let end = strings[no..]
-                .iter()
-                .position(|c| *c == 0)
-                .map(|v| no + v)
-                .unwrap_or(sl);
-            if !String::from_utf8_lossy(&strings[no..end])
-                .to_ascii_lowercase()
-                .ends_with(".nacp")
+        };
+        for entry in &index.entries {
+            if !(NACP_REQUIRED_LEN as u64..=0x10000).contains(&entry.size)
+                || !entry.name.to_ascii_lowercase().ends_with(".nacp")
             {
                 continue;
             }
             let mut bytes = vec![0; NACP_REQUIRED_LEN];
-            if file.seek(SeekFrom::Start(data + off)).is_err()
+            if file
+                .seek(SeekFrom::Start(index.data_start + entry.offset))
+                .is_err()
                 || file.read_exact(&mut bytes).is_err()
             {
                 continue;
@@ -443,58 +358,28 @@ fn pfs_ncas(path: &Path) -> Option<Vec<PfsNca>> {
     let mut file = File::open(path).ok()?;
     let file_size = file.metadata().ok()?.len();
     for base in [0u64, 0x200, 0x400, 0x1000, 0x4000, 0x8000] {
-        if base + 16 > file_size || file.seek(SeekFrom::Start(base)).is_err() {
+        let Some(index) = crate::container_index::read_for_metadata(
+            &mut file,
+            base,
+            file_size,
+            Some(crate::container_index::Kind::Pfs0),
+        ) else {
             continue;
-        }
-        let mut header = [0; 16];
-        if file.read_exact(&mut header).is_err() || &header[..4] != b"PFS0" {
-            continue;
-        }
-        let count = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-        let strings_size = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
-        if count == 0 || count > 16384 || strings_size > 64 * 1024 * 1024 {
-            continue;
-        }
-        let table_size = count.checked_mul(0x18)?;
-        let data_start = base
-            .checked_add(16)?
-            .checked_add(table_size as u64)?
-            .checked_add(strings_size as u64)?;
-        if data_start > file_size {
-            continue;
-        }
-        let mut table = vec![0; table_size];
-        let mut strings = vec![0; strings_size];
-        if file.read_exact(&mut table).is_err() || file.read_exact(&mut strings).is_err() {
-            continue;
-        }
-        let mut entries = Vec::new();
-        for i in 0..count {
-            let p = i * 0x18;
-            let relative = u64::from_le_bytes(table[p..p + 8].try_into().ok()?);
-            let size = u64::from_le_bytes(table[p + 8..p + 16].try_into().ok()?);
-            let name_offset = u32::from_le_bytes(table[p + 16..p + 20].try_into().ok()?) as usize;
-            let Some(name_data) = strings.get(name_offset..) else {
-                continue;
-            };
-            let name_end = name_data
-                .iter()
-                .position(|b| *b == 0)
-                .unwrap_or(name_data.len());
-            let name = String::from_utf8_lossy(&name_data[..name_end]).into_owned();
-            if !name.to_ascii_lowercase().ends_with(".nca")
-                && !name.to_ascii_lowercase().ends_with(".ncz")
-            {
-                continue;
-            }
-            let Some(offset) = data_start.checked_add(relative) else {
-                continue;
-            };
-            if offset.checked_add(size).map(|end| end <= file_size) != Some(true) {
-                continue;
-            }
-            entries.push(PfsNca { name, offset, size });
-        }
+        };
+        let data_start = index.data_start;
+        let mut entries: Vec<PfsNca> = index
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                let name = entry.name.to_ascii_lowercase();
+                name.ends_with(".nca") || name.ends_with(".ncz")
+            })
+            .map(|entry| PfsNca {
+                name: entry.name,
+                offset: data_start + entry.offset,
+                size: entry.size,
+            })
+            .collect();
         if !entries.is_empty() {
             entries.sort_by_key(|entry| entry.size);
             return Some(entries);

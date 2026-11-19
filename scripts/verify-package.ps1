@@ -13,6 +13,7 @@ $archive = (Resolve-Path -LiteralPath $PackageZip -ErrorAction Stop).Path
 $allowed = @(
     'nsl.exe', 'nsl-manifest.json',
     'licenses/memmap2-MIT.txt',
+    'licenses/nsrp-MIT.txt',
     'licenses/zstd-BSD-3-Clause.txt',
     'licenses/zstd-sys-BSD-2-Clause.txt',
     'licenses/zstd-sys-BSD-3-Clause.txt',
@@ -31,6 +32,8 @@ foreach ($file in Get-ChildItem -LiteralPath $staging -Recurse -File) {
 }
 foreach ($required in @(
     'nsl.exe', 'nsl-manifest.json',
+    # Older r22 and earlier ZIPs do not bundle the new NSRP attribution.
+    # Keep them verifiable; new package.ps1 always includes the notice.
     'licenses/memmap2-MIT.txt', 'licenses/zstd-BSD-3-Clause.txt',
     'licenses/zstd-sys-BSD-2-Clause.txt', 'licenses/zstd-sys-BSD-3-Clause.txt'
 )) {

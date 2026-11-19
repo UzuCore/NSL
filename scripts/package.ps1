@@ -34,6 +34,7 @@ $releaseExe = if ([string]::IsNullOrWhiteSpace($ExecutableOverride)) {
 $required = @(
     @{ From = $releaseExe; To = 'nsl.exe' },
     @{ From = (Join-Path $root 'licenses\memmap2-MIT.txt'); To = 'licenses\memmap2-MIT.txt' },
+    @{ From = (Join-Path $root 'licenses\nsrp-MIT.txt'); To = 'licenses\nsrp-MIT.txt' },
     @{ From = (Join-Path $root 'licenses\zstd-BSD-3-Clause.txt'); To = 'licenses\zstd-BSD-3-Clause.txt' },
     @{ From = (Join-Path $root 'licenses\zstd-sys-BSD-2-Clause.txt'); To = 'licenses\zstd-sys-BSD-2-Clause.txt' },
     @{ From = (Join-Path $root 'licenses\zstd-sys-BSD-3-Clause.txt'); To = 'licenses\zstd-sys-BSD-3-Clause.txt' }
@@ -69,7 +70,7 @@ New-Item -ItemType Directory -Path (Join-Path $staging 'screenshots') -Force | O
 New-Item -ItemType Directory -Path (Join-Path $staging 'licenses') -Force | Out-Null
 
 Copy-Item -LiteralPath $releaseExe -Destination (Join-Path $staging 'nsl.exe')
-foreach ($notice in @('memmap2-MIT.txt','zstd-BSD-3-Clause.txt','zstd-sys-BSD-2-Clause.txt','zstd-sys-BSD-3-Clause.txt')) {
+foreach ($notice in @('memmap2-MIT.txt','nsrp-MIT.txt','zstd-BSD-3-Clause.txt','zstd-sys-BSD-2-Clause.txt','zstd-sys-BSD-3-Clause.txt')) {
     Copy-Item -LiteralPath (Join-Path $root ('licenses\' + $notice)) -Destination (Join-Path $staging ('licenses\' + $notice))
 }
 foreach ($file in $titleDbFiles) {
@@ -112,7 +113,7 @@ Copy-Item -LiteralPath (Join-Path $staging 'nsl.exe') -Destination (Join-Path $d
 Copy-Item -LiteralPath (Join-Path $staging 'nsl-manifest.json') -Destination (Join-Path $dist 'nsl-manifest.json') -Force
 New-Item -ItemType Directory -Path (Join-Path $dist 'licenses') -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $dist 'titledb') -Force | Out-Null
-foreach ($notice in @('memmap2-MIT.txt','zstd-BSD-3-Clause.txt','zstd-sys-BSD-2-Clause.txt','zstd-sys-BSD-3-Clause.txt')) {
+foreach ($notice in @('memmap2-MIT.txt','nsrp-MIT.txt','zstd-BSD-3-Clause.txt','zstd-sys-BSD-2-Clause.txt','zstd-sys-BSD-3-Clause.txt')) {
     Copy-Item -LiteralPath (Join-Path $staging ('licenses\' + $notice)) -Destination (Join-Path $dist ('licenses\' + $notice)) -Force
 }
 foreach ($file in $titleDbFiles) {
@@ -164,5 +165,5 @@ $oldTargetManifest = Join-Path $root 'target\release\nsl-rust-manifest.json'
 if (Test-Path -LiteralPath $oldTargetManifest -PathType Leaf) {
     Remove-Item -LiteralPath $oldTargetManifest -Force
 }
-Write-Host ("Packaged {0} files ({1:N1} MB) as {2}" -f (6 + $titleDbFiles.Count), ((Get-Item -LiteralPath $archive).Length / 1MB), $archive)
+Write-Host ("Packaged {0} files ({1:N1} MB) as {2}" -f (7 + $titleDbFiles.Count), ((Get-Item -LiteralPath $archive).Length / 1MB), $archive)
 $global:LASTEXITCODE = 0

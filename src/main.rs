@@ -3,6 +3,7 @@
 mod app;
 mod catalog;
 mod common;
+mod container_index;
 mod database;
 mod decompress;
 mod image_loader;

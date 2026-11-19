@@ -1,4 +1,5 @@
 use crate::{
+    container_index::{self, Kind},
     native_nca,
     scanner::{self, Content},
 };
@@ -8,73 +9,21 @@ use std::{
     path::Path,
 };
 
-#[derive(Clone)]
-struct Entry {
-    offset: u64,
-    size: u64,
-    name: String,
-}
-struct Index {
-    entries: Vec<Entry>,
-    data_start: u64,
-}
+type Index = container_index::Index;
 
 fn read_index(file: &mut File, base: u64, file_size: u64) -> Option<Index> {
-    if base.checked_add(16)? > file_size || file.seek(SeekFrom::Start(base)).is_err() {
-        return None;
-    }
-    let mut header = [0; 16];
-    file.read_exact(&mut header).ok()?;
-    if &header[..4] != b"PFS0" && &header[..4] != b"HFS0" {
-        return None;
-    }
-    let count = u32::from_le_bytes(header[4..8].try_into().ok()?) as usize;
-    let strings_size = u32::from_le_bytes(header[8..12].try_into().ok()?) as usize;
-    if count == 0 || count > 16384 || strings_size > 64 * 1024 * 1024 {
-        return None;
-    }
-    let entry_size = if &header[..4] == b"HFS0" { 0x40 } else { 0x18 };
-    let table_size = count.checked_mul(entry_size)?;
-    let strings_at = base.checked_add(16)?.checked_add(table_size as u64)?;
-    let data_start = strings_at.checked_add(strings_size as u64)?;
-    if data_start > file_size {
-        return None;
-    }
-    let mut table = vec![0; table_size];
-    file.read_exact(&mut table).ok()?;
-    let mut strings = vec![0; strings_size];
-    file.read_exact(&mut strings).ok()?;
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let p = i * entry_size;
-        let offset = u64::from_le_bytes(table[p..p + 8].try_into().ok()?);
-        let size = u64::from_le_bytes(table[p + 8..p + 16].try_into().ok()?);
-        let name_offset = u32::from_le_bytes(table[p + 16..p + 20].try_into().ok()?) as usize;
-        if name_offset >= strings.len()
-            || data_start.checked_add(offset)?.checked_add(size)? > file_size
-        {
-            continue;
-        }
-        let end = strings[name_offset..]
-            .iter()
-            .position(|b| *b == 0)
-            .map(|n| name_offset + n)
-            .unwrap_or(strings.len());
-        let name = String::from_utf8_lossy(&strings[name_offset..end]).into_owned();
-        if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\']) {
-            continue;
-        }
-        entries.push(Entry { offset, size, name });
-    }
-    Some(Index {
-        entries,
-        data_start,
-    })
+    container_index::read_at(file, base, file_size, None)
 }
 
 fn root_index(file: &mut File, len: u64) -> Option<Index> {
     let mut candidates = Vec::new();
-    for header_base in [0x1000u64, 0] {
+    // Game-card HEAD pointers can use either absolute bytes or media sectors.
+    // NSRP also checks a HEAD at 0x200 and scans the conventional aligned
+    // header area when no pointer yields an HFS0 root.
+    for header_base in [0x1000u64, 0, 0x200] {
+        if header_base.checked_add(0x138)? > len {
+            continue;
+        }
         if file.seek(SeekFrom::Start(header_base + 0x100)).is_ok() {
             let mut magic = [0; 4];
             if file.read_exact(&mut magic).is_ok()
@@ -84,23 +33,30 @@ fn root_index(file: &mut File, len: u64) -> Option<Index> {
                 let mut raw = [0; 8];
                 if file.read_exact(&mut raw).is_ok() {
                     let addr = u64::from_le_bytes(raw);
-                    if addr > 0 && addr < (1 << 40) {
+                    if addr > 0 && addr < len {
                         candidates.push(addr);
                     }
-                    if addr > 0 && addr < (1 << 32) {
-                        candidates.push(addr.saturating_mul(0x200));
+                    if let Some(sector_offset) = addr.checked_mul(0x200) {
+                        if sector_offset > 0 && sector_offset < len {
+                            candidates.push(sector_offset);
+                        }
                     }
                 }
             }
         }
     }
-    candidates.extend([0x10000, 0xF000, 0x8000, 0x4000, 0x1000, 0]);
+    candidates.extend([
+        0x10000, 0xF000, 0x8000, 0x4000, 0x2000, 0x1000, 0x400, 0x200, 0,
+    ]);
+    // Cheap fallback: read only 16 bytes per candidate unless the HFS0 magic
+    // matches. Do not sweep the game payload or guess arbitrary offsets.
+    candidates.extend((0x200..len.min(0x20000)).step_by(0x200));
     let mut seen = std::collections::HashSet::new();
     for offset in candidates {
         if !seen.insert(offset) {
             continue;
         }
-        if let Some(index) = read_index(file, offset, len) {
+        if let Some(index) = container_index::read_at(file, offset, len, Some(Kind::Hfs0)) {
             if index
                 .entries
                 .iter()
@@ -385,6 +341,54 @@ pub fn scan(path: &Path) -> (Vec<Content>, (String, String, String)) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn finds_game_card_root_at_nonstandard_aligned_header_offset() {
+        // The former hard-coded offsets omitted 0x12000; NSRP searches the
+        // conventional 0x200-aligned header region before rejecting a card.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic.xci");
+        let mut bytes = vec![0u8; 0x12000];
+        bytes.extend_from_slice(b"HFS0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&8u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 40]);
+        bytes.extend_from_slice(b"secure\0");
+        bytes.extend_from_slice(b"PFS0test");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut file = File::open(&path).unwrap();
+        let root = root_index(&mut file, bytes.len() as u64).expect("aligned HFS0 root");
+        assert_eq!(root.entries.len(), 1);
+        assert_eq!(root.entries[0].name, "secure");
+        assert_eq!(root.entries[0].size, 8);
+    }
+
+    #[test]
+    fn rejects_spoofed_xci_header_without_secure_partition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fake.xci");
+        let mut bytes = vec![0u8; 0x400];
+        bytes.extend_from_slice(b"HFS0");
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&4u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 40]);
+        bytes.extend_from_slice(b"normal\0");
+        bytes.extend_from_slice(b"data");
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(root_index(&mut file, bytes.len() as u64).is_none());
+    }
 
     #[test]
     #[ignore = "requires local read-only game corpus and prod.keys"]

@@ -1,0 +1,43 @@
+# Build output
+/target/
+/dist/
+/dist-rust/
+/build/
+/*.exe
+/*.log
+
+# Local data / caches (never commit)
+/library.db
+/library.db-shm
+/library.db-wal
+/config.json
+/config.json.bak
+/config.json.tmp
+/temp/
+/workspaces/
+/caches/
+/icons/
+/screenshots/
+/titledb/*.json
+/titledb/*.json.tmp
+/prod.keys
+/title.keys
+
+# Torrent downloads and resume state
+/downloads/
+/torrent-session/
+
+# QA screenshots and archived GUI evidence are local-only
+/docs/screenshots/
+
+# Local development documentation and QA helpers are not part of the
+# minimal public GitHub build tree. The private local master may already
+# track some of these; the GitHub publication uses a strict allowlist.
+/docs/
+/scripts/apply-local-release-update.ps1
+/scripts/smoke-release.ps1
+/scripts/test-package-verify.ps1
+
+# OS cruft
+Thumbs.db
+desktop.ini

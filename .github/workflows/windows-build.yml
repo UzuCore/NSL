@@ -1,0 +1,60 @@
+name: Build NSL for Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nsl-manual-windows-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout build sources
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build and package Windows release
+        shell: cmd
+        run: build.bat
+
+      - name: Verify release archive
+        shell: pwsh
+        run: .\scripts\verify-package.ps1 -PackageZip .\dist\nsl-win64.zip -StagingDir .\build\package
+
+      - name: Upload Windows distribution
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsl-win64
+          path: dist/nsl-win64.zip
+          if-no-files-found: error
+
+      - name: Publish KST-dated GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $kst = [System.TimeZoneInfo]::ConvertTimeFromUtc(
+            [datetime]::UtcNow,
+            [System.TimeZoneInfo]::FindSystemTimeZoneById('Korea Standard Time')
+          )
+          $date = $kst.ToString('yyyyMMdd-HHmmss')
+          $tag = "build-$date-KST-r${{ github.run_number }}"
+          $commit = $env:GITHUB_SHA.ToLowerInvariant()
+          $short = $commit.Substring(0, 7)
+          $notes = "NSL Windows build`nCommit: $commit`nReleased: $($kst.ToString('yyyy-MM-dd HH:mm:ss')) KST`n`nDownload nsl-win64.zip to install or update. Existing game data, settings and keys are preserved."
+          & gh release create $tag 'dist/nsl-win64.zip' `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $commit `
+            --title "NSL $short ($($kst.ToString('yyyy-MM-dd HH:mm')) KST)" `
+            --notes $notes `
+            --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to publish dated GitHub Release.' }

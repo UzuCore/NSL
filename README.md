@@ -1,0 +1,127 @@
+# NSL — Nintendo Switch Library
+
+**NSL**은 PC에 보관한 Nintendo Switch 게임 파일을 검색·분류하고 관리하는 **Windows용 네이티브 라이브러리 관리 프로그램**입니다. 게임, 업데이트, DLC 정보를 한 화면에서 확인하고 파일과 타이틀 데이터베이스를 함께 관리할 수 있습니다.
+
+**[최신 버전 다운로드](https://github.com/UzuCore/NSL/releases/latest)** · **[전체 릴리스](https://github.com/UzuCore/NSL/releases)** · **[수동 빌드 실행](https://github.com/UzuCore/NSL/actions/workflows/windows-build.yml)**
+
+## 주요 기능
+
+| 분류 | 기능 |
+| --- | --- |
+| 파일 관리 | `NSP`, `NSZ`, `XCI`, `XCZ` 검색 및 라이브러리 등록 |
+| 게임 정보 | 게임·업데이트·DLC 구분, 버전 확인, 누락된 업데이트·DLC 조회 |
+| 타이틀 DB | 게임 이름 및 메타데이터 매칭, 타이틀 DB 다운로드·갱신 |
+| 미디어 | 게임 아이콘과 스크린샷 수집 및 캐시 관리 |
+| 목록 UI | 리스트·그리드 보기, 검색·정렬·필터, 폴더별 탭과 상세 정보 패널 |
+| 파일 도구 | 파일명 정리, 라이브러리 CSV 내보내기, `NSZ → NSP` 및 `XCZ → XCI` 변환 |
+| 다운로드 | 스토어·다운로드 화면, 토렌트 전송 및 진행 상태 확인 |
+| 성능·안정성 | 비동기 이미지 로딩, 병렬 파일 검사, 작업 진행률·취소, 중복 실행 보호 |
+| 업데이트 | GitHub Releases의 검증된 ZIP을 이용한 프로그램 자체 업데이트 |
+
+게임 파일을 분석하고 압축 형식을 변환하는 주요 기능은 **Rust로 직접 구현**되어 있으며, 별도의 Python 실행 환경이나 `nstool`, `hactool`, `nsz.exe` 설치가 필요하지 않습니다.
+
+## 다운로드 및 사용
+
+1. **[Releases](https://github.com/UzuCore/NSL/releases/latest)**에서 최신 `nsl-win64.zip`을 다운로드합니다.
+2. ZIP을 원하는 폴더에 압축 해제하고 `nsl.exe`를 실행합니다.
+3. 설정에서 스캔할 게임 폴더를 등록합니다. **최대 5개 폴더**를 지정할 수 있습니다.
+4. 게임 파일을 스캔하고 필요에 따라 타이틀 DB를 갱신하거나 **미디어 수집**을 실행합니다.
+
+일부 암호화된 게임 파일의 메타데이터를 읽으려면 사용자가 **직접 준비한 적법한 키 파일**이 필요할 수 있습니다. 게임 파일, 개인 키 및 사용자 데이터는 이 저장소와 공식 배포 ZIP에 포함되지 않습니다.
+
+### 지원 환경
+
+- **운영체제:** Windows x64
+- **배포 형태:** 포터블 ZIP (`nsl.exe` 및 필수 파일)
+- **저장 방식:** SQLite 기반 로컬 라이브러리와 JSON 설정
+
+## 화면 구성
+
+- **라이브러리:** 보유 게임, 업데이트, DLC 및 누락 항목을 검색·정렬·필터링합니다.
+- **상세 정보:** 선택한 게임의 파일, 게임 정보, 스크린샷, DLC를 확인합니다.
+- **스토어 / 다운로드:** 카탈로그 및 다운로드 작업을 관리합니다.
+- **설정:** 스캔 폴더, 표시 방식, 이미지 수집, DB 소스 등 환경을 조정합니다.
+
+대용량 라이브러리에서도 목록을 먼저 표시하고 이미지는 필요할 때 불러오도록 설계했습니다. 스캔과 다운로드 등 장시간 작업의 상태는 하단 진행 표시줄에서 확인할 수 있습니다.
+
+## 소스에서 빌드
+
+**Rust stable**, Cargo, Git, Windows PowerShell이 설치된 Windows x64 환경을 사용합니다.
+
+```powershell
+git clone https://github.com/UzuCore/NSL.git
+cd NSL
+.\build.bat
+```
+
+`build.bat`은 다음 작업을 순서대로 수행합니다.
+
+1. `cargo build --release --locked`로 Rust 릴리스를 빌드합니다.
+2. 배포 파일과 라이선스 고지를 ZIP으로 묶습니다.
+3. ZIP 안의 파일 목록, 매니페스트 및 SHA-256 해시를 검증합니다.
+
+완료 후 `target\release\nsl.exe`와 `dist\nsl-win64.zip`을 사용할 수 있습니다. 기본 테스트는 다음과 같이 실행합니다.
+
+```powershell
+cargo fmt --all -- --check
+cargo test --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+### 저장소 구성
+
+```text
+NSL/
+├── src/                   Rust 앱·GUI·스캐너·파일 변환 소스
+├── assets/icon.ico        프로그램 아이콘
+├── scripts/               ZIP 생성·검증 및 업데이트 스크립트
+├── licenses/              포함된 외부 구성요소의 라이선스 고지
+├── .github/workflows/     GitHub Actions 수동 Windows 빌드
+├── build.rs               빌드 커밋 정보 삽입
+├── build.bat              로컬 릴리스 빌드
+├── Cargo.toml             Rust 프로젝트 설정
+└── Cargo.lock             고정된 의존성 버전
+```
+
+빌드 결과물과 개인 설정·DB·키·게임 파일 등은 Git으로 배포하지 않습니다.
+
+## GitHub Actions 빌드 및 릴리스
+
+GitHub Actions는 소스 푸시만으로 실행되지 않으며 **수동 실행 전용**입니다.
+
+1. **[Actions → Build NSL for Windows](https://github.com/UzuCore/NSL/actions/workflows/windows-build.yml)**를 엽니다.
+2. **Run workflow**를 누르고 `main` 브랜치를 선택합니다.
+3. Windows 빌드와 ZIP 무결성 검사에 성공하면 아티팩트를 업로드하고, **GitHub Releases에 동일한 ZIP을 자동 등록**합니다.
+
+릴리스 태그는 등록 시점의 한국 시간(KST)과 실행 번호로 만들어집니다.
+
+```text
+build-YYYYMMDD-HHMMSS-KST-r<실행번호>
+```
+
+프로그램의 **버전 표시는 숫자 버전이 아니라 Git 커밋 앞 7자리**입니다. 전체 40자리 커밋은 빌드 매니페스트에 기록됩니다. 따라서 화면의 커밋과 Releases 태그는 서로 다른 용도로 사용됩니다.
+
+## 프로그램 업데이트와 데이터 보존
+
+앱에서 업데이트를 확인하면 공식 GitHub Releases의 `nsl-win64.zip`을 다운로드합니다. 패키지에 기록된 **커밋 정보와 실행파일 SHA-256**을 검사한 뒤 사용자가 적용을 승인하면 프로그램을 종료하고 파일을 교체합니다.
+
+자동 업데이트가 교체하는 파일은 다음 두 개뿐입니다.
+
+```text
+nsl.exe
+nsl-manifest.json
+```
+
+**게임 파일, `library.db`, `config.json`, `prod.keys`, `title.keys`, 타이틀 DB, 아이콘·스크린샷 캐시, 다운로드 파일은 자동 업데이트 과정에서 덮어쓰지 않습니다.** 실행파일 교체 도중 실패할 경우 이전 파일로 되돌리는 절차가 포함되어 있습니다. 중요한 데이터는 별도로 백업하는 것을 권장합니다.
+
+과거 ZIP 이름을 사용하는 구형 배포판은 Git 이력 및 배포 파일명 변경으로 자동 업데이트가 연결되지 않을 수 있습니다. 이 경우 최신 ZIP을 한 번 직접 받아 기존 설치 폴더에 실행파일과 매니페스트만 적용하세요. 기존 사용자 데이터는 삭제하지 마세요.
+
+## 라이선스 및 유의 사항
+
+이 저장소의 `licenses/`에는 사용된 외부 구성요소의 라이선스 고지가 있습니다. 이는 **NSL 프로젝트 자체의 라이선스를 의미하지 않으며**, 프로젝트 코드에 대한 별도의 라이선스 파일은 현재 제공되지 않습니다.
+
+NSL은 개인이 보유한 파일을 관리하기 위한 도구입니다. **게임 ROM이나 저작권이 있는 게임 데이터, 암호화 키를 제공하지 않습니다.** 사용자는 자신이 사용할 권리가 있는 자료만 사용해야 합니다. Nintendo와 공식적으로 제휴하거나 승인받은 프로그램이 아닙니다.
+
+---
+
+**프로젝트:** [UzuCore/NSL](https://github.com/UzuCore/NSL) · **배포 파일:** [GitHub Releases](https://github.com/UzuCore/NSL/releases)

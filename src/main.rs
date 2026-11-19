@@ -3404,13 +3404,13 @@ impl NslApp {
         }
         let dir = self.base_dir.join("titledb");
         let db = self.db.clone();
-        let source = self
-            .config
-            .settings
-            .get("titledb_source")
-            .and_then(|v| v.as_str())
-            .unwrap_or("custom")
-            .to_owned();
+        // The repository has a single canonical source. Migrate legacy
+        // "custom"/"tinfoil" choices so update checks cannot hit old hosts.
+        let source = titledb::TITLE_DB_SOURCE.to_owned();
+        self.config.settings.insert(
+            "titledb_source".into(),
+            serde_json::Value::String(source.clone()),
+        );
         let (tx, rx) = mpsc::channel();
         self.titledb_result = Some(rx);
         let progress = Arc::new(TaskProgress::default());
@@ -5075,46 +5075,29 @@ impl NslApp {
                                 });
                         }
                         4 => {
-                            let mut source = self
-                                .config
-                                .settings
-                                .get("titledb_source")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("custom")
-                                .to_owned();
                             egui::Grid::new("settings_database_rows")
                                 .num_columns(2)
                                 .spacing(egui::vec2(0.0, 4.0))
                                 .show(ui, |ui| {
                                     settings_row_label(ui, "타이틀 DB 소스");
-                                    ui.vertical(|ui| {
-                                        ui.radio_value(
-                                            &mut source,
-                                            "custom".into(),
-                                            "자체 서버 (기본, 빠름)",
-                                        );
-                                        ui.radio_value(
-                                            &mut source,
-                                            "tinfoil".into(),
-                                            "Tinfoil 공식 (titles.json)",
-                                        );
-                                    });
+                                    ui.label("borntohonk/titledb (GitHub)");
                                     ui.end_row();
-                                    settings_row_label(ui, "");
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(
-                                                "자체 서버 URL: https://github.com/UzuCore/NSL/releases/download/titledb/titles.json",
-                                            )
-                                            .color(egui::Color32::GRAY),
-                                        )
-                                        .wrap(),
+                                    settings_row_label(ui, "기본 타이틀 정보");
+                                    ui.label("titles.json.zst 다운로드 → titles.json 자동 압축 해제");
+                                    ui.end_row();
+                                    settings_row_label(ui, "추가 타이틀 정보");
+                                    ui.label("versions.json, KR.ko.json");
+                                    ui.end_row();
+                                    settings_row_label(ui, "저장소");
+                                    ui.hyperlink_to(
+                                        "github.com/borntohonk/titledb",
+                                        "https://github.com/borntohonk/titledb",
                                     );
                                     ui.end_row();
                                 });
                             self.config.settings.insert(
                                 "titledb_source".into(),
-                                serde_json::Value::String(source),
+                                serde_json::Value::String(titledb::TITLE_DB_SOURCE.into()),
                             );
                         }
                         5 => {

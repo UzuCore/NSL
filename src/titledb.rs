@@ -551,6 +551,7 @@ pub fn load_local_with_progress(dir: &Path, progress: Option<&TaskProgress>) -> 
 }
 
 const TITLE_FILES: [&str; 3] = ["titles.json", "versions.json", "KR.ko.json"];
+pub const TITLE_DB_SOURCE: &str = "borntohonk";
 const MAX_TITLE_DB_BYTES: u64 = 512 * 1024 * 1024;
 const ROLLBACK_FOLDER: &str = ".nsl-title-rollback";
 const CACHE_FILE: &str = ".nsl-title-http-cache.json";
@@ -690,23 +691,19 @@ struct RemoteReply {
     last_modified: Option<String>,
 }
 
-fn title_urls(source: &str) -> [(&'static str, &'static str); 3] {
+fn title_urls(_source: &str) -> [(&'static str, &'static str); 3] {
     [
         (
             "titles.json",
-            if source == "custom" {
-                "https://github.com/UzuCore/NSL/releases/download/titledb/titles.json"
-            } else {
-                "https://tinfoil.media/repo/db/titles.json"
-            },
+            "https://raw.githubusercontent.com/borntohonk/titledb/master/titles.json.zst",
         ),
         (
             "versions.json",
-            "https://raw.githubusercontent.com/blawar/titledb/master/versions.json",
+            "https://raw.githubusercontent.com/borntohonk/titledb/master/versions.json",
         ),
         (
             "KR.ko.json",
-            "https://raw.githubusercontent.com/blawar/titledb/master/KR.ko.json",
+            "https://raw.githubusercontent.com/borntohonk/titledb/master/KR.ko.json",
         ),
     ]
 }
@@ -876,6 +873,28 @@ fn create_rollback(dir: &Path, token: &str) -> Result<()> {
     Ok(())
 }
 
+/// Decode the upstream Zstandard archive into the local, uncompressed
+/// titles.json. Decode into the existing staging directory, never directly
+/// into the active database or the user-visible titles.json. Limit the
+/// expanded size separately from the compressed download size so a corrupt
+/// or malicious archive cannot exhaust the disk.
+fn decompress_titles_zstd(archive: &Path, target: &Path, maximum_bytes: u64) -> Result<u64> {
+    let compressed = fs::File::open(archive).context("titles.json.zst 파일을 읽을 수 없습니다")?;
+    let decoder = zstd::stream::read::Decoder::new(compressed)
+        .context("titles.json.zst 압축 헤더가 올바르지 않습니다")?;
+    let mut capped = decoder.take(maximum_bytes.saturating_add(1));
+    let mut output =
+        fs::File::create(target).context("titles.json 임시 파일을 만들 수 없습니다")?;
+    let bytes = std::io::copy(&mut capped, &mut output)
+        .context("titles.json.zst 압축 해제에 실패했습니다")?;
+    anyhow::ensure!(
+        bytes > 0 && bytes <= maximum_bytes,
+        "titles.json.zst 압축 해제 결과가 비어 있거나 허용 크기를 초과했습니다"
+    );
+    output.sync_all()?;
+    Ok(bytes)
+}
+
 fn remote_download(
     name: &str,
     url: &str,
@@ -892,7 +911,7 @@ fn remote_download(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
         )
-        .set("Accept", "application/json, text/plain, */*");
+        .set("Accept", "application/octet-stream, application/json, */*");
     if let Some(header) = old {
         if let Some(etag) = &header.etag {
             request = request.set("If-None-Match", etag);
@@ -902,28 +921,44 @@ fn remote_download(
     }
     let response = match request.call() {
         Ok(response) => response,
-        Err(ureq::Error::Status(304, _)) if old.is_some() => {
-            if let Some(progress) = progress {
-                progress.begin(format!("{name} 최신 확인"), None, false);
-            }
-            let header = old.context("304 응답에 대응하는 기존 타이틀 파일이 없습니다")?;
-            return Ok(RemoteReply {
-                not_modified: true,
-                etag: header.etag.clone(),
-                last_modified: header.last_modified.clone(),
-            });
-        }
+        // ureq 2.x can return a 304 as Ok(Response), not just Status(304).
+        // Handle both variants uniformly below; 304 has no response body.
+        Err(ureq::Error::Status(304, response)) => response,
         Err(error) => anyhow::bail!("{name} 다운로드 실패: {error}"),
     };
+    if response.status() == 304 {
+        let header = old.context("304 응답에 대응하는 기존 타이틀 파일이 없습니다")?;
+        if let Some(progress) = progress {
+            progress.begin(format!("{name} 최신 확인"), None, false);
+        }
+        return Ok(RemoteReply {
+            not_modified: true,
+            etag: response
+                .header("ETag")
+                .map(str::to_owned)
+                .or_else(|| header.etag.clone()),
+            last_modified: response
+                .header("Last-Modified")
+                .map(str::to_owned)
+                .or_else(|| header.last_modified.clone()),
+        });
+    }
     let etag = response.header("ETag").map(str::to_owned);
     let last_modified = response.header("Last-Modified").map(str::to_owned);
+    let response_status = response.status();
+    let declared_bytes = response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok());
     if let Some(progress) = progress {
-        let length = response
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok());
-        progress.begin(format!("{name} 다운로드"), length, true);
+        progress.begin(format!("{name} 다운로드"), declared_bytes, true);
     }
-    let mut output = fs::File::create(target)?;
+    let compressed_titles = name == "titles.json" && url.ends_with("/titles.json.zst");
+    let downloaded = if compressed_titles {
+        target.with_extension("json.zst")
+    } else {
+        target.to_path_buf()
+    };
+    let mut output = fs::File::create(&downloaded)?;
     let mut source = response.into_reader().take(MAX_TITLE_DB_BYTES + 1);
     let bytes = if let Some(progress) = progress {
         std::io::copy(&mut MeteredReader::new(&mut source, progress), &mut output)
@@ -933,9 +968,17 @@ fn remote_download(
     .with_context(|| format!("{name} 다운로드 실패"))?;
     anyhow::ensure!(
         bytes > 0 && bytes <= MAX_TITLE_DB_BYTES,
-        "{name} 응답 크기가 잘못되었습니다"
+        "{name} 응답 크기가 잘못되었습니다: 받은 데이터 {bytes}바이트, 서버 Content-Length {declared_bytes:?}, HTTP {response_status}"
     );
     output.sync_all()?;
+    drop(output);
+    if compressed_titles {
+        if let Some(progress) = progress {
+            progress.begin("titles.json.zst 압축 해제 → titles.json", None, false);
+        }
+        decompress_titles_zstd(&downloaded, target, MAX_TITLE_DB_BYTES)?;
+        fs::remove_file(&downloaded)?;
+    }
     Ok(RemoteReply {
         not_modified: false,
         etag,
@@ -1106,6 +1149,180 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_title_database_urls_use_borntohonk_and_compressed_titles() {
+        for legacy_setting in [TITLE_DB_SOURCE, "custom", "tinfoil"] {
+            let urls = title_urls(legacy_setting);
+            assert_eq!(urls.map(|(name, _)| name), TITLE_FILES);
+            assert_eq!(
+                urls[0].1,
+                "https://raw.githubusercontent.com/borntohonk/titledb/master/titles.json.zst"
+            );
+            assert_eq!(
+                urls[1].1,
+                "https://raw.githubusercontent.com/borntohonk/titledb/master/versions.json"
+            );
+            assert_eq!(
+                urls[2].1,
+                "https://raw.githubusercontent.com/borntohonk/titledb/master/KR.ko.json"
+            );
+        }
+    }
+
+    #[test]
+    fn titles_zstd_decompression_streams_and_rejects_corrupt_or_oversized_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("titles.json.zst");
+        let extracted = dir.path().join("titles.json");
+        let contents = fixture("titles.json", "압축된 게임 이름");
+        let compressed = zstd::stream::encode_all(contents.as_slice(), 3).unwrap();
+        assert!(compressed.len() < contents.len());
+        fs::write(&archive, &compressed).unwrap();
+        assert_eq!(
+            decompress_titles_zstd(&archive, &extracted, MAX_TITLE_DB_BYTES).unwrap(),
+            contents.len() as u64
+        );
+        assert_eq!(fs::read(&extracted).unwrap(), contents);
+        let parsed = load_streamed_titles(&extracted).unwrap();
+        assert_eq!(parsed["0100D2C0115B6000"].name, "압축된 게임 이름");
+
+        assert!(
+            decompress_titles_zstd(&archive, &dir.path().join("oversized.json"), 8).is_err(),
+            "the expanded output must be checked independently of the compressed size"
+        );
+        fs::write(&archive, b"not a valid Zstandard archive").unwrap();
+        assert!(decompress_titles_zstd(&archive, &dir.path().join("corrupt.json"), 4096).is_err());
+        assert_eq!(
+            fs::read(&extracted).unwrap(),
+            contents,
+            "failure in another stage must not modify the previously validated file"
+        );
+    }
+
+    #[test]
+    fn http_304_from_ureq_preserves_cached_json_without_creating_an_empty_file() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            assert!(client.read(&mut request).unwrap() > 0);
+            client
+                .write_all(
+                    b"HTTP/1.1 304 Not Modified\r\nETag: \"known-etag\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("titles.json");
+        let cache = RemoteHeader {
+            sha256: "abcdef".into(),
+            etag: Some("\"known-etag\"".into()),
+            last_modified: None,
+        };
+        let response = remote_download(
+            "titles.json",
+            &format!("http://{address}/titles.json.zst"),
+            &target,
+            Some(&cache),
+            None,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(response.not_modified);
+        assert_eq!(response.etag, cache.etag);
+        assert!(!target.exists());
+        assert!(!target.with_extension("json.zst").exists());
+    }
+
+    #[test]
+    fn corrupt_compressed_titles_preserve_existing_source_files_and_sqlite_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let titles = dir.path().join("titledb");
+        let db = fixture_db(dir.path());
+        assert_eq!(
+            update_with_fetch(
+                &titles,
+                TITLE_DB_SOURCE,
+                &db,
+                None,
+                |name, _, target, _, _| {
+                    fs::write(target, fixture(name, "Existing name"))?;
+                    Ok(RemoteReply {
+                        not_modified: false,
+                        etag: None,
+                        last_modified: None,
+                    })
+                }
+            )
+            .unwrap(),
+            UpdateOutcome::Updated(1)
+        );
+        let before = TITLE_FILES
+            .iter()
+            .map(|name| fs::read(titles.join(name)).unwrap())
+            .collect::<Vec<_>>();
+        let result = update_with_fetch(
+            &titles,
+            TITLE_DB_SOURCE,
+            &db,
+            None,
+            |name, _, target, _, _| {
+                if name == "titles.json" {
+                    let compressed = target.with_extension("json.zst");
+                    fs::write(&compressed, b"bad Zstandard payload")?;
+                    decompress_titles_zstd(&compressed, target, MAX_TITLE_DB_BYTES)?;
+                } else {
+                    fs::write(target, fixture(name, "Changed name"))?;
+                }
+                Ok(RemoteReply {
+                    not_modified: false,
+                    etag: None,
+                    last_modified: None,
+                })
+            },
+        );
+        assert!(result.is_err());
+        for (name, baseline) in TITLE_FILES.iter().zip(before) {
+            assert_eq!(fs::read(titles.join(name)).unwrap(), baseline);
+        }
+        assert_eq!(db.stats().unwrap().title_db_count, 1);
+        assert!(!titles.join(ROLLBACK_FOLDER).exists());
+    }
+
+    #[test]
+    #[ignore = "downloads ~92 MB from the live borntohonk GitHub repository"]
+    fn live_borntohonk_zstd_download_import_and_conditional_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let titles = dir.path().join("titledb");
+        let db = fixture_db(dir.path());
+        let started = std::time::Instant::now();
+        let outcome = download_and_apply(&titles, TITLE_DB_SOURCE, &db, None).unwrap();
+        assert!(matches!(outcome, UpdateOutcome::Updated(n) if n > 10_000));
+        assert!(
+            fs::metadata(titles.join("titles.json")).unwrap().len() > 20_000_000,
+            "the extracted JSON should be much larger than its Zstd archive"
+        );
+        assert!(!titles.join("titles.json.zst").exists());
+        for name in TITLE_FILES {
+            assert!(titles.join(name).is_file(), "missing {name}");
+        }
+        assert!(db.stats().unwrap().title_db_count > 10_000);
+        assert_eq!(
+            download_and_apply(&titles, TITLE_DB_SOURCE, &db, None).unwrap(),
+            UpdateOutcome::AlreadyLatest
+        );
+        eprintln!(
+            "BORNTOHONK_LIVE_DB_IMPORT=PASS rows={} elapsed={:.1}s",
+            db.stats().unwrap().title_db_count,
+            started.elapsed().as_secs_f64()
+        );
+    }
 
     #[test]
     fn incremental_title_parsing_matches_original_object_wrapper_and_array() {

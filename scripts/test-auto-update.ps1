@@ -70,6 +70,11 @@ try {
         $backup = (Get-FileHash (Join-Path $case.task 'backup\nsl.exe') -Algorithm SHA256).Hash
         $manifest = Get-Content (Join-Path $case.binDir 'nsl-manifest.json') -Raw | ConvertFrom-Json
         if ($actual -cne $newHash -or $backup -cne $case.oldHash -or $manifest.commit -cne $tag) { throw "Invalid upgrade/backup for $layout" }
+        $ready = Join-Path $case.task 'apply-ready.flag'
+        if (-not (Test-Path -LiteralPath $ready -PathType Leaf) -or
+            (Get-Content -LiteralPath $ready -Raw) -cne $tag) {
+            throw "Update helper failed to acknowledge staged content for $layout"
+        }
         Assert-Sentinels $case
         Write-Output "PASS: real release installer layout=$layout, original backup valid, user data preserved"
     }
@@ -78,6 +83,7 @@ try {
     $result = Run-Installer $case 0
     if ($result.code -eq 0 -or (Get-FileHash (Join-Path $case.binDir 'nsl.exe') -Algorithm SHA256).Hash -cne $case.oldHash) { throw 'Tampered package was installed' }
     if (-not (Test-Path -LiteralPath (Join-Path $case.task 'update-error.log'))) { throw 'Corrupted update did not leave a diagnostic log' }
+    if (Test-Path -LiteralPath (Join-Path $case.task 'apply-ready.flag')) { throw 'Corrupted update must not acknowledge readiness' }
     Assert-Sentinels $case
     Write-Output 'PASS: modified staged executable rejected before replacing installed files'
 
@@ -89,6 +95,7 @@ try {
     $result = Run-Installer $case 0
     if ($result.code -eq 0 -or (Get-FileHash (Join-Path $case.binDir 'nsl.exe') -Algorithm SHA256).Hash -cne $case.oldHash) { throw 'Invalid manifest was installed' }
     if (-not (Test-Path -LiteralPath (Join-Path $case.task 'update-error.log'))) { throw 'Invalid manifest did not leave a diagnostic log' }
+    if (Test-Path -LiteralPath (Join-Path $case.task 'apply-ready.flag')) { throw 'Invalid manifest must not acknowledge readiness' }
     Assert-Sentinels $case
     Write-Output 'PASS: invalid staged manifest rejected before replacing installed files'
 

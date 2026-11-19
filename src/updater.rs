@@ -7,7 +7,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RELEASE_URL: &str = "https://api.github.com/repos/UzuCore/NSL/releases/latest";
@@ -108,6 +108,43 @@ fn install_directory(base_dir: &Path, running_exe: &Path) -> Result<PathBuf> {
         "NSL executable is outside its installation or recognized development folder"
     );
     Ok(binary_dir.to_owned())
+}
+
+/// Windows canonicalize() returns NT verbatim paths (\\?\D:\...), which
+/// ordinary filesystem operations accept but Windows PowerShell's Join-Path
+/// cannot resolve as a PSDrive. Pass regular absolute paths to -File,
+/// -BaseDir, -TaskDir and the helper's working directory instead.
+#[cfg(windows)]
+fn powershell_compatible_path(path: &Path) -> Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+    let unc = [b'U' as u16, b'N' as u16, b'C' as u16, b'\\' as u16];
+    let normal = if wide.starts_with(&verbatim) {
+        let suffix = &wide[verbatim.len()..];
+        if suffix.starts_with(&unc) {
+            let mut result = vec![b'\\' as u16, b'\\' as u16];
+            result.extend_from_slice(&suffix[unc.len()..]);
+            result
+        } else {
+            suffix.to_vec()
+        }
+    } else {
+        wide
+    };
+    let output = PathBuf::from(OsString::from_wide(&normal));
+    anyhow::ensure!(
+        output.is_absolute(),
+        "Windows PowerShell cannot use a non-filesystem verbatim path"
+    );
+    Ok(output)
+}
+
+#[cfg(not(windows))]
+fn powershell_compatible_path(path: &Path) -> Result<PathBuf> {
+    Ok(path.to_path_buf())
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -307,6 +344,9 @@ pub fn download_and_prepare_with_progress(
 
     let script = task_dir.join("extract.ps1");
     fs::write(&script, include_str!("../scripts/extract-update.ps1"))?;
+    let script_argument = powershell_compatible_path(&script)?;
+    let archive_argument = powershell_compatible_path(&archive)?;
+    let extraction_argument = powershell_compatible_path(&extraction)?;
     let mut command = Command::new("powershell.exe");
     #[cfg(windows)]
     {
@@ -321,11 +361,11 @@ pub fn download_and_prepare_with_progress(
             "Bypass",
             "-File",
         ])
-        .arg(&script)
+        .arg(&script_argument)
         .arg("-ArchivePath")
-        .arg(&archive)
+        .arg(&archive_argument)
         .arg("-DestinationPath")
-        .arg(&extraction)
+        .arg(&extraction_argument)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -405,13 +445,30 @@ pub fn launch_apply_and_exit(task_dir: &Path, base_dir: &Path) -> Result<()> {
     // title databases are never overwritten during an automatic update.
     let script = task.join("apply.ps1");
     fs::write(&script, include_str!("../scripts/apply-update.ps1"))?;
+    // canonicalize() deliberately returns \\?\ paths on Windows. Passing
+    // them to PowerShell's Join-Path makes the hidden helper exit before
+    // installation or restart. Keep canonical paths for security checks,
+    // but use ordinary absolute paths for all PowerShell-facing arguments.
+    let script_arg = powershell_compatible_path(&script)?;
+    let install_arg = powershell_compatible_path(&install_dir)?;
+    let task_arg = powershell_compatible_path(&task)?;
+    let base_arg = powershell_compatible_path(&base)?;
+    let ready_file = task.join("apply-ready.flag");
+    anyhow::ensure!(
+        !ready_file.exists(),
+        "this staged update was already started"
+    );
+    let stderr_log = task.join("apply-stderr.log");
+    let stdout = fs::File::create(task.join("apply-stdout.log"))
+        .context("could not create update stdout log")?;
+    let stderr = fs::File::create(&stderr_log).context("could not create update error log")?;
     let mut command = Command::new("powershell.exe");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000);
     }
-    command
+    let mut helper = command
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -419,17 +476,50 @@ pub fn launch_apply_and_exit(task_dir: &Path, base_dir: &Path) -> Result<()> {
             "Bypass",
             "-File",
         ])
-        .arg(&script)
+        .arg(&script_arg)
         .arg("-BaseDir")
-        .arg(&install_dir)
+        .arg(&install_arg)
         .arg("-TaskDir")
-        .arg(&task)
+        .arg(&task_arg)
         .arg("-WaitForPid")
         .arg(std::process::id().to_string())
-        .current_dir(&base)
+        .current_dir(&base_arg)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
         .spawn()
         .context("could not start update replacement script")?;
-    std::process::exit(0);
+
+    // A successful process spawn does not mean the PowerShell script ran.
+    // Require the helper to acknowledge that staging is complete BEFORE
+    // letting this GUI exit. Otherwise a hidden early failure strands users.
+    let started = Instant::now();
+    loop {
+        if let Some(status) = helper
+            .try_wait()
+            .context("could not inspect the NSL update helper")?
+        {
+            let details = fs::read_to_string(&stderr_log).unwrap_or_default();
+            anyhow::bail!(
+                "update helper exited before applying changes ({status}): {}",
+                details.trim()
+            );
+        }
+        if ready_file.is_file() {
+            std::process::exit(0);
+        }
+        if started.elapsed() > Duration::from_secs(30) {
+            // Before sending its ready signal, the helper cannot begin
+            // replacing our executable. Stop only the child we spawned.
+            let _ = helper.kill();
+            let _ = helper.wait();
+            let details = fs::read_to_string(&stderr_log).unwrap_or_default();
+            anyhow::bail!(
+                "update helper did not become ready within 30 seconds: {}",
+                details.trim()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[cfg(test)]
@@ -467,6 +557,54 @@ mod tests {
             "Git build must embed full commit SHA"
         );
         assert_eq!(build_commit_short().len(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_paths_work_in_real_powershell_join_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("NSL updater 한글 경로 with spaces");
+        fs::create_dir_all(&folder).unwrap();
+        let canonical = folder.canonicalize().unwrap();
+        assert!(
+            canonical.to_string_lossy().starts_with(r"\\?\"),
+            "Windows canonicalize() must produce a verbatim path for this regression"
+        );
+        let normal = powershell_compatible_path(&canonical).unwrap();
+        assert!(!normal.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(normal.canonicalize().unwrap(), canonical);
+        let script = normal.join("check.ps1");
+        fs::write(
+            &script,
+            "param([string]$BaseDir)\n$ErrorActionPreference='Stop'\n\
+             $p=Join-Path $BaseDir 'nsl.exe'\n\
+             if (-not $p.EndsWith('nsl.exe')) { throw 'Unexpected path' }\n\
+             Write-Output 'NSL_POWERSHELL_PATH_OK'\n",
+        )
+        .unwrap();
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(powershell_compatible_path(&script).unwrap())
+            .arg("-BaseDir")
+            .arg(&normal)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "real PowerShell Join-Path rejected installer argument: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("NSL_POWERSHELL_PATH_OK"));
+
+        let unc = powershell_compatible_path(Path::new(r"\\?\UNC\server\share\folder")).unwrap();
+        assert_eq!(unc, PathBuf::from(r"\\server\share\folder"));
+        assert!(powershell_compatible_path(Path::new(r"\\?\GLOBALROOT\Device\Harddisk")).is_err());
     }
 
     #[test]

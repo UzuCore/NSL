@@ -58,6 +58,14 @@ try {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
         Copy-Item -LiteralPath $source -Destination $pending -Force
     }
+    # The parent GUI waits for this handshake before exiting. At this point
+    # the helper has validated and staged both files and is ready to wait
+    # for the caller's exact PID. Never signal readiness before these checks.
+    [IO.File]::WriteAllText(
+        (Join-Path $task 'apply-ready.flag'),
+        $manifest.commit,
+        [Text.UTF8Encoding]::new($false)
+    )
     # Wait for the exact process that requested this update. A fixed sleep
     # could expire before the GUI has released its executable on slow PCs.
     if ($WaitForPid -gt 0) {
@@ -157,7 +165,28 @@ try {
     }
 }
 if (-not $NoRestart) {
-    Start-Process -FilePath (Join-Path $base 'nsl.exe') -WorkingDirectory $base
-    # An incomplete update remains on disk for diagnosis; a successful one
-    # only contains the previous binaries and may be removed by the user.
+    try {
+        $started = Start-Process -FilePath (Join-Path $base 'nsl.exe') -WorkingDirectory $base -PassThru -ErrorAction Stop
+        # Preserve a readable record of what was installed and restarted.
+        # A failure to write the success log must not kill the new GUI.
+        try {
+            [IO.File]::WriteAllText(
+                (Join-Path $task 'apply-success.log'),
+                "$(Get-Date -Format o) Applied: $($manifest.commit); Restart PID: $($started.Id)",
+                [Text.UTF8Encoding]::new($false)
+            )
+        } catch {}
+    } catch {
+        $reason = "NSL updated successfully, but restarting the application failed: $_"
+        try {
+            [IO.File]::WriteAllText(
+                (Join-Path $task 'update-error.log'),
+                "$(Get-Date -Format o) $reason",
+                [Text.UTF8Encoding]::new($false)
+            )
+        } catch {}
+        Write-Error $reason
+        exit 1
+    }
+    # Retain the staged task as a diagnostic record until normal cleanup.
 }

@@ -48,6 +48,32 @@ pub enum EngineNotice {
 }
 pub type CompletionList = Vec<EngineNotice>;
 
+/// One file from the validated torrent metadata, preserving its original ID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TorrentFileEntry {
+    pub index: usize,
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// Read-only torrent preview; the raw metadata is reused when starting.
+#[derive(Debug)]
+pub struct TorrentPreview {
+    pub files: Vec<TorrentFileEntry>,
+    pub torrent_bytes: Vec<u8>,
+}
+
+pub struct TorrentPreviewRequest {
+    pub receiver: mpsc::Receiver<Result<TorrentPreview, String>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for TorrentPreviewRequest {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
 fn safe_sub_folder(path: &Path) -> bool {
     let mut components = path.components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
@@ -83,6 +109,12 @@ fn is_restorable_folder(output: &Path, default: &Path) -> bool {
 pub enum EngineCommand {
     /// Add a new magnet download.
     Add(TorrentJob),
+    /// Metadata-only preview; no file transfers.
+    Preview {
+        magnet: String,
+        response: mpsc::Sender<Result<TorrentPreview, String>>,
+        cancel: Arc<AtomicBool>,
+    },
     /// Pause the torrent behind a progress key.
     Pause(String),
     /// Resume a previously paused torrent.
@@ -98,6 +130,8 @@ pub struct TorrentJob {
     /// Per-torrent sub-folder created under the session's default output
     /// folder, e.g. `downloads/Barbie Rewind/...`.
     pub sub_folder: PathBuf,
+    pub torrent_bytes: Option<Vec<u8>>,
+    pub only_files: Option<Vec<usize>>,
     pub cancel: Arc<AtomicBool>,
 }
 
@@ -231,6 +265,28 @@ fn spawn_engine(
                     let notice = match command {
                         EngineCommand::Add(job) => {
                             run_job(session, job, progress, cancels, handles).await
+                        }
+                        EngineCommand::Preview {
+                            magnet,
+                            response,
+                            cancel,
+                        } => {
+                            let result = tokio::select! {
+                                result = tokio::time::timeout(
+                                    Duration::from_secs(90),
+                                    preview_torrent(&session, &magnet),
+                                ) => match result {
+                                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                                    Err(_) => Err("토렌트 파일 목록 조회 시간이 초과되었습니다".into()),
+                                },
+                                _ = async {
+                                    while !cancel.load(Ordering::Relaxed) {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                } => return,
+                            };
+                            let _ = response.send(result);
+                            None
                         }
                         EngineCommand::Pause(key) => {
                             let result = pause_torrent(&session, &handles, &key, true).await;
@@ -485,6 +541,49 @@ async fn run_job(
     result.map(|result| EngineNotice::Download { key, result })
 }
 
+async fn preview_torrent(session: &Arc<Session>, magnet: &str) -> Result<TorrentPreview> {
+    let response = session
+        .add_torrent(
+            AddTorrent::from_url(magnet.to_owned()),
+            Some(AddTorrentOptions {
+                list_only: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .context("토렌트 파일 목록을 가져오지 못했습니다")?;
+    let librqbit::AddTorrentResponse::ListOnly(info) = response else {
+        anyhow::bail!("다운로드 없이 파일 목록을 확인할 수 없습니다");
+    };
+    anyhow::ensure!(
+        info.torrent_bytes.len() <= 64 * 1024 * 1024,
+        "토렌트 메타데이터가 64MB를 초과했습니다"
+    );
+    let mut files = Vec::new();
+    for (index, file) in info.info.iter_file_details().enumerate() {
+        anyhow::ensure!(index < 100_000, "토렌트 파일이 너무 많습니다");
+        let path = file.filename.to_pathbuf();
+        anyhow::ensure!(
+            !path.as_os_str().is_empty()
+                && path
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_))),
+            "안전하지 않은 토렌트 파일 경로: {}",
+            path.display()
+        );
+        files.push(TorrentFileEntry {
+            index,
+            path,
+            size: file.len,
+        });
+    }
+    anyhow::ensure!(!files.is_empty(), "이 토렌트에 다운로드할 파일이 없습니다");
+    Ok(TorrentPreview {
+        files,
+        torrent_bytes: info.torrent_bytes.to_vec(),
+    })
+}
+
 async fn add_torrent(
     session: &Arc<Session>,
     job: &TorrentJob,
@@ -494,18 +593,36 @@ async fn add_torrent(
     // separated per game instead of mixing into one flat directory.
     let opts = AddTorrentOptions {
         sub_folder: Some(job.sub_folder.to_string_lossy().into_owned()),
+        only_files: job.only_files.clone(),
+        // Metadata returned by a magnet peer need not carry the original
+        // magnet's tracker URLs. Restore them when starting from the cached
+        // .torrent bytes, otherwise tracker-only/private torrents can stall.
+        trackers: librqbit::Magnet::parse(&job.magnet)
+            .ok()
+            .map(|magnet| magnet.trackers),
         overwrite: true,
         ..Default::default()
     };
-    session
-        .add_torrent(AddTorrent::from_url(job.magnet.clone()), Some(opts))
+    let torrent = match &job.torrent_bytes {
+        Some(bytes) => AddTorrent::from_bytes(bytes.clone()),
+        None => AddTorrent::from_url(job.magnet.clone()),
+    };
+    let handle = session
+        .add_torrent(torrent, Some(opts))
         .await
         .and_then(|response| {
             response
                 .into_handle()
                 .context("이 토렌트는 파일 목록만 조회할 수 있습니다")
         })
-        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(expected) = &job.only_files {
+        anyhow::ensure!(
+            handle.only_files().as_ref() == Some(expected),
+            "토렌트 엔진에 선택된 파일 목록이 적용되지 않았습니다"
+        );
+    }
+    Ok(handle)
 }
 
 impl TorrentEngine {
@@ -566,7 +683,41 @@ impl TorrentEngine {
     }
 
     /// Queue a magnet for download. Returns the progress key.
+    #[cfg(test)]
     pub fn start_download(&self, label: &str, magnet: &str, sub_folder: PathBuf) -> Result<String> {
+        self.start_download_selected(label, magnet, sub_folder, None, None)
+    }
+
+    /// Resolve the magnet metadata without starting a download. The receiver
+    /// is polled by egui; dropping the request cancels metadata resolution.
+    pub fn preview_files(&self, magnet: &str) -> Result<TorrentPreviewRequest> {
+        anyhow::ensure!(
+            magnet.starts_with("magnet:?"),
+            "올바른 마그넷 링크가 아닙니다"
+        );
+        let (response, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.command_tx
+            .send(EngineCommand::Preview {
+                magnet: magnet.to_owned(),
+                response,
+                cancel: cancel.clone(),
+            })
+            .map_err(|_| anyhow::anyhow!("토렌트 엔진이 중지되었습니다"))?;
+        Ok(TorrentPreviewRequest { receiver, cancel })
+    }
+
+    /// Start exactly the files chosen in the metadata preview. The original
+    /// torrent bytes let rqbit apply only_files BEFORE creating any payloads,
+    /// rather than downloading all files and filtering after transfer.
+    pub fn start_download_selected(
+        &self,
+        label: &str,
+        magnet: &str,
+        sub_folder: PathBuf,
+        torrent_bytes: Option<Vec<u8>>,
+        only_files: Option<Vec<usize>>,
+    ) -> Result<String> {
         anyhow::ensure!(
             safe_sub_folder(&sub_folder),
             "다운로드 하위 폴더가 안전하지 않습니다"
@@ -575,12 +726,29 @@ impl TorrentEngine {
             magnet.starts_with("magnet:?"),
             "올바른 마그넷 링크가 아닙니다"
         );
+        if let Some(indices) = &only_files {
+            anyhow::ensure!(!indices.is_empty(), "파일을 하나 이상 선택하세요");
+            let unique = indices
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            anyhow::ensure!(
+                indices.len() == unique.len(),
+                "중복된 토렌트 파일 선택입니다"
+            );
+            anyhow::ensure!(
+                torrent_bytes.is_some(),
+                "파일별 다운로드에는 검증된 토렌트 메타데이터가 필요합니다"
+            );
+        }
         let seq = self.counter.fetch_add(1, Ordering::Relaxed);
         let key = format!("t{seq}");
         let job = TorrentJob {
             key: key.clone(),
             magnet: magnet.to_owned(),
             sub_folder,
+            torrent_bytes,
+            only_files,
             cancel: Arc::new(AtomicBool::new(false)),
         };
         if let Ok(mut cancels) = self.cancels.lock() {

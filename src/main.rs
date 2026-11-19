@@ -16,6 +16,7 @@ mod scanner;
 mod theme;
 mod titledb;
 mod torrent;
+mod torrent_file_picker;
 mod translate;
 mod updater;
 mod xci;
@@ -35,6 +36,13 @@ use std::{
         Arc,
     },
 };
+
+struct CatalogTorrentDialog {
+    item: catalog::CatalogItem,
+    request: Option<torrent::TorrentPreviewRequest>,
+    files: Option<torrent_file_picker::TorrentFilePicker>,
+    error: Option<String>,
+}
 
 const ICON_CACHE_MAX: usize = 144;
 const ICON_LOAD_BUDGET: usize = 16;
@@ -775,6 +783,7 @@ struct NslApp {
     catalog_cover_queue: Option<Receiver<(usize, Vec<String>)>>,
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
+    catalog_torrent_dialog: Option<CatalogTorrentDialog>,
     download_selected: Option<String>,
     download_search: String,
     download_status_filter: String,
@@ -1364,6 +1373,7 @@ impl NslApp {
             catalog_cover_queue: None,
             torrent_engine: None,
             torrent_progress: Vec::new(),
+            catalog_torrent_dialog: None,
             download_selected: None,
             download_search: String::new(),
             download_status_filter: "all".into(),
@@ -1921,6 +1931,37 @@ impl NslApp {
             self.status = "이 항목에는 마그넷 링크가 없습니다".into();
             return;
         }
+        match engine.preview_files(&item.magnet) {
+            Ok(request) => {
+                self.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+                    item: item.clone(),
+                    request: Some(request),
+                    files: None,
+                    error: None,
+                });
+                self.status = "토렌트 파일 목록 확인 중…".into();
+            }
+            Err(error) => self.status = format!("토렌트 파일 목록 조회 실패: {error}"),
+        }
+    }
+
+    /// Called only after the user confirms the metadata file-picker dialog.
+    fn start_selected_catalog_torrent(
+        &mut self,
+        item: &catalog::CatalogItem,
+        picker: torrent_file_picker::TorrentFilePicker,
+    ) {
+        let Some(engine) = self.torrent_engine.clone() else {
+            self.status = "토렌트 엔진을 사용할 수 없습니다".into();
+            return;
+        };
+        let (torrent_bytes, only_files) = match picker.into_transfer() {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.status = error.to_string();
+                return;
+            }
+        };
         let folder_name = match item.base_title_id() {
             Some(id) => id,
             None => Self::sanitize_folder_name(&item.title),
@@ -1938,7 +1979,13 @@ impl NslApp {
             .filter(|hash| !hash.is_empty())
             .unwrap_or_else(|| Self::sanitize_folder_name(&item.topic_id));
         let sub_folder = PathBuf::from(format!("{folder_name}-{suffix}"));
-        match engine.start_download(&item.title, &item.magnet, sub_folder) {
+        match engine.start_download_selected(
+            &item.title,
+            &item.magnet,
+            sub_folder,
+            Some(torrent_bytes),
+            only_files,
+        ) {
             Ok(_) => {
                 self.status = format!("다운로드 시작: {}", truncate_label(&item.title, 60));
                 let _ = self.log_sender.send(format!(
@@ -7830,6 +7877,127 @@ impl NslApp {
                 },
             );
         }
+        if let Some(mut dialog) = self.catalog_torrent_dialog.take() {
+            if let Some(request) = &dialog.request {
+                match request.receiver.try_recv() {
+                    Ok(Ok(preview)) => {
+                        dialog.request = None;
+                        match torrent_file_picker::TorrentFilePicker::new(preview) {
+                            Ok(files) => dialog.files = Some(files),
+                            Err(error) => dialog.error = Some(error.to_string()),
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        dialog.request = None;
+                        dialog.error = Some(error);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        dialog.request = None;
+                        dialog.error = Some("토렌트 파일 목록을 가져올 수 없습니다".into());
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(90));
+                    }
+                }
+            }
+            let mut canceled = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+            let mut confirmed = false;
+            let response = show_centered_popup(
+                ctx,
+                "store_select_torrent_files",
+                "다운로드 파일 선택",
+                None,
+                |window| window.resizable(true).max_width(780.0),
+                |ui| {
+                    ui.set_min_width(520.0);
+                    ui.label(
+                        egui::RichText::new(truncate_label(&dialog.item.title, 85))
+                            .strong()
+                            .size(15.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(
+                            "다운로드할 파일과 하위 폴더를 확인하세요. 기본값은 전체 선택입니다.",
+                        )
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    ui.add_space(4.0);
+                    if let Some(files) = &mut dialog.files {
+                        files.ui(ui);
+                        ui.label(
+                            egui::RichText::new(
+                                "토렌트 조각 무결성과 재개를 위해 미선택 파일에도 일부 경계 조각이 저장될 수 있습니다.",
+                            )
+                            .small()
+                            .color(ui.visuals().weak_text_color()),
+                        );
+                    } else if let Some(error) = &dialog.error {
+                        ui.colored_label(
+                            egui::Color32::LIGHT_RED,
+                            format!("파일 목록 조회 실패: {error}"),
+                        );
+                        ui.label("취소 후 다시 다운로드 버튼을 누르면 재시도할 수 있습니다.");
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("토렌트 메타데이터를 받는 중… 파일 다운로드는 아직 시작되지 않았습니다.");
+                        });
+                        ui.label(
+                            "연결할 피어가 없으면 파일 목록을 가져오는 데 시간이 걸릴 수 있습니다.",
+                        );
+                    }
+                    popup_footer(ui, |ui| {
+                        let confirm = ui.add_enabled(
+                            dialog
+                                .files
+                                .as_ref()
+                                .is_some_and(|files| files.selected_count() > 0),
+                            egui::Button::new("선택한 파일 다운로드"),
+                        );
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_torrent_confirm_button"),
+                                confirm.rect,
+                            );
+                        });
+                        if confirm.clicked() {
+                            confirmed = true;
+                        }
+                        let cancel = ui.button("취소");
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_torrent_cancel_button"),
+                                cancel.rect,
+                            );
+                        });
+                        if cancel.clicked() {
+                            canceled = true;
+                        }
+                    });
+                },
+            );
+            #[cfg(test)]
+            if let Some(response) = response {
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("nsl_test_torrent_file_selection_popup"),
+                        response.response.rect,
+                    );
+                });
+            }
+            #[cfg(not(test))]
+            let _ = response;
+            if confirmed {
+                if let Some(files) = dialog.files.take() {
+                    self.start_selected_catalog_torrent(&dialog.item, files);
+                }
+            } else if !canceled {
+                self.catalog_torrent_dialog = Some(dialog);
+            }
+        }
         if let Some((key, name)) = self.download_delete_confirm.clone() {
             show_centered_popup(
                 ctx,
@@ -10276,6 +10444,115 @@ mod runtime_tests {
         );
         assert_eq!(app.download_selected.as_deref(), Some("job-b"));
         assert_eq!(app.torrent_progress.len(), 2);
+    }
+
+    #[test]
+    fn store_download_popup_selects_nested_directories_and_can_cancel() {
+        let (mut app, _dir) = seeded_app();
+        let ctx = run_app_ticks(&mut app, 2);
+        wait_for_rows(&mut app, &ctx);
+        app.folder_filter = "CATALOG".into();
+        app.torrent_engine = None;
+        let preview = torrent::TorrentPreview {
+            files: vec![
+                torrent::TorrentFileEntry {
+                    index: 0,
+                    path: PathBuf::from("game/base/a.nsp"),
+                    size: 100,
+                },
+                torrent::TorrentFileEntry {
+                    index: 1,
+                    path: PathBuf::from("game/dlc/extra.nsp"),
+                    size: 55,
+                },
+                torrent::TorrentFileEntry {
+                    index: 2,
+                    path: PathBuf::from("readme.txt"),
+                    size: 5,
+                },
+            ],
+            torrent_bytes: vec![1, 2, 3],
+        };
+        app.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+            item: catalog::CatalogItem {
+                title: "Nested torrent QA".into(),
+                topic_id: "nested-folder-test".into(),
+                magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".into(),
+                ..Default::default()
+            },
+            request: None,
+            files: Some(torrent_file_picker::TorrentFilePicker::new(preview).unwrap()),
+            error: None,
+        });
+        draw_card_test_frames(&ctx, &mut app, 3);
+        let popup = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_file_selection_popup"))
+                .expect("file-picker popup not visible")
+        });
+        assert!(popup.width() >= 480.0 && popup.height() > 145.0);
+        assert_eq!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .selected_count(),
+            3
+        );
+        let clear = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_clear_all"))
+                .unwrap()
+        });
+        click_cell(&ctx, &mut app, clear.center(), 1456.0, 900.0);
+        assert_eq!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .selected_count(),
+            0
+        );
+        let folder = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new(("nsl_test_torrent_node_checkbox", "game")))
+                .expect("game directory checkbox missing")
+        });
+        click_cell(&ctx, &mut app, folder.center(), 1456.0, 900.0);
+        assert_eq!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .selected_ids(),
+            vec![0, 1],
+            "checking parent folder must recursively include DLC subdirectory"
+        );
+        let all = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_select_all"))
+                .unwrap()
+        });
+        click_cell(&ctx, &mut app, all.center(), 1456.0, 900.0);
+        assert_eq!(
+            app.catalog_torrent_dialog
+                .as_ref()
+                .unwrap()
+                .files
+                .as_ref()
+                .unwrap()
+                .selected_count(),
+            3
+        );
+        let cancel = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_cancel_button"))
+                .unwrap()
+        });
+        click_cell(&ctx, &mut app, cancel.center(), 1456.0, 900.0);
+        assert!(app.catalog_torrent_dialog.is_none());
+        assert!(app.torrent_progress.is_empty());
     }
 
     #[test]

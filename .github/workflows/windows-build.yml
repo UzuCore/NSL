@@ -31,7 +31,9 @@ jobs:
         run: .\scripts\verify-package.ps1 -PackageZip .\dist\nsl-win64.zip -StagingDir .\build\package
 
       - name: Verify automatic update replacement and rollback
-        shell: pwsh
+        # The updater itself launches Windows PowerShell (powershell.exe).
+        # Test under the same host so inherited PSModulePath is representative.
+        shell: powershell
         run: .\scripts\test-auto-update.ps1 -RunDelayedFailure
 
       - name: Upload Windows distribution

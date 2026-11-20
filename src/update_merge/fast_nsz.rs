@@ -9,7 +9,10 @@
 use super::{compression_options, validate_selected_cnmts};
 use anyhow::{ensure, Context, Result};
 use nsrp_core::{
-    formats::pfs0::{build_from_sources, Pfs0Entry, Pfs0Index, Pfs0Source},
+    formats::{
+        ncz_stream::validate_ncz_region_layout,
+        pfs0::{build_from_sources, Pfs0Entry, Pfs0Index, Pfs0Source},
+    },
     keys::KeySet,
     ops::{
         cnmt::{self, CnmtInfo, ContentMetaType},
@@ -18,6 +21,8 @@ use nsrp_core::{
 };
 use std::{
     collections::{BTreeMap, HashSet},
+    fs::File,
+    io::BufReader,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -226,6 +231,32 @@ fn compose_nsz(
         }
     }
     ensure!(ncz_count > 0, "압축된 NCA가 없는 NSZ 병합 결과");
+    // Passthrough must not turn a malformed original NCZ into a freshly
+    // published package. This reads only headers/block-size tables; even an
+    // 8 GiB NCZ is inspected without inflating its encrypted content.
+    let mut readers = BTreeMap::<PathBuf, BufReader<File>>::new();
+    for (name, source) in &files {
+        if !name.to_ascii_lowercase().ends_with(".ncz") {
+            continue;
+        }
+        ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "병합 작업이 중단되었습니다"
+        );
+        if let Pfs0Source::Region {
+            container,
+            offset,
+            size,
+        } = source
+        {
+            if !readers.contains_key(container) {
+                readers.insert(container.clone(), BufReader::new(File::open(container)?));
+            }
+            let reader = readers.get_mut(container).context("NCZ 원본 열기 실패")?;
+            validate_ncz_region_layout(reader, *offset, *size)
+                .with_context(|| format!("병합 NCZ 헤더 구조 오류: {name}"))?;
+        }
+    }
     // PFS0 validates every source range, streams in 2MiB bounded chunks,
     // checks cancellation, and removes its .partial output on failure.
     build_from_sources(&files, output, cancel)?;
@@ -334,7 +365,25 @@ pub(super) fn try_merge_nsz_fast(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nsrp_core::formats::pfs0::build_from_paths;
+    use nsrp_core::formats::{
+        ncz::{self, NczSection, ENC_NONE, NCZ_HEADER_SIZE},
+        pfs0::build_from_paths,
+    };
+
+    fn valid_ncz(body: &[u8]) -> Result<Vec<u8>> {
+        ncz::build_streaming(
+            &vec![0x53; NCZ_HEADER_SIZE],
+            body,
+            &[NczSection {
+                offset: NCZ_HEADER_SIZE as u64,
+                size: body.len() as u64,
+                crypto_type: ENC_NONE,
+                crypto_key: [0; 16],
+                crypto_counter: [0; 16],
+            }],
+            3,
+        )
+    }
 
     fn fake_cnmt(source: usize, title_id: &str, nca_id: &str, version: u32) -> Candidate {
         Candidate {
@@ -372,8 +421,8 @@ mod tests {
         let meta_base = temp.path().join("meta_base");
         let meta_patch = temp.path().join("meta_patch");
         let ticket = temp.path().join("ticket");
-        std::fs::write(&base_payload, b"already-compressed-original-bytes")?;
-        std::fs::write(&update_payload, b"compressed-new-update-bytes")?;
+        std::fs::write(&base_payload, valid_ncz(b"original encrypted body")?)?;
+        std::fs::write(&update_payload, valid_ncz(b"update encrypted body")?)?;
         std::fs::write(&meta_base, b"base-cnmt-remains-uncompressed")?;
         std::fs::write(&meta_patch, b"patch-cnmt-remains-uncompressed")?;
         std::fs::write(&ticket, b"original-ticket-bytes")?;
@@ -441,6 +490,63 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_base_ncz_before_creating_any_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base_id = "0100111122220000";
+        let update_id = "0100111122220800";
+        let base_nca = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let update_nca = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let invalid_base = temp.path().join("bad_ncz");
+        let update = temp.path().join("update_ncz");
+        let meta_base = temp.path().join("meta_base");
+        let meta_update = temp.path().join("meta_update");
+        let mut damaged = valid_ncz(b"original ciphertext")?;
+        damaged[NCZ_HEADER_SIZE] = b'X';
+        std::fs::write(&invalid_base, damaged)?;
+        std::fs::write(&update, valid_ncz(b"updated ciphertext")?)?;
+        std::fs::write(&meta_base, b"base meta")?;
+        std::fs::write(&meta_update, b"update meta")?;
+        let base_path = temp.path().join("base.nsz");
+        let patch_path = temp.path().join("patch.nsp");
+        let compressed_patch_path = temp.path().join("patch.nsz");
+        build_from_paths(
+            &[
+                (format!("{base_nca}.ncz"), invalid_base),
+                (format!("{base_id}.cnmt.nca"), meta_base),
+            ],
+            &base_path,
+        )?;
+        build_from_paths(
+            &[(format!("{update_id}.cnmt.nca"), meta_update)],
+            &patch_path,
+        )?;
+        build_from_paths(
+            &[(format!("{update_nca}.ncz"), update)],
+            &compressed_patch_path,
+        )?;
+
+        let output = temp.path().join("never_create.nsz");
+        let result = compose_nsz(
+            &[
+                fake_cnmt(0, base_id, base_nca, 0),
+                fake_cnmt(1, update_id, update_nca, 65536),
+            ],
+            &IndexedSource::open(&base_path)?,
+            &IndexedSource::open(&patch_path)?,
+            &IndexedSource::open(&compressed_patch_path)?,
+            &output,
+            &AtomicBool::new(false),
+        );
+        ensure!(result.is_err(), "damaged base NCZ was accepted");
+        ensure!(!output.exists(), "invalid NCZ produced final output");
+        ensure!(
+            !output.with_extension("nsz.partial").exists(),
+            "invalid NCZ left partial output"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn missing_mandatory_content_and_cancel_do_not_publish_nsz() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let base_id = "0100111122220000";
@@ -450,7 +556,7 @@ mod tests {
         let nca = temp.path().join("nc");
         std::fs::write(&meta_base, b"base-meta")?;
         std::fs::write(&meta_patch, b"patch-meta")?;
-        std::fs::write(&nca, b"original-ncz")?;
+        std::fs::write(&nca, valid_ncz(b"original NCA payload")?)?;
         let base_path = temp.path().join("base.nsz");
         let patch_path = temp.path().join("patch.nsp");
         build_from_paths(

@@ -2,6 +2,42 @@
 use super::*;
 use sha2::Digest;
 
+/// No decompression, re-encoding, or modification of source NSZ. Validates
+/// the exact compressed ranges the Stage 5 passthrough will use.
+#[test]
+#[ignore = "requires NSL_QA_ROOT and NSL_QA_BASE pointing to an isolated, read-only NSZ"]
+fn real_package_ncz_passthrough_preflight_readonly() {
+    use nsrp_core::formats::{ncz_stream::validate_ncz_region_layout, pfs0::Pfs0Index};
+    use std::io::BufReader;
+
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let source = std::fs::canonicalize(std::env::var("NSL_QA_BASE").unwrap()).unwrap();
+    assert!(source.starts_with(&root));
+    assert!(source
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")));
+    let index = Pfs0Index::parse(&source).unwrap();
+    let mut reader = BufReader::new(File::open(&source).unwrap());
+    let mut count = 0u64;
+    let mut reconstructed_size = 0u64;
+    for entry in &index.entries {
+        if !entry.name.to_ascii_lowercase().ends_with(".ncz") {
+            continue;
+        }
+        let restored =
+            validate_ncz_region_layout(&mut reader, index.data_start + entry.offset, entry.size)
+                .unwrap_or_else(|error| panic!("malformed NCZ {}: {error}", entry.name));
+        assert!(restored >= 0x4000);
+        reconstructed_size += restored;
+        count += 1;
+    }
+    assert!(count > 0, "read-only sample contains no NCZ");
+    println!(
+        "NSL_STAGE5_NCZ_READONLY_PREFLIGHT_PASS blocks={count} reconstructed_bytes={reconstructed_size}"
+    );
+}
+
 /// Fast NSZ composition against read-only, explicitly isolated game copies.
 /// A reference from the previous fully SHA-256 verified Stage 3 output can
 /// additionally prove every decompressed NCA is byte-identical. For very
@@ -73,6 +109,44 @@ fn real_package_fast_nsz_equivalence() {
         index.entries.len(),
         compressed,
     );
+    if let Ok(path) = std::env::var("NSL_QA_EDEN_EXPORT") {
+        use std::io::Write;
+        let destination = PathBuf::from(path);
+        let parent = std::fs::canonicalize(destination.parent().unwrap()).unwrap();
+        assert!(
+            parent.starts_with(&root),
+            "Eden output must be under QA root"
+        );
+        assert!(
+            destination
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")),
+            "Eden QA output must have an NSZ extension"
+        );
+        // Exclusive creation rejects overwriting any pre-existing user or QA
+        // file. On failure, remove only the file just created by this test.
+        let mut copied = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .unwrap();
+        let result = (|| -> std::io::Result<u64> {
+            let copied_bytes = std::io::copy(&mut File::open(&output)?, &mut copied)?;
+            copied.flush()?;
+            copied.sync_all()?;
+            Ok(copied_bytes)
+        })();
+        if result.is_err() {
+            drop(copied);
+            let _ = std::fs::remove_file(&destination);
+        }
+        assert_eq!(result.unwrap(), std::fs::metadata(&output).unwrap().len());
+        println!(
+            "NSL_STAGE5_EDEN_ISOLATED_ARTIFACT={}",
+            destination.display()
+        );
+    }
     if std::env::var("NSL_QA_STRUCTURAL_ONLY").ok().as_deref() == Some("1") {
         return;
     }

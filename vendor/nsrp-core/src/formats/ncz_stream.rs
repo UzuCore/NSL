@@ -78,6 +78,65 @@ struct RegionHeader {
     compressed_offset: u64,
 }
 
+/// Validate NCZ framing without inflating the zstd body. This is suitable
+/// before passthrough, but is not a cryptographic content-integrity check.
+pub fn validate_ncz_region_layout<R: Read + Seek>(
+    reader: &mut R,
+    ncz_base: u64,
+    ncz_size: u64,
+) -> Result<u64> {
+    let header = parse_region_header(reader, ncz_base, ncz_size)?;
+    Ok(NCZ_HEADER_SIZE as u64 + validate_region_layout(&header, ncz_size)?)
+}
+
+fn validate_region_layout(header: &RegionHeader, ncz_size: u64) -> Result<u64> {
+    let body_expected = validated_ncz_body_size(&header.sections)?;
+    if let Some(block) = &header.block {
+        ensure!(
+            block.decompressed_size == body_expected,
+            "NCZBLOCK decompressed size disagrees with the NCA section table"
+        );
+        ensure!(
+            (14..=24).contains(&block.block_size_exponent),
+            "NCZBLOCK block exponent outside the safe range"
+        );
+        let block_size = 1u64 << block.block_size_exponent;
+        let preceding = (block.compressed_sizes.len() as u64)
+            .checked_sub(1)
+            .and_then(|n| n.checked_mul(block_size))
+            .context("NCZBLOCK block count overflow")?;
+        ensure!(
+            block.decompressed_size > preceding
+                && block.decompressed_size <= preceding + block_size,
+            "NCZBLOCK block count does not match its declared size"
+        );
+        let limit = zstd::zstd_safe::compress_bound(block_size as usize);
+        let mut encoded_total = 0u64;
+        for &size in &block.compressed_sizes {
+            ensure!(
+                size > 0 && size as usize <= limit,
+                "NCZBLOCK encoded block size is invalid"
+            );
+            encoded_total = encoded_total
+                .checked_add(size as u64)
+                .context("NCZBLOCK encoded size overflow")?;
+        }
+        ensure!(
+            header
+                .compressed_offset
+                .checked_add(encoded_total)
+                .is_some_and(|end| end <= ncz_size),
+            "NCZBLOCK encoded payload exceeds the archive entry"
+        );
+    } else {
+        ensure!(
+            header.compressed_offset < ncz_size,
+            "NCZ zstd stream is missing"
+        );
+    }
+    Ok(body_expected)
+}
+
 /// NCZ가 NSP/NSZ 내부에 있어도 전체 엔트리를 메모리에 올리지 않고 NCA로 복원한다.
 pub fn decompress_ncz_region_to_nca<R, W, F>(
     reader: &mut R,
@@ -94,13 +153,7 @@ where
 {
     ensure!(!cancel.load(Ordering::Relaxed), "작업이 중단되었습니다");
     let header = parse_region_header(reader, ncz_base, ncz_size)?;
-    let body_expected = validated_ncz_body_size(&header.sections)?;
-    if let Some(block) = &header.block {
-        ensure!(
-            block.decompressed_size == body_expected,
-            "NCZBLOCK decompressed size disagrees with the NCA section table"
-        );
-    }
+    let body_expected = validate_region_layout(&header, ncz_size)?;
     // Reject malformed metadata and cancellation before publishing any
     // reconstructed NCA header to the caller.
     out.write_all(&header.original)?;
@@ -108,38 +161,11 @@ where
     let mut processed = 0u64;
     if let Some(block) = &header.block {
         reader.seek(SeekFrom::Start(ncz_base + header.compressed_offset))?;
-        ensure!(
-            (14..=24).contains(&block.block_size_exponent),
-            "NCZBLOCK 블록 지수가 안전 범위를 벗어났습니다"
-        );
         let block_size = 1usize
             .checked_shl(block.block_size_exponent as u32)
             .context("NCZBLOCK 크기 오류")?;
         let count = block.compressed_sizes.len();
         let full_blocks = (count - 1) as u64 * block_size as u64;
-        ensure!(
-            block.decompressed_size > full_blocks
-                && block.decompressed_size <= full_blocks + block_size as u64,
-            "NCZBLOCK 블록 수와 원본 크기가 일치하지 않습니다"
-        );
-        let max_encoded = zstd::zstd_safe::compress_bound(block_size);
-        let mut encoded_bytes = 0u64;
-        for &size in &block.compressed_sizes {
-            ensure!(
-                size > 0 && size as usize <= max_encoded,
-                "NCZBLOCK 블록의 압축 크기가 비정상입니다"
-            );
-            encoded_bytes = encoded_bytes
-                .checked_add(u64::from(size))
-                .context("NCZBLOCK 압축 크기 오버플로")?;
-        }
-        ensure!(
-            header
-                .compressed_offset
-                .checked_add(encoded_bytes)
-                .is_some_and(|end| end <= ncz_size),
-            "NCZBLOCK 데이터가 원본 엔트리를 벗어납니다"
-        );
 
         // Independent blocks can be decoded and encrypted concurrently,
         // while the shared input and output remain strictly ordered.
@@ -249,9 +275,6 @@ where
             bail!("NCZBLOCK 전체 해제 크기 불일치");
         }
     } else {
-        if header.compressed_offset >= ncz_size {
-            bail!("NCZ zstd 스트림이 없습니다");
-        }
         reader.seek(SeekFrom::Start(ncz_base + header.compressed_offset))?;
         let limited = reader.take(ncz_size - header.compressed_offset);
         let mut decoder = zstd::stream::read::Decoder::new(limited)?;
@@ -749,6 +772,8 @@ mod stage14_tests {
     #[test]
     fn block_multithread_roundtrip_matches_every_byte() -> Result<()> {
         let (nca, ncz) = fixture()?;
+        let layout_size = validate_ncz_region_layout(&mut Cursor::new(&ncz), 0, ncz.len() as u64)?;
+        ensure!(layout_size == nca.len() as u64, "NCZ layout size differs");
         let mut restored = Vec::new();
         let count = decompress_ncz_region_to_nca(
             &mut Cursor::new(&ncz),
@@ -760,6 +785,68 @@ mod stage14_tests {
         )?;
         ensure!(count as usize == nca.len());
         ensure!(restored == nca, "parallel NCZ roundtrip differs");
+        Ok(())
+    }
+
+    #[test]
+    fn passthrough_preflight_rejects_invalid_block_layout_before_any_output() -> Result<()> {
+        let (nca, original) = fixture()?;
+        let prefix = vec![0x77; 113];
+        let mut wrapped = prefix.clone();
+        wrapped.extend_from_slice(&original);
+        ensure!(
+            validate_ncz_region_layout(
+                &mut Cursor::new(&wrapped),
+                prefix.len() as u64,
+                original.len() as u64,
+            )? == nca.len() as u64,
+            "nonzero-offset NCZ layout rejected"
+        );
+
+        let block_offset = NCZ_HEADER_SIZE + 16 + 64;
+        let mut cases = Vec::new();
+        let mut bad_exponent = original.clone();
+        bad_exponent[block_offset + 8 + 3] = 31;
+        cases.push(("huge block exponent", bad_exponent));
+
+        let mut bad_decompressed_size = original.clone();
+        bad_decompressed_size[block_offset + 16..block_offset + 24]
+            .copy_from_slice(&1i64.to_le_bytes());
+        cases.push(("declared NCA size mismatch", bad_decompressed_size));
+
+        let mut huge_block_length = original.clone();
+        huge_block_length[block_offset + 24..block_offset + 28]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(("huge encoded block", huge_block_length));
+
+        let mut truncated_payload = original.clone();
+        truncated_payload.truncate(truncated_payload.len() - 128);
+        cases.push(("payload truncated after size index", truncated_payload));
+
+        for (case, bytes) in cases {
+            ensure!(
+                validate_ncz_region_layout(&mut Cursor::new(&bytes), 0, bytes.len() as u64)
+                    .is_err(),
+                "malformed passthrough layout accepted: {case}"
+            );
+            let mut output = Vec::new();
+            ensure!(
+                decompress_ncz_region_to_nca(
+                    &mut Cursor::new(&bytes),
+                    0,
+                    bytes.len() as u64,
+                    &mut output,
+                    &AtomicBool::new(false),
+                    |_, _| {},
+                )
+                .is_err(),
+                "malformed NCZ decompression accepted: {case}"
+            );
+            ensure!(
+                output.is_empty(),
+                "malformed layout emitted an NCA header: {case}"
+            );
+        }
         Ok(())
     }
 

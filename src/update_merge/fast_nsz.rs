@@ -3,8 +3,9 @@
 //! The ordinary NSRP route inflates the entire base NSZ to a temporary NSP,
 //! extracts each NCA again, builds an intermediate NSP and then recompresses
 //! it. This path keeps the original compressed NCA bytes and only compresses
-//! the (usually much smaller) update NSP. Both CNMTs are still decoded with
-//! the native metadata reader and the final package is verified by the caller.
+//! updates that are still NSP. Already-compressed NSZ updates are copied
+//! directly as well. Both CNMTs are decoded by the native metadata reader
+//! and the final package is verified by the caller.
 
 use super::{compression_options, validate_selected_cnmts};
 use anyhow::{ensure, Context, Result};
@@ -297,10 +298,12 @@ pub(super) fn try_merge_nsz_fast(
             .unwrap_or("")
             .to_ascii_lowercase()
     };
-    if ext(original) != "nsz" || ext(patch) != "nsp" {
+    let patch_is_nsz = ext(patch) == "nsz";
+    if ext(original) != "nsz" || !(ext(patch) == "nsp" || patch_is_nsz) {
         return Ok(None);
     }
     let base = IndexedSource::open(original)?;
+    let raw_patch = IndexedSource::open(patch)?;
     // A compressed CNMT requires materializing the metadata NCA first.
     // The traditional NSRP path already handles that uncommon layout.
     if !base
@@ -313,6 +316,23 @@ pub(super) fn try_merge_nsz_fast(
             .entries
             .iter()
             .any(|entry| entry.name.to_ascii_lowercase().ends_with(".cnmt.ncz"))
+    {
+        return Ok(None);
+    }
+    // Compressed metadata cannot be decoded in place. Preserve the legacy
+    // fallback for unusual NSZ patches, and reject misnamed uncompressed
+    // packages before allocating any output.
+    if patch_is_nsz
+        && (!raw_patch
+            .index
+            .entries
+            .iter()
+            .any(|entry| entry.name.to_ascii_lowercase().ends_with(".ncz"))
+            || raw_patch
+                .index
+                .entries
+                .iter()
+                .any(|entry| entry.name.to_ascii_lowercase().ends_with(".cnmt.ncz")))
     {
         return Ok(None);
     }
@@ -331,30 +351,34 @@ pub(super) fn try_merge_nsz_fast(
         prod_keys,
         cancel,
     )
-    .context("업데이트 NSP CNMT 분석 실패")?;
+    .context("업데이트 NSP/NSZ CNMT 분석 실패")?;
     let Some(candidates) = latest_candidates(base_id, version, &base_cnmts, &patch_cnmts)? else {
         return Ok(None);
     };
 
-    let patch_nsz = work.join("fast_patch.nsz");
-    compress::compress_nsp(
-        patch,
-        &patch_nsz,
-        keys,
-        &compression_options(),
-        cancel,
-        &mut |_| {},
-        &mut |_| {},
-    )
-    .context("업데이트 NSP 독립 압축 실패")?;
-    let raw_patch = IndexedSource::open(patch)?;
-    let compressed_patch = IndexedSource::open(&patch_nsz)?;
+    let compressed_patch = if patch_is_nsz {
+        // Reuse already compressed update NCZ without decoding or re-encoding.
+        None
+    } else {
+        let patch_nsz = work.join("fast_patch.nsz");
+        compress::compress_nsp(
+            patch,
+            &patch_nsz,
+            keys,
+            &compression_options(),
+            cancel,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .context("업데이트 NSP 독립 압축 실패")?;
+        Some(IndexedSource::open(&patch_nsz)?)
+    };
     let output = work.join("fast_merged.nsz");
     let count = compose_nsz(
         &candidates,
         &base,
         &raw_patch,
-        &compressed_patch,
+        compressed_patch.as_ref().unwrap_or(&raw_patch),
         &output,
         cancel,
     )?;
@@ -542,6 +566,127 @@ mod tests {
         ensure!(
             !output.with_extension("nsz.partial").exists(),
             "invalid NCZ left partial output"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_precompressed_nsz_packages_are_merged_without_reencoding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base_id = "0100111122220000";
+        let update_id = "0100111122220800";
+        let base_nca = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let update_nca = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let base_bytes = valid_ncz(b"already compressed base content")?;
+        let update_bytes = valid_ncz(b"already compressed patch content")?;
+        let base_blob = temp.path().join("base_payload");
+        let patch_blob = temp.path().join("patch_payload");
+        let base_meta = temp.path().join("base_meta");
+        let patch_meta = temp.path().join("patch_meta");
+        let patch_ticket = temp.path().join("patch_ticket");
+        std::fs::write(&base_blob, &base_bytes)?;
+        std::fs::write(&patch_blob, &update_bytes)?;
+        std::fs::write(&base_meta, b"base CNMT bytes")?;
+        std::fs::write(&patch_meta, b"patch CNMT bytes")?;
+        std::fs::write(&patch_ticket, b"ticket bytes")?;
+        let base_path = temp.path().join("base.nsz");
+        let patch_path = temp.path().join("patch.nsz");
+        build_from_paths(
+            &[
+                (format!("{base_nca}.ncz"), base_blob),
+                (format!("{base_id}.cnmt.nca"), base_meta),
+            ],
+            &base_path,
+        )?;
+        build_from_paths(
+            &[
+                (format!("{update_nca}.ncz"), patch_blob),
+                (format!("{update_id}.cnmt.nca"), patch_meta),
+                (format!("{update_id}0000000000000000.tik"), patch_ticket),
+            ],
+            &patch_path,
+        )?;
+        let base = IndexedSource::open(&base_path)?;
+        let patch = IndexedSource::open(&patch_path)?;
+        let output = temp.path().join("combined.nsz");
+        let candidates = [
+            fake_cnmt(0, base_id, base_nca, 0),
+            fake_cnmt(1, update_id, update_nca, 65536),
+        ];
+        assert_eq!(
+            compose_nsz(
+                &candidates,
+                &base,
+                &patch,
+                &patch,
+                &output,
+                &AtomicBool::new(false),
+            )?,
+            2
+        );
+        let combined = Pfs0Index::parse(&output)?;
+        assert_eq!(combined.entries.len(), 5);
+        assert_eq!(
+            combined.read_entry(&output, combined.entry(&format!("{base_nca}.ncz")).unwrap())?,
+            base_bytes,
+        );
+        assert_eq!(
+            combined.read_entry(
+                &output,
+                combined.entry(&format!("{update_nca}.ncz")).unwrap()
+            )?,
+            update_bytes,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compressed_cnmt_update_falls_back_without_creating_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base_id = "0100111122220000";
+        let update_id = "0100111122220800";
+        let base_blob = temp.path().join("base_blob");
+        let patch_blob = temp.path().join("patch_blob");
+        let meta = temp.path().join("meta");
+        std::fs::write(&base_blob, valid_ncz(b"base payload")?)?;
+        std::fs::write(&patch_blob, valid_ncz(b"patch payload")?)?;
+        std::fs::write(&meta, b"uncompressed CNMT")?;
+        let base_path = temp.path().join("base.nsz");
+        let patch_path = temp.path().join("patch.nsz");
+        build_from_paths(
+            &[
+                ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ncz".into(), base_blob),
+                (format!("{base_id}.cnmt.nca"), meta.clone()),
+            ],
+            &base_path,
+        )?;
+        build_from_paths(
+            &[
+                ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ncz".into(), patch_blob),
+                (format!("{update_id}.cnmt.ncz"), meta),
+            ],
+            &patch_path,
+        )?;
+        let result = try_merge_nsz_fast(
+            FastNszRequest {
+                original: &base_path,
+                patch: &patch_path,
+                base_id,
+                version: 65536,
+                work: temp.path(),
+                disabled_tool: &temp.path().join("no_tools.exe"),
+                prod_keys: &temp.path().join("missing_keys"),
+            },
+            &mut KeySet::default(),
+            &AtomicBool::new(false),
+        )?;
+        ensure!(
+            result.is_none(),
+            "compressed CNMT used the unsafe fast path"
+        );
+        ensure!(
+            !temp.path().join("fast_merged.nsz").exists(),
+            "unsupported layout produced an output"
         );
         Ok(())
     }

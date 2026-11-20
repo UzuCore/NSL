@@ -2,6 +2,29 @@
 use super::*;
 use sha2::Digest;
 
+fn qa_pfs0_region_sha256(
+    path: &Path,
+    index: &nsrp_core::formats::pfs0::Pfs0Index,
+    entry: &nsrp_core::formats::pfs0::Pfs0Entry,
+) -> [u8; 32] {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut input = File::open(path).unwrap();
+    input
+        .seek(SeekFrom::Start(index.data_start + entry.offset))
+        .unwrap();
+    let mut remaining = entry.size;
+    let mut buffer = vec![0u8; 1 << 20];
+    let mut digest = sha2::Sha256::new();
+    while remaining != 0 {
+        let amount = remaining.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..amount]).unwrap();
+        digest.update(&buffer[..amount]);
+        remaining -= amount as u64;
+    }
+    digest.finalize().into()
+}
+
 /// No decompression, re-encoding, or modification of source NSZ. Validates
 /// the exact compressed ranges the Stage 5 passthrough will use.
 #[test]
@@ -69,11 +92,30 @@ fn real_package_fast_nsz_equivalence() {
     let mut keys = KeySet::load_with_local_title_keys(&prod_keys).unwrap();
     let tool = temp.path().join("_external_tools_disabled.exe");
     let cancel = AtomicBool::new(false);
+    let precompress_patch = std::env::var("NSL_QA_PRECOMPRESS_PATCH").ok().as_deref() == Some("1");
+    let patch_nsz = temp.path().join("independent_patch.nsz");
+    if precompress_patch {
+        compress::compress_nsp(
+            &patch,
+            &patch_nsz,
+            &mut keys,
+            &compression_options(),
+            &cancel,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+    let merge_patch = if precompress_patch {
+        &patch_nsz
+    } else {
+        &patch
+    };
     let started = Instant::now();
     let output = fast_nsz::try_merge_nsz_fast(
         fast_nsz::FastNszRequest {
             original: &base,
-            patch: &patch,
+            patch: merge_patch,
             base_id: &base_id,
             version,
             work: temp.path(),
@@ -85,6 +127,12 @@ fn real_package_fast_nsz_equivalence() {
     )
     .unwrap()
     .expect("isolated NSZ + NSP samples should use the fast path");
+    if precompress_patch {
+        assert!(
+            !temp.path().join("fast_patch.nsz").exists(),
+            "already compressed NSZ update was redundantly re-encoded"
+        );
+    }
     let elapsed = started.elapsed();
     let index = nsrp_core::formats::pfs0::Pfs0Index::parse(&output).unwrap();
     let compressed = index
@@ -93,6 +141,34 @@ fn real_package_fast_nsz_equivalence() {
         .filter(|entry| entry.name.to_ascii_lowercase().ends_with(".ncz"))
         .count();
     assert!(compressed > 0);
+    if precompress_patch {
+        let mut passthrough_counts = [0usize; 2];
+        for (position, source) in [&base, &patch_nsz].iter().enumerate() {
+            let source_index = nsrp_core::formats::pfs0::Pfs0Index::parse(source).unwrap();
+            for entry in source_index
+                .entries
+                .iter()
+                .filter(|entry| entry.name.to_ascii_lowercase().ends_with(".ncz"))
+            {
+                let Some(final_entry) = index.entry(&entry.name) else {
+                    continue;
+                };
+                assert_eq!(entry.size, final_entry.size);
+                assert_eq!(
+                    qa_pfs0_region_sha256(source, &source_index, entry),
+                    qa_pfs0_region_sha256(&output, &index, final_entry),
+                    "compressed NCZ bytes were changed: {}",
+                    entry.name
+                );
+                passthrough_counts[position] += 1;
+            }
+        }
+        assert!(passthrough_counts.iter().all(|&count| count > 0));
+        println!(
+            "NSL_STAGE6_DUAL_NSZ_BYTE_PASSTHROUGH_PASS base={} update={}",
+            passthrough_counts[0], passthrough_counts[1]
+        );
+    }
     let (_, cnmts, _) = cnmt::discover_game_metadata(
         &output,
         &temp.path().join("verify"),
@@ -209,21 +285,47 @@ fn real_package_fast_nsz_end_to_end_publish() {
     std::fs::copy(&original, &base_copy).unwrap();
     std::fs::copy(&patch, &patch_copy).unwrap();
     let base_hash = file_sha256(&base_copy);
-    let patch_hash = file_sha256(&patch_copy);
-    let output = merge_verified_package(&base_copy, &patch_copy, &base_id, version).unwrap();
+    let raw_patch_hash = file_sha256(&patch_copy);
+    let compressed_patch = temp.path().join("patch.nsz");
+    let precompress_patch = std::env::var("NSL_QA_PRECOMPRESS_PATCH").ok().as_deref() == Some("1");
+    if precompress_patch {
+        let prod_keys = scanner::prod_keys().unwrap();
+        let mut keys = KeySet::load_with_local_title_keys(&prod_keys).unwrap();
+        compress::compress_nsp(
+            &patch_copy,
+            &compressed_patch,
+            &mut keys,
+            &compression_options(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+    }
+    let effective_patch = if precompress_patch {
+        &compressed_patch
+    } else {
+        &patch_copy
+    };
+    let patch_hash = file_sha256(effective_patch);
+    let output = merge_verified_package(&base_copy, effective_patch, &base_id, version).unwrap();
     assert!(output.starts_with(temp.path()) && output.is_file());
     assert_eq!(output.extension().and_then(|ext| ext.to_str()), Some("nsz"));
     let output_size = std::fs::metadata(&output).unwrap().len();
     assert!(output_size > 0);
     assert_eq!(
-        merge_or_recover_existing(&base_copy, &patch_copy, &base_id, version).unwrap(),
+        merge_or_recover_existing(&base_copy, effective_patch, &base_id, version).unwrap(),
         output
     );
-    assert!(merge_verified_package(&base_copy, &patch_copy, &base_id, version).is_err());
+    assert!(merge_verified_package(&base_copy, effective_patch, &base_id, version).is_err());
     assert_eq!(std::fs::metadata(&output).unwrap().len(), output_size);
     assert_eq!(file_sha256(&base_copy), base_hash);
-    assert_eq!(file_sha256(&patch_copy), patch_hash);
-    println!("NSL_STAGE4_PUBLISH_RECOVERY_INPUT_IMMUTABILITY_PASS output_bytes={output_size}");
+    assert_eq!(file_sha256(effective_patch), patch_hash);
+    assert_eq!(file_sha256(&patch_copy), raw_patch_hash);
+    println!(
+        "NSL_STAGE6_PUBLISH_RECOVERY_INPUT_IMMUTABILITY_PASS compressed_patch={} output_bytes={output_size}",
+        precompress_patch
+    );
 }
 
 #[test]

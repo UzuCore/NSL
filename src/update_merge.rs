@@ -164,17 +164,23 @@ fn check_space(parent: &Path, original: &Path, patch: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Fast NSZ assembly reuses the compressed base: only the patch is
-/// recompressed, so no giant plaintext NSP is staged on LOCALAPPDATA.
+/// Fast NSZ assembly reuses the compressed base, and also reuses the patch
+/// when it is already NSZ: no giant plaintext NSP is staged on LOCALAPPDATA.
 fn check_fast_nsz_space(parent: &Path, original: &Path, patch: &Path) -> Result<()> {
     let base = fs::metadata(original)?.len();
     let update = fs::metadata(patch)?.len();
     // Two copies of the final output cover filesystems without hardlink
     // support. The extra patch allocation and fixed headroom cover temporary
     // compression, metadata and NCZ framing overhead.
+    let patch_is_nsz = patch
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("nsz"));
+    // Precompressed updates are copied as-is, with no intermediate patch NSZ.
+    let patch_factor = if patch_is_nsz { 2 } else { 3 };
     let needed = base
         .saturating_mul(2)
-        .saturating_add(update.saturating_mul(3))
+        .saturating_add(update.saturating_mul(patch_factor))
         .saturating_add(512 * 1024 * 1024);
     let free = fs2::available_space(parent)?;
     anyhow::ensure!(
@@ -184,6 +190,20 @@ fn check_fast_nsz_space(parent: &Path, original: &Path, patch: &Path) -> Result<
         free >> 30
     );
     Ok(())
+}
+
+fn is_fast_nsz_candidate(original: &Path, patch: &Path, format: OutputKind) -> bool {
+    format == OutputKind::Nsz
+        && original
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("nsz"))
+        && patch
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("nsp") || extension.eq_ignore_ascii_case("nsz")
+            })
 }
 
 fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
@@ -244,12 +264,7 @@ pub(crate) fn merge_verified_package(
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
-    let fast_candidate = format == OutputKind::Nsz
-        && original
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz"))
-        && ext.eq_ignore_ascii_case("nsp");
+    let fast_candidate = is_fast_nsz_candidate(original, patch, format);
     if fast_candidate {
         check_fast_nsz_space(parent, original, patch)?;
     } else {
@@ -478,6 +493,28 @@ mod tests {
         assert!(output_for_game(Path::new("C:/game.nsp"), "..\\..", 1).is_err());
         assert!(output_for_game(Path::new("C:/game.nsp"), "0100D2C0115B6800", 1).is_err());
         assert!(output_for_game(Path::new("C:/game.nsp"), "0100D2C0115B6000", 0).is_err());
+    }
+
+    #[test]
+    fn recognizes_fast_nsz_inputs_including_precompressed_updates() {
+        for extension in ["nsp", "nsz", "NSZ"] {
+            assert!(is_fast_nsz_candidate(
+                Path::new("C:/Games/original.NSZ"),
+                Path::new(&format!("C:/Games/patch.{extension}")),
+                OutputKind::Nsz,
+            ));
+        }
+        for (original, patch, output) in [
+            ("original.nsp", "patch.nsz", OutputKind::Nsp),
+            ("original.xci", "patch.nsz", OutputKind::Xci),
+            ("original.nsz", "patch.xci", OutputKind::Nsz),
+        ] {
+            assert!(!is_fast_nsz_candidate(
+                Path::new(original),
+                Path::new(patch),
+                output,
+            ));
+        }
     }
 
     #[test]

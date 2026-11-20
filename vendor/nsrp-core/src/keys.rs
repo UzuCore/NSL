@@ -1,4 +1,4 @@
-use crate::formats::pfs0::Pfs0Index;
+use crate::{crypto::aes_ecb_decrypt_block, formats::pfs0::Pfs0Index};
 use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -60,6 +60,60 @@ impl KeySet {
             self.add_ticket_data(&entry.name, &data);
         }
         Ok(count)
+    }
+
+    /// During package processing, correct an already-decrypted title.keys
+    /// entry with the matching encrypted value from an embedded NSP ticket.
+    /// Only the in-memory KeySet changes; no keys file is ever rewritten.
+    /// Unrelated, unverified conflicts are left unchanged.
+    pub fn reconcile_ticket_keys_from_nsp(&mut self, path: &Path) -> Result<(usize, usize)> {
+        let index = Pfs0Index::parse(path)?;
+        let mut tickets = 0usize;
+        let mut corrected = 0usize;
+        for entry in &index.entries {
+            if !entry.name.to_ascii_lowercase().ends_with(".tik") || entry.size > 1024 * 1024 {
+                continue;
+            }
+            let stem = entry
+                .name
+                .rsplit_once('.')
+                .map(|p| p.0)
+                .unwrap_or(&entry.name);
+            if stem.len() != 32 || !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let data = index.read_entry(path, entry)?;
+            if data.len() < 0x190 {
+                continue;
+            }
+            let ticket_key = &data[0x180..0x190];
+            if ticket_key.iter().all(|&byte| byte == 0) {
+                continue;
+            }
+            tickets += 1;
+            let rights_id: [u8; 16] = hex::decode(stem)?.try_into().expect("32 hex digits");
+            let existing = self.title_key(&rights_id).map(|bytes| bytes.to_vec());
+            match existing {
+                Some(existing) if existing != ticket_key => {
+                    let is_decrypted_ticket = self.prod.iter().any(|(name, kek)| {
+                        name.starts_with("titlekek_")
+                            && kek.len() == 16
+                            && aes_ecb_decrypt_block(ticket_key, kek)
+                                .is_ok_and(|plain| plain.as_slice() == existing)
+                    });
+                    if is_decrypted_ticket {
+                        self.title
+                            .insert(stem.to_ascii_uppercase(), ticket_key.to_vec());
+                        corrected += 1;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.add_ticket_data(&entry.name, &data);
+                }
+            }
+        }
+        Ok((tickets, corrected))
     }
 
     pub fn add_ticket_data(&mut self, name: &str, data: &[u8]) -> bool {
@@ -248,6 +302,44 @@ pub fn merge_ticket_keys_from_nsp_file(nsp: &Path, title_keys_path: &Path) -> Re
 mod tests {
     use super::*;
     use crate::formats::pfs0::build_from_paths;
+
+    #[test]
+    fn ticket_overrides_decrypted_local_representation_in_memory_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let rights_id = "01004F90239BA8000000000000000012";
+        let ticket = temp.path().join("sample.tik");
+        let encrypted_key = [0x5A; 16];
+        let kek = [0xA5; 16];
+        let decrypted_key = aes_ecb_decrypt_block(&encrypted_key, &kek)?;
+        let mut data = vec![0u8; 0x200];
+        data[0x180..0x190].copy_from_slice(&encrypted_key);
+        fs::write(&ticket, data)?;
+        let nsp = temp.path().join("source.nsp");
+        build_from_paths(&[(format!("{rights_id}.tik"), ticket)], &nsp)?;
+        let prod = temp.path().join("prod.keys");
+        let title = temp.path().join("title.keys");
+        fs::write(&prod, format!("titlekek_12 = {}\n", hex::encode(kek)))?;
+        fs::write(
+            &title,
+            format!("{rights_id} = {}\n", hex::encode(decrypted_key)),
+        )?;
+        let prod_before = fs::read(&prod)?;
+        let title_before = fs::read(&title)?;
+        let mut keys = KeySet::load_with_local_title_keys(&prod)?;
+        assert_eq!(
+            keys.title_key(&hex::decode(rights_id)?.try_into().unwrap()),
+            Some(decrypted_key.as_slice())
+        );
+        assert_eq!(keys.reconcile_ticket_keys_from_nsp(&nsp)?, (1, 1));
+        assert_eq!(
+            keys.title_key(&hex::decode(rights_id)?.try_into().unwrap()),
+            Some(encrypted_key.as_slice())
+        );
+        assert_eq!(fs::read(&prod)?, prod_before);
+        assert_eq!(fs::read(&title)?, title_before);
+        assert_eq!(keys.reconcile_ticket_keys_from_nsp(&nsp)?, (1, 0));
+        Ok(())
+    }
 
     #[test]
     fn persists_ticket_key_aliases() -> Result<()> {

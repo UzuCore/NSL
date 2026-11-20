@@ -213,7 +213,16 @@ impl CnmtInfo {
     pub fn required_nca_names(&self) -> Vec<String> {
         let mut out = Vec::with_capacity(self.contents.len() + 1);
         out.push(self.cnmt_nca_name.clone());
-        out.extend(self.contents.iter().map(|c| format!("{}.nca", c.nca_id)));
+        // CNMT type 6 (DeltaFragment) is a delivery-only delta NCA. It is
+        // often omitted in fully installed/repacked Update NSPs, which still
+        // contain the complete Program, Control and LegalInfo NCA set.
+        // Do not make a missing delta fragment fatal for native merging.
+        out.extend(
+            self.contents
+                .iter()
+                .filter(|content| content.content_type != 6)
+                .map(|content| format!("{}.nca", content.nca_id)),
+        );
         out
     }
 
@@ -833,6 +842,36 @@ pub fn select_latest_by_title(cnmts: &[CnmtInfo]) -> Vec<CnmtInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_delta_fragment_is_not_a_required_merged_nca() {
+        let info = CnmtInfo {
+            cnmt_nca_name: "metadata.cnmt.nca".into(),
+            title_id: "01004F90239BA800".into(),
+            version: 458752,
+            meta_type: ContentMetaType::Update,
+            required_system_version: 0,
+            contents: vec![
+                CnmtContent {
+                    hash: [0x01; 32],
+                    nca_id: "11111111111111111111111111111111".into(),
+                    size: 2048,
+                    content_type: 1,
+                },
+                CnmtContent {
+                    hash: [0x02; 32],
+                    nca_id: "22222222222222222222222222222222".into(),
+                    size: 1024,
+                    content_type: 6,
+                },
+            ],
+            raw: Vec::new(),
+        };
+        assert_eq!(
+            info.required_nca_names(),
+            vec!["metadata.cnmt.nca", "11111111111111111111111111111111.nca"]
+        );
+    }
 
     #[test]
     fn parses_cnmt_content_table() -> Result<()> {

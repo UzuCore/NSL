@@ -6,10 +6,7 @@ use crate::{
             CnmtInfo, ContentMetaType, base_title_id, discover_game_metadata,
             get_title_from_control_nca, resolve_content_entry,
         },
-        compress::{
-            CompressOptions, compress_nsp, decompress_nsz, repair_legacy_container_headers,
-            repair_legacy_nsp_headers,
-        },
+        compress::{CompressOptions, compress_nsp, decompress_nsz},
         container::ContainerEntry,
         convert::game_info_preset_data,
         split::sanitize_filename,
@@ -88,24 +85,17 @@ pub fn merge_packages(
         if cancel.load(Ordering::Relaxed) {
             bail!("작업이 중단되었습니다");
         }
-        match original
+        // Merge always preserves the decompressed NCA's source header. A
+        // ticketless source can boot even when restoring its canonical Rights
+        // ID from CNMT makes it fail at runtime (whether or not a title key
+        // happens to be present). The archival repair policy is not suitable
+        // for an implicit launchability-preserving game update operation.
+        if original
             .extension()
             .and_then(|ext| ext.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz") || ext.eq_ignore_ascii_case("xcz"))
         {
-            "nsz" => repair_legacy_nsp_headers(path, hactool, prod_keys, cancel, &mut |_| {}, log)?,
-            "xcz" => repair_legacy_container_headers(
-                path,
-                true,
-                hactool,
-                prod_keys,
-                cancel,
-                &mut |_| {},
-                log,
-            )?,
-            _ => {}
+            log("병합 원본의 NCA 헤더를 그대로 보존합니다 (Rights ID 강제 복원 없음)".to_owned());
         }
         let (entries, cnmts, legacy_partition_fallback) = discover_game_metadata(
             path,
@@ -242,6 +232,12 @@ pub fn merge_packages(
                 cancel,
             )?;
             for content in &candidate.cnmt.contents {
+                // Type 6 is an optional download delta fragment and is not
+                // required to install or boot a materialized Update NCA set.
+                // Repacked NSPs often omit it even though CNMT lists it.
+                if content.content_type == 6 {
+                    continue;
+                }
                 let wanted = format!("{}.nca", content.nca_id);
                 if !try_add_content(
                     &wanted,

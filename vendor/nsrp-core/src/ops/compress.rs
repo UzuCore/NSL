@@ -60,9 +60,14 @@ pub fn compress_nsp(
     }
     let index = Pfs0Index::parse(input).context("NSP PFS0 파싱 실패")?;
     let input_size = fs::metadata(input)?.len();
-    let ticket_count = keys.add_ticket_keys_from_nsp(input)?;
+    let (ticket_count, corrected_keys) = keys.reconcile_ticket_keys_from_nsp(input)?;
     if ticket_count > 0 {
         log(format!("티켓 {ticket_count}개에서 title key를 읽었습니다"));
+    }
+    if corrected_keys > 0 {
+        log(format!(
+            "title.keys의 복호화된 키 {corrected_keys}개를 메모리에서만 티켓 암호화 표현으로 정합했습니다 (원본 키 파일은 변경하지 않습니다)"
+        ));
     }
     let total_payload = index.entries.iter().map(|e| e.size).sum::<u64>().max(1);
     let mut source = BufReader::with_capacity(2 * 1024 * 1024, File::open(input)?);

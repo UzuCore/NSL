@@ -395,6 +395,10 @@ pub(crate) fn merge_or_recover_existing(
 }
 
 #[cfg(test)]
+#[path = "update_merge/real_qa.rs"]
+mod real_qa;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -35,6 +35,8 @@ For nested XCI/XCZ partitions, `xci.rs::scan_native_card` limits each child inde
 
 The native conversion writer (`native_package.rs`) retains its own strict, transform-aware index representation; it has not been casually replaced with a metadata-only parser. No NCA decryption or filesystem write paths have been changed.
 
+The converter input reader also uses `container_index::valid_name` so both readers follow one filename policy, but keeps **converter-only** validation for HFS0 hashes, non-overlapping extents, and NUL-terminated names. Unlike the metadata reader, it must continue to support **zero-entry HFS0** `normal`/`update` partitions and must **reject** named game-card partitions whose declared size extends past the physical file end: an output writer cannot safely guess whether missing bytes were padding or real NCA/NCZ data. See [native package input QA](../qa/QA_NATIVE_PACKAGE_INPUT_SAFETY_2026-11-20.md).
+
 ## Validation and limits
 
 Read-only local library header sampling first found 136 NSP/NSZ entries and identified one compatibility case. The follow-up **full database-corpus header check inspected 875/875 available NSP/NSZ files**, with **874 fully valid index tables and 1 file with one out-of-bounds unrelated entry**. Metadata mode safely keeps that file's valid index entries. **14/14 available XCI/XCZ root HFS0 indexes** were accepted by the strict structural validation model; all 14 contained `secure` and update/normal partitions. These checks only read package headers and a read-only SQLite snapshot, **not** decrypted game contents; they are independent rule checks rather than compiled Rust tests.

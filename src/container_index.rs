@@ -32,6 +32,17 @@ pub(crate) struct Index {
     pub(crate) entries: Vec<Entry>,
 }
 
+/// One filename policy for metadata readers and the native package rebuilder.
+/// This is a format validation rule, not an output-path sanitization step.
+pub(crate) fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+}
+
 /// Strict read-only validation for a nested container or game-card partition.
 /// Invalid entries reject the entire index, as in the NSRP reference parser.
 pub(crate) fn read_at<R: Read + Seek>(
@@ -164,13 +175,7 @@ fn parse_entry(
     let name_data = strings.get(string_at..)?;
     let name_len = name_data.iter().position(|b| *b == 0)?;
     let name = std::str::from_utf8(&name_data[..name_len]).ok()?;
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
-    {
+    if !valid_name(name) {
         return None;
     }
     let start = data_start.checked_add(relative)?;

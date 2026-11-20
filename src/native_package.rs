@@ -3,11 +3,11 @@
 //! Only the public container-format specification is used; no third-party
 //! source file is embedded or translated. Never touches the input archive.
 
-use crate::ncz;
+use crate::{container_index, ncz};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
@@ -66,15 +66,6 @@ fn align(value: u64, unit: u64) -> Result<u64> {
         .context("패키지 정렬 크기 범위 초과")
 }
 
-fn valid_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
-}
-
 fn get_u64(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes.try_into()?))
 }
@@ -113,6 +104,7 @@ fn read_index(source: &mut File, start: u64, end: u64, kind: Kind) -> Result<Vec
     let data_start = start + raw_header;
     let mut entries = Vec::with_capacity(count);
     let mut names = HashSet::with_capacity(count);
+    let mut extents = BTreeMap::<u64, u64>::new();
     for row in table.chunks_exact(kind.entry_len()) {
         let offset = get_u64(&row[..8])?;
         let size = get_u64(&row[8..16])?;
@@ -120,12 +112,15 @@ fn read_index(source: &mut File, start: u64, end: u64, kind: Kind) -> Result<Vec
         let data = strings
             .get(str_offset..)
             .context("패키지 파일명 위치가 잘못되었습니다")?;
-        let text = data.split(|b| *b == 0).next().context("파일명 누락")?;
-        let name = std::str::from_utf8(text)
+        let terminator = data
+            .iter()
+            .position(|byte| *byte == 0)
+            .context("패키지 파일명이 NUL로 종료되지 않았습니다")?;
+        let name = std::str::from_utf8(&data[..terminator])
             .context("패키지 파일명 인코딩 오류")?
             .to_owned();
         anyhow::ensure!(
-            valid_name(&name) && names.insert(name.to_ascii_lowercase()),
+            container_index::valid_name(&name) && names.insert(name.to_lowercase()),
             "잘못된 또는 중복 패키지 파일명: {name}"
         );
         let absolute = data_start
@@ -135,6 +130,21 @@ fn read_index(source: &mut File, start: u64, end: u64, kind: Kind) -> Result<Vec
             absolute.checked_add(size).is_some_and(|v| v <= end),
             "패키지 항목이 파일 크기를 초과합니다: {name}"
         );
+        // Converter input is always strict. Prevent two nominally different
+        // NCAs/partitions from aliasing the same original data extent.
+        if size != 0 {
+            let file_end = absolute + size;
+            let overlaps = extents
+                .range(..=absolute)
+                .next_back()
+                .is_some_and(|(_, previous_end)| *previous_end > absolute)
+                || extents
+                    .range(absolute..)
+                    .next()
+                    .is_some_and(|(next_start, _)| *next_start < file_end);
+            anyhow::ensure!(!overlaps, "패키지 항목 데이터 구간이 중복됩니다: {name}");
+            extents.insert(absolute, file_end);
+        }
         let hash_size = if kind == Kind::Hfs0 {
             get_u32(&row[20..24])?
         } else {
@@ -389,6 +399,71 @@ pub fn unpack_xcz(source: &Path, target: &mut File) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn synthetic_two_entry_index(kind: Kind) -> Vec<u8> {
+        let names = b"first.nca\0second.nca\0";
+        let mut data = Vec::new();
+        data.extend_from_slice(kind.magic());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        for (relative, name_at) in [(0u64, 0u32), (4u64, 10u32)] {
+            data.extend_from_slice(&relative.to_le_bytes());
+            data.extend_from_slice(&4u64.to_le_bytes());
+            data.extend_from_slice(&name_at.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+            if kind == Kind::Hfs0 {
+                data.extend_from_slice(&[0u8; 40]);
+            }
+        }
+        data.extend_from_slice(names);
+        data.extend_from_slice(b"abcdefgh");
+        data
+    }
+
+    #[test]
+    fn repacker_rejects_overlapping_and_unterminated_pfs0_hfs0_indexes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic_index.bin");
+        for kind in [Kind::Pfs0, Kind::Hfs0] {
+            let original = synthetic_two_entry_index(kind);
+            std::fs::write(&path, &original).unwrap();
+            let mut source = File::open(&path).unwrap();
+            let entries = read_index(&mut source, 0, original.len() as u64, kind)
+                .expect("adjacent data entries are supported");
+            assert_eq!(entries.len(), 2);
+            drop(source);
+
+            let mut overlap = original.clone();
+            let second_start = 16 + kind.entry_len();
+            overlap[second_start..second_start + 8].copy_from_slice(&2u64.to_le_bytes());
+            std::fs::write(&path, &overlap).unwrap();
+            let mut source = File::open(&path).unwrap();
+            assert!(read_index(&mut source, 0, overlap.len() as u64, kind).is_err());
+            drop(source);
+
+            let mut invalid_name = original;
+            let last_nul = 16 + 2 * kind.entry_len() + b"first.nca\0second.nca".len();
+            invalid_name[last_nul] = b'X';
+            std::fs::write(&path, &invalid_name).unwrap();
+            let mut source = File::open(&path).unwrap();
+            assert!(read_index(&mut source, 0, invalid_name.len() as u64, kind).is_err());
+        }
+    }
+
+    #[test]
+    fn repacker_still_accepts_empty_hfs0_game_card_partition() {
+        // Real XCZ images contain HFS0 normal/update partitions with zero
+        // entries. The library metadata reader may skip them, but the native
+        // repacker must continue to preserve them during an XCZ conversion.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("empty_partition.bin");
+        std::fs::write(&path, b"HFS0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        let mut source = File::open(&path).unwrap();
+        assert!(read_index(&mut source, 0, 16, Kind::Hfs0)
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     #[ignore = "uses read-only local NSZ/XCZ game files and isolated temporary output"]
     fn real_nsz_and_xcz_restore_valid_package_and_nca_hashes() {
@@ -492,9 +567,9 @@ mod tests {
         std::fs::write(&source, b"PFS0\x01\0\0\0\0\0\0\0\0\0\0\0").unwrap();
         let mut output = File::create(dir.path().join("out.nsp")).unwrap();
         assert!(unpack_nsz(&source, &mut output).is_err());
-        assert!(!valid_name("../file.nca"));
-        assert!(!valid_name("\\evil"));
-        assert!(valid_name("1234567890abcdef.nca"));
+        assert!(!container_index::valid_name("../file.nca"));
+        assert!(!container_index::valid_name("\\evil"));
+        assert!(container_index::valid_name("1234567890abcdef.nca"));
     }
 
     #[test]

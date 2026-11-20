@@ -22,7 +22,7 @@ Date: 2026-11-20 (KST). Previous commit: `f2b1f09`. Source files: `src/main.rs`,
 ### Active tab indicator
 
 - Every selected library/directory, Store or Downloads tab has a **2-point (~2px at 100% UI scale) top bar** drawn inside its unchanged tab rectangle and click area.
-- The color uses the active theme's **primary accent** (`egui::Visuals.widgets.active.bg_fill`, mapped from `Palette.accent`) rather than a fixed color or the secondary hyperlink accent. There is no line on inactive tabs.
+- The color uses the active theme's **selection/link accent** (`egui::Visuals.hyperlink_color`, mapped from `Palette.accent2`) to match selected card borders rather than its action-button accent. On GitHub Dark, this is **blue `#1F6FEB`**, instead of green `#238636`. Other themes continue using their own palette accent2. There is no line on inactive tabs.
 
 ## Actual local regression tests
 
@@ -30,7 +30,7 @@ New headless egui tests (no game or network writes):
 
 1. `store_uses_configured_page_size_even_when_library_paging_is_disabled`: 9 synthetic items, `paging_on=0`, page size 3 then 2, including last-page remainder.
 2. `store_and_downloads_keyboard_navigation_crosses_page_boundaries`: nine Store entries and 105 synthetic download jobs, ArrowDown/Right, End, Home, cross-page selection, search focus and modal suppression, independent download 100-item page limit.
-3. `active_tab_draws_two_pixel_primary_theme_accent_for_each_screen`: actual tab geometry, 2-point size and palette color across **GitHub Dark, GitHub Light and Catppuccin Mocha**, for All, Store and Downloads tabs.
+3. `active_tab_draws_two_pixel_selection_accent_for_each_screen`: actual tab geometry, 2-point size and palette color across **GitHub Dark, GitHub Light and Catppuccin Mocha**, for All, Store and Downloads tabs, including the explicit blue `#1F6FEB` expectation on GitHub Dark.
 4. `management_keyboard_end_reveals_selected_row_in_long_scrollable_lists`: virtualized Store page with **120 rows**, Downloads page with **100 jobs**. Both keyboard-selected final items must be rendered fully within the real egui viewport. This test detected that the first Downloads scroll-to-rect implementation failed to reveal a far-away selected row in headless execution; the fix now stores the precise scroll offset from the selected card's actual geometry for immediate visibility on the following frame.
 
 After updating two old Store page-size assertions for configurable paging, the complete `cargo test --locked --all-targets -- --test-threads 4` suite passed: **181 passed, 0 failed, 17 ignored**. `cargo clippy --locked --all-targets -- -D warnings`: **PASS** (zero warnings). Runtime tests do not launch a production download, visit a network service, modify a live library or press keys globally on Windows.

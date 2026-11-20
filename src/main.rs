@@ -659,11 +659,12 @@ fn draw_tab_button(
         );
     }
     if selected {
-        // The palette's active widget fill is its primary accent, unlike
-        // hyperlink_color (the secondary accent). Overlay a 2-point strip
-        // inside the tab without changing its layout or click area.
+        // Match the theme's visible selection/link accent, not its action
+        // button fill (green on GitHub Dark). The selection accent is blue
+        // (#1F6FEB) on GitHub Dark and follows Palette.accent2 elsewhere.
+        // Keep the 2-point strip inside the existing tab/click rectangle.
         let accent_bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 2.0));
-        let accent_color = visuals.widgets.active.bg_fill;
+        let accent_color = visuals.hyperlink_color;
         painter.rect_filled(accent_bar, 0.0, accent_color);
         #[cfg(test)]
         ui.ctx().data_mut(|data| {

@@ -3243,7 +3243,7 @@ fn management_keyboard_end_reveals_selected_row_in_long_scrollable_lists() {
 }
 
 #[test]
-fn active_tab_draws_two_pixel_primary_theme_accent_for_each_screen() {
+fn active_tab_draws_two_pixel_selection_accent_for_each_screen() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
     wait_for_rows(&mut app, &ctx);
@@ -3271,7 +3271,12 @@ fn active_tab_draws_two_pixel_primary_theme_accent_for_each_screen() {
             assert_eq!(bar.width(), tab.width());
             assert_eq!(bar.height(), 2.0);
             assert_eq!(bar.min, tab.min);
-            assert_eq!(color, ctx.style().visuals.widgets.active.bg_fill);
+            assert_eq!(color, ctx.style().visuals.hyperlink_color);
+            assert_eq!(color, theme::swatches(theme_id).1);
+            if theme_id == "github_dark" {
+                assert_eq!(color, egui::Color32::from_rgb(0x1F, 0x6F, 0xEB));
+                assert_ne!(color, ctx.style().visuals.widgets.active.bg_fill);
+            }
         }
     }
 }

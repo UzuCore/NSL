@@ -20,6 +20,8 @@ mod titledb;
 mod torrent;
 mod torrent_file_picker;
 mod translate;
+mod update_batch;
+mod update_merge;
 mod updater;
 mod xci;
 
@@ -851,6 +853,8 @@ struct NslApp {
     torrent_engine: Option<Arc<torrent::TorrentEngine>>,
     torrent_progress: Vec<(String, torrent::TorrentProgress)>,
     catalog_torrent_dialog: Option<CatalogTorrentDialog>,
+    /// Metadata-only bulk scan and independently verified selective updates.
+    update_batch: Option<update_batch::UpdateBatch>,
     download_selected: Option<String>,
     download_search: String,
     download_status_filter: String,

@@ -131,6 +131,16 @@ impl NslApp {
                 |progress| ProgressView::from_task(progress.snapshot()),
             ));
         }
+        if let Some(batch) = &self.update_batch {
+            if batch.running {
+                let (done, total) = batch.progress();
+                views.push(ProgressView::counted(
+                    "미보유 업데이트 카탈로그 대조",
+                    done as u64,
+                    total as u64,
+                ));
+            }
+        }
         if self
             .catalog_torrent_dialog
             .as_ref()
@@ -563,7 +573,7 @@ impl NslApp {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
         if self.torrent_engine.is_some() && self.torrent_poll_due() {
-            if let Some(engine) = &self.torrent_engine {
+            if let Some(engine) = self.torrent_engine.clone() {
                 let was_active = self
                     .torrent_progress
                     .iter()
@@ -592,6 +602,7 @@ impl NslApp {
                             continue;
                         }
                     };
+                    self.handle_missing_update_completion(&key, &result);
                     let label = snapshot
                         .iter()
                         .find(|(k, _)| *k == key)
@@ -625,6 +636,7 @@ impl NslApp {
                 self.torrent_progress = snapshot;
             }
         }
+        self.poll_missing_update_audit(ctx);
         let update_check_done = poll_background(&self.update_check_result, "update check");
         if let Some(done) = update_check_done {
             self.update_check_result = None;
@@ -1369,6 +1381,12 @@ impl NslApp {
                     });
                     return;
                 }
+                if self.folder_filter == "MISSING_UPDATES" {
+                    ui.scope(|ui| {
+                        outlined_action_style(ui);
+                        self.missing_update_toolbar(ui);
+                    });
+                }
                 let (grid_columns, grid_card_width, grid_thumbnail_size) =
                     library_grid_dimensions(ui.available_width());
                 if self.rows.is_empty() {
@@ -1683,6 +1701,24 @@ impl NslApp {
                                                             ));
                                                         });
                                                     });
+                                                if self.folder_filter == "MISSING_UPDATES"
+                                                    && self.update_batch.as_ref().and_then(|batch| batch.by_id(row.id)).is_some_and(|audit| audit.found.is_some())
+                                                {
+                                                    if let Some(icon) = &icon_response {
+                                                        let indicator = egui::Rect::from_min_size(
+                                                            icon.rect.right_top() - egui::vec2(19.0, 0.0),
+                                                            egui::vec2(19.0, 19.0),
+                                                        );
+                                                        ui.painter().rect_filled(indicator, 4.0, ui.visuals().hyperlink_color);
+                                                        ui.painter().text(
+                                                            indicator.center(),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            "↑",
+                                                            egui::FontId::proportional(14.0),
+                                                            egui::Color32::WHITE,
+                                                        );
+                                                    }
+                                                }
                                                 // One click target for the complete grid card,
                                                 // including the blank icon/label padding.
                                                 remember_card_geometry(
@@ -1863,11 +1899,19 @@ impl NslApp {
                                 .show(ui, |ui| {
                                 for row in &page_items[row_range] {
                                     let selected = self.selected == Some(row.id);
+                                    let update_audited = self.folder_filter == "MISSING_UPDATES"
+                                        && self.update_batch.as_ref().and_then(|batch| batch.by_id(row.id))
+                                            .is_some_and(|entry| entry.found.is_some());
+                                    let display_name: std::borrow::Cow<'_, str> = if update_audited {
+                                        std::borrow::Cow::Owned(format!("↑  {}", row.title_name))
+                                    } else {
+                                        std::borrow::Cow::Borrowed(row.title_name.as_str())
+                                    };
                                     let response = selectable_table_text_cell(
                                         ui,
                                         name_width,
                                         24.0,
-                                        &row.title_name,
+                                        &display_name,
                                         selected,
                                         egui::Align::Min,
                                     );

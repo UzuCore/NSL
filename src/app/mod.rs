@@ -11,4 +11,5 @@ mod scanning;
 mod settings;
 mod startup;
 mod store;
+mod update_batch;
 mod updates;

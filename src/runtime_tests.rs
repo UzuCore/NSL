@@ -16,6 +16,58 @@ fn normalizes_windows_scan_paths_for_existing_database_keys() {
 }
 
 #[test]
+fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut base = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    base.latest_version = 196_608;
+    base.update_version = 65_536;
+    let eligible = catalog::CatalogItem {
+        title: "Alpha release".into(),
+        title_id: Some(base.title_id.clone()),
+        topic_id: "123456".into(),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let wrong = catalog::CatalogItem {
+        title: "Different base".into(),
+        title_id: Some("0100AABBCCDDE000".into()),
+        topic_id: "123455".into(),
+        magnet: "magnet:?xt=urn:btih:EFGH".into(),
+        ..Default::default()
+    };
+    let batch = update_batch::new_update_batch(&[base.clone()], &[wrong, eligible.clone()], "");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].candidates, vec![1]);
+    assert_eq!(
+        batch.eligible(),
+        0,
+        "metadata verification must happen first"
+    );
+    let excluded = update_batch::new_update_batch(
+        std::slice::from_ref(&base),
+        std::slice::from_ref(&eligible),
+        &base.title_id,
+    );
+    assert!(excluded.rows.is_empty());
+
+    app.rows = vec![base];
+    app.rows_generation += 1;
+    app.folder_filter = "MISSING_UPDATES".into();
+    app.kind_filter = "base".into();
+    app.torrent_engine = None;
+    app.update_batch = Some(batch);
+    app.update_batch.as_mut().unwrap().running = false;
+    let ctx = run_app_ticks(&mut app, 2);
+    let rect = ctx.data_mut(|data| {
+        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_update_batch_toolbar"))
+            .expect("missing-updates-only catalog toolbar not drawn")
+    });
+    assert!(rect.width() > 100.0 && rect.height() > 0.0);
+}
+
+#[test]
 fn cached_scan_reuse_does_not_depend_on_nacp_names() {
     let path = normalize_scan_path_text(r"E:\NSW\sample.nsp");
     let mut records = HashMap::new();

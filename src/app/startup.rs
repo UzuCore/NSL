@@ -163,6 +163,7 @@ impl NslApp {
             torrent_engine: None,
             torrent_progress: Vec::new(),
             catalog_torrent_dialog: None,
+            update_batch: None,
             download_selected: None,
             download_search: String::new(),
             download_status_filter: "all".into(),

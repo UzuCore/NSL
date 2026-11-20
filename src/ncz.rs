@@ -352,6 +352,18 @@ fn reencrpyt_ctr(data: &mut [u8], offset: u64, key: &[u8; 16], counter: &[u8; 16
     Ok(())
 }
 
+/// Surface out-of-space errors explicitly. A caller using NamedTempFile can
+/// then discard its incomplete output instead of publishing a broken NCA.
+fn write_output<W: Write>(target: &mut W, bytes: &[u8]) -> Result<()> {
+    target.write_all(bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::StorageFull {
+            anyhow::Error::new(error).context("NCZ 복원 파일을 저장할 디스크 공간이 부족합니다")
+        } else {
+            anyhow::Error::new(error).context("NCZ 복원 파일 쓰기 실패")
+        }
+    })
+}
+
 pub fn decompress<R: Read + Seek, W: Write>(
     source: &mut R,
     start: u64,
@@ -362,7 +374,7 @@ pub fn decompress<R: Read + Seek, W: Write>(
     source.seek(SeekFrom::Start(start))?;
     let mut header = vec![0u8; HEADER as usize];
     source.read_exact(&mut header)?;
-    target.write_all(&header)?;
+    write_output(target, &header)?;
     source.seek(SeekFrom::Start(layout.header_end))?;
     let remaining = compressed_size - (layout.header_end - start);
     let compressed = source.take(remaining);
@@ -393,7 +405,7 @@ pub fn decompress<R: Read + Seek, W: Write>(
                 reader
                     .read_exact(&mut buffer[..len])
                     .context("NCZ 섹션 앞 데이터 손상")?;
-                target.write_all(&buffer[..len])?;
+                write_output(target, &buffer[..len])?;
                 position += len as u64;
                 left -= len as u64;
             }
@@ -407,7 +419,7 @@ pub fn decompress<R: Read + Seek, W: Write>(
             if let Some(cipher) = cipher.as_ref() {
                 reencrypt_ctr_with_cipher(cipher, &mut buffer[..len], position, &section.counter);
             }
-            target.write_all(&buffer[..len])?;
+            write_output(target, &buffer[..len])?;
             position += len as u64;
             left -= len as u64;
         }
@@ -420,7 +432,7 @@ pub fn decompress<R: Read + Seek, W: Write>(
         reader
             .read_exact(&mut buffer[..len])
             .context("NCZ 평문 후반 데이터가 잘렸습니다")?;
-        target.write_all(&buffer[..len])?;
+        write_output(target, &buffer[..len])?;
         position += len as u64;
     }
     anyhow::ensure!(
@@ -806,6 +818,63 @@ mod tests {
         let unpacked_at = HEADER as usize + 16 + 64 + 8 + 4 + 4;
         undersized[unpacked_at..unpacked_at + 8].copy_from_slice(&0x1000u64.to_le_bytes());
         assert!(inspect(&mut Cursor::new(&undersized), 0, length).is_err());
+    }
+
+    #[test]
+    fn simulated_disk_full_aborts_solid_and_block_restoration_without_overwriting_input() {
+        struct QuotaWriter {
+            bytes: Vec<u8>,
+            quota: usize,
+        }
+
+        impl Write for QuotaWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                let remaining = self.quota - self.bytes.len();
+                if remaining == 0 {
+                    return Err(io::Error::from(io::ErrorKind::StorageFull));
+                }
+                let count = remaining.min(buf.len());
+                self.bytes.extend_from_slice(&buf[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sections = [Section {
+            start: HEADER,
+            size: 0x23000,
+            crypto: 3,
+            key: [0x11; 16],
+            counter: [0x22; 16],
+        }];
+
+        for is_block in [false, true] {
+            let mut original = vec![0x58; HEADER as usize];
+            // Only NCZBLOCK explicitly describes plain bytes after the final
+            // encrypted range. Solid NCZ correctly rejects undeclared tails.
+            let plain_bytes = if is_block { 0x53000 } else { 0x23000 };
+            original.extend((0..plain_bytes).map(|i| (i % 233) as u8));
+            let encoded = sample_ncz(&original, &sections, is_block);
+            for quota in [0, HEADER as usize + 32 * 1024, original.len() - 1] {
+                let mut source = Cursor::new(&encoded);
+                let mut output = QuotaWriter {
+                    bytes: Vec::new(),
+                    quota,
+                };
+                let error = decompress(&mut source, 0, encoded.len() as u64, &mut output)
+                    .expect_err("write failure must never be silently ignored");
+                assert!(
+                    format!("{error:#}").contains("디스크 공간이 부족"),
+                    "missing actionable disk-full error context: {error:#}"
+                );
+                assert_eq!(output.bytes.len(), quota);
+                assert_eq!(output.bytes, original[..quota]);
+                assert_eq!(source.get_ref().as_slice(), encoded.as_slice());
+            }
+        }
     }
 
     #[test]

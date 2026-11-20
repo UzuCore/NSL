@@ -106,6 +106,88 @@ fn wait_for(
     }
 }
 
+/// Reusable loopback-only seeder; no DHT or public trackers are contacted.
+fn local_file_seeder(
+    file: &Path,
+    seed_dir: &Path,
+    upload_bytes_per_second: u32,
+) -> (
+    tokio::runtime::Runtime,
+    Arc<Session>,
+    ManagedTorrentHandle,
+    LocalTracker,
+    String,
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (session, handle, peer, magnet) = runtime.block_on(async {
+        let fixture = librqbit::create_torrent(
+            file,
+            CreateTorrentOptions {
+                piece_length: Some(32 * 1024),
+                ..Default::default()
+            },
+            &BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap();
+        let session = Session::new_with_opts(
+            seed_dir.to_path_buf(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: "127.0.0.1:0".parse().unwrap(),
+                    ..Default::default()
+                }),
+                ratelimits: LimitsConfig {
+                    upload_bps: NonZeroU32::new(upload_bytes_per_second),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(fixture.as_bytes().unwrap()),
+                Some(AddTorrentOptions {
+                    overwrite: true,
+                    output_folder: Some(seed_dir.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        while !handle.stats().finished {
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "generated test seeder did not become ready"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let peer = session.listen_addr().expect("loopback listener");
+        let magnet = librqbit::Magnet::from_id20(fixture.info_hash(), vec![], None).to_string();
+        (session, handle, peer, magnet)
+    });
+    assert!(peer.ip().is_loopback());
+    let tracker = LocalTracker::new(peer);
+    let magnet = format!(
+        "{}&tr={}",
+        magnet,
+        url::form_urlencoded::byte_serialize(tracker.url.as_bytes()).collect::<String>()
+    );
+    (runtime, session, handle, tracker, magnet)
+}
+
 #[test]
 #[ignore = "localhost-only real torrent transfer with generated data (run explicitly)"]
 fn transfer_pause_restart_resume_delete_preserves_other_files() {
@@ -119,73 +201,8 @@ fn transfer_pause_restart_resume_delete_preserves_other_files() {
     }
     std::fs::write(seed_dir.join("payload.bin"), &data).unwrap();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let (seed_session, peer, magnet) = runtime.block_on(async {
-        let fixture = librqbit::create_torrent(
-            &seed_dir.join("payload.bin"),
-            CreateTorrentOptions {
-                piece_length: Some(32 * 1024),
-                ..Default::default()
-            },
-            &BlockingSpawner::new(1),
-        )
-        .await
-        .unwrap();
-        let session = Session::new_with_opts(
-            seed_dir.clone(),
-            SessionOptions {
-                dht: None,
-                disable_local_service_discovery: true,
-                listen: Some(ListenerOptions {
-                    mode: ListenerMode::TcpOnly,
-                    listen_addr: "127.0.0.1:0".parse().unwrap(),
-                    ..Default::default()
-                }),
-                ratelimits: LimitsConfig {
-                    upload_bps: NonZeroU32::new(512 * 1024),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let torrent = session
-            .add_torrent(
-                AddTorrent::from_bytes(fixture.as_bytes().unwrap()),
-                Some(AddTorrentOptions {
-                    overwrite: true,
-                    output_folder: Some(seed_dir.to_string_lossy().into_owned()),
-                    ..Default::default()
-                }),
-            )
-            .await
-            .unwrap()
-            .into_handle()
-            .unwrap();
-        let start = tokio::time::Instant::now();
-        while !torrent.stats().finished {
-            assert!(
-                start.elapsed() < Duration::from_secs(15),
-                "seeder not ready"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let peer = session.listen_addr().expect("loopback peer address");
-        let magnet = librqbit::Magnet::from_id20(fixture.info_hash(), vec![], None).to_string();
-        (session, peer, magnet)
-    });
-    assert!(peer.ip().is_loopback());
-    let tracker = LocalTracker::new(peer);
-    let magnet = format!(
-        "{}&tr={}",
-        magnet,
-        url::form_urlencoded::byte_serialize(tracker.url.as_bytes()).collect::<String>()
-    );
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_dir.join("payload.bin"), &seed_dir, 512 * 1024);
 
     let engine = TorrentEngine::new(client_dir.clone()).unwrap();
     let key = engine
@@ -277,6 +294,77 @@ fn transfer_pause_restart_resume_delete_preserves_other_files() {
     );
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
     drop(restored);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// Longer loopback-only transfer with a real seeder interruption. The pause
+/// models a disconnected/unavailable peer without changing any user network
+/// adapters or touching any non-test torrent process or directory.
+#[test]
+#[ignore = "localhost-only 16 MiB transfer, seeder disconnect and resume (run explicitly)"]
+fn larger_transfer_survives_local_seeder_outage_and_restores_exact_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let seed_dir = root.path().join("seed");
+    let client_dir = root.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..16 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(131).wrapping_add((i / 8192) as u32) as u8)
+        .collect::<Vec<_>>();
+    let file = seed_dir.join("outage-test.bin");
+    std::fs::write(&file, &data).unwrap();
+    let (runtime, seed_session, seed_handle, tracker, magnet) =
+        local_file_seeder(&file, &seed_dir, 768 * 1024);
+
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download("outage-only QA", &magnet, PathBuf::from("isolated-outage"))
+        .unwrap();
+    let started = Instant::now();
+    let (_, first) = wait_for(&engine, Duration::from_secs(35), |id, progress| {
+        id == key && progress.progress_bytes > 0 && !progress.finished
+    });
+    assert!(first.progress_bytes < data.len() as u64);
+    runtime.block_on(seed_session.pause(&seed_handle)).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let (during_outage, _) = engine.poll();
+    let current = during_outage
+        .iter()
+        .find(|(id, _)| id == &key)
+        .map(|(_, status)| status)
+        .expect("interrupted download should stay visible for retry");
+    assert!(
+        !current.finished,
+        "outage should not mark an incomplete download as done"
+    );
+    assert!(
+        current.error.is_none(),
+        "temporary outage became fatal: {current:?}"
+    );
+    eprintln!(
+        "TORRENT_PEER_OUTAGE first_bytes={} outage_bytes={} elapsed_s={:.2}",
+        first.progress_bytes,
+        current.progress_bytes,
+        started.elapsed().as_secs_f64()
+    );
+
+    runtime
+        .block_on(seed_session.unpause(&seed_handle))
+        .unwrap();
+    let (_, complete) = wait_for(&engine, Duration::from_secs(90), |id, progress| {
+        id == key && progress.finished
+    });
+    assert_eq!(complete.total_bytes, data.len() as u64);
+    assert_eq!(complete.progress_bytes, data.len() as u64);
+    let output = client_dir.join("isolated-outage").join("outage-test.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!(
+        "TORRENT_OUTAGE_RECOVERY_PASS bytes={} elapsed_s={:.2}",
+        data.len(),
+        started.elapsed().as_secs_f64()
+    );
+    drop(engine);
     drop(seed_session);
     drop(runtime);
     drop(tracker);

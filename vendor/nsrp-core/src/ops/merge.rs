@@ -55,6 +55,47 @@ struct Candidate {
     cnmt: CnmtInfo,
 }
 
+/// Selected CNMT content remains in the owned temporary workspace while
+/// `emit` executes. The caller must finish writing its output inside that
+/// callback; retaining any paths after the callback returns is invalid.
+/// `prepared_base` is the decoded first input (XCI when the original was
+/// XCZ), allowing consumers to reuse it instead of decoding again.
+pub struct SelectedMergeGroup<'a> {
+    pub files: &'a [(String, PathBuf)],
+    pub prepared_base: &'a Path,
+    pub cancel: &'a AtomicBool,
+}
+
+pub fn merge_packages_selected(
+    inputs: &[PathBuf],
+    output_dir: &Path,
+    output_dir_explicit: bool,
+    resource_dir: &Path,
+    hactool: &Path,
+    prod_keys: &Path,
+    keys: &mut KeySet,
+    options: &MergeOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+    log: &mut dyn FnMut(String),
+    emit: &mut dyn FnMut(SelectedMergeGroup<'_>) -> Result<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    merge_packages_impl(
+        inputs,
+        output_dir,
+        output_dir_explicit,
+        resource_dir,
+        hactool,
+        prod_keys,
+        keys,
+        options,
+        cancel,
+        progress,
+        log,
+        Some(emit),
+    )
+}
+
 pub fn merge_packages(
     inputs: &[PathBuf],
     output_dir: &Path,
@@ -67,6 +108,36 @@ pub fn merge_packages(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(f32),
     log: &mut dyn FnMut(String),
+) -> Result<Vec<PathBuf>> {
+    merge_packages_impl(
+        inputs,
+        output_dir,
+        output_dir_explicit,
+        resource_dir,
+        hactool,
+        prod_keys,
+        keys,
+        options,
+        cancel,
+        progress,
+        log,
+        None,
+    )
+}
+
+fn merge_packages_impl(
+    inputs: &[PathBuf],
+    output_dir: &Path,
+    output_dir_explicit: bool,
+    resource_dir: &Path,
+    hactool: &Path,
+    prod_keys: &Path,
+    keys: &mut KeySet,
+    options: &MergeOptions,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(f32),
+    log: &mut dyn FnMut(String),
+    mut emit: Option<&mut dyn FnMut(SelectedMergeGroup<'_>) -> Result<PathBuf>>,
 ) -> Result<Vec<PathBuf>> {
     if inputs.len() < 2 {
         bail!("병합에는 최소 2개 입력 파일이 필요합니다");
@@ -266,6 +337,28 @@ pub fn merge_packages(
             }
         }
         files.sort_by(|a, b| a.0.cmp(&b.0));
+        if let Some(emitter) = emit.as_deref_mut() {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("작업이 중단되었습니다");
+            }
+            // Keep the selected files and any decoded source-XCI alive for
+            // the entire callback. No second full-size merged NSP is built.
+            let produced = emitter(SelectedMergeGroup {
+                files: &files,
+                prepared_base: &sources[0].path,
+                cancel,
+            })?;
+            if !produced.is_file() || fs::metadata(&produced)?.len() == 0 {
+                bail!("선택된 병합 콘텐츠로 만든 출력이 비어 있습니다");
+            }
+            log(format!(
+                "중간 NSP 없이 CNMT 선택 엔트리 전달: {base_id} ({}개)",
+                files.len()
+            ));
+            outputs.push(produced);
+            progress(0.20 + 0.80 * (group_index + 1) as f32 / group_count as f32);
+            continue;
+        }
         let tag = merge_content_tag(&candidates);
         let base_name = match tag {
             Some(tag) => sanitize_filename(&format!("[Merged] {game_title} {tag}")),

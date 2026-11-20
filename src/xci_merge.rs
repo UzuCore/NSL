@@ -7,12 +7,14 @@
 //! console compatibility need independent end-to-end testing.
 
 use anyhow::{Context, Result};
-use nsrp_core::formats::{hfs0, pfs0::Pfs0Index};
+use nsrp_core::formats::hfs0;
+#[cfg(test)]
+use nsrp_core::formats::pfs0::Pfs0Index;
 use sha2::{Digest, Sha256};
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -44,6 +46,16 @@ fn copy_region(
     Ok(())
 }
 
+/// Either a region in the legacy merged NSP or an already selected materialized
+/// NCA/ticket. Both paths use the same HFS0 and gamecard HEAD writer.
+struct XciContentSource {
+    name: String,
+    path: PathBuf,
+    offset: u64,
+    size: u64,
+}
+
+#[cfg(test)]
 pub(crate) fn build_merged_xci_from_template(
     template: &Path,
     merged_nsp: &Path,
@@ -54,6 +66,61 @@ pub(crate) fn build_merged_xci_from_template(
     anyhow::ensure!(
         template != output && merged_nsp != output,
         "입출력 경로 충돌"
+    );
+    let index = Pfs0Index::parse(merged_nsp).context("CNMT 병합 NSP를 파싱할 수 없습니다")?;
+    let sources = index
+        .entries
+        .iter()
+        .map(|entry| -> Result<XciContentSource> {
+            Ok(XciContentSource {
+                name: entry.name.clone(),
+                path: merged_nsp.to_path_buf(),
+                offset: index
+                    .data_start
+                    .checked_add(entry.offset)
+                    .context("NSP 엔트리 오프셋 초과")?,
+                size: entry.size,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    build_merged_xci_from_sources(template, &sources, output, cancel)
+}
+
+/// Assemble the merged XCI directly from NSRP's CNMT-selected files. No
+/// full-size PFS0 intermediate is generated, and each source is read once
+/// while the callback's temporary workspace is still alive.
+pub(crate) fn build_merged_xci_from_selected_files(
+    template: &Path,
+    files: &[(String, PathBuf)],
+    output: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let mut sources = Vec::with_capacity(files.len());
+    for (name, path) in files {
+        anyhow::ensure!(path != output, "선택된 XCI 입력이 출력과 같습니다");
+        sources.push(XciContentSource {
+            name: name.clone(),
+            path: path.clone(),
+            offset: 0,
+            size: std::fs::metadata(path)?.len(),
+        });
+    }
+    build_merged_xci_from_sources(template, &sources, output, cancel)
+}
+
+fn build_merged_xci_from_sources(
+    template: &Path,
+    sources: &[XciContentSource],
+    output: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 병합이 취소되었습니다");
+    anyhow::ensure!(template != output, "XCI 템플릿과 출력 경로 충돌");
+    anyhow::ensure!(
+        sources
+            .iter()
+            .any(|entry| entry.name.to_ascii_lowercase().ends_with(".nca")),
+        "선택된 병합 결과에 NCA가 없습니다"
     );
     let (root, head_base) = hfs0::find_xci_root_with_header_base(template)?;
     let head_base = head_base.context("게임카드 HEAD가 없는 XCI를 변환할 수 없습니다")?;
@@ -66,27 +133,13 @@ pub(crate) fn build_merged_xci_from_template(
         "게임카드 secure 파티션이 없습니다"
     );
 
-    let nsp_index =
-        Pfs0Index::parse(merged_nsp).context("CNMT 병합 결과 NSP를 파싱할 수 없습니다")?;
-    anyhow::ensure!(
-        nsp_index
-            .entries
-            .iter()
-            .any(|entry| { entry.name.to_ascii_lowercase().ends_with(".nca") }),
-        "병합 NSP에 NCA가 없습니다"
-    );
-    let inner_names: Vec<String> = nsp_index
-        .entries
-        .iter()
-        .map(|entry| entry.name.clone())
-        .collect();
+    let inner_names: Vec<String> = sources.iter().map(|entry| entry.name.clone()).collect();
     let root_names: Vec<String> = root
         .entries
         .iter()
         .map(|entry| entry.name.clone())
         .collect();
     let mut template_file = File::open(template)?;
-    let mut merged_file = File::open(merged_nsp)?;
     let mut buffer = vec![0u8; 2 * 1024 * 1024];
     let mut out = OpenOptions::new()
         .read(true)
@@ -117,14 +170,11 @@ pub(crate) fn build_merged_xci_from_template(
             let partition = &root.entries[index];
             if partition.name.eq_ignore_ascii_case("secure") {
                 hfs0::build_to_stream(&inner_names, output, 0x200, 0x200, cancel, |i, target| {
-                    let entry = &nsp_index.entries[i];
-                    let start = nsp_index
-                        .data_start
-                        .checked_add(entry.offset)
-                        .context("NSP 엔트리 오프셋 초과")?;
+                    let entry = &sources[i];
+                    let mut source = File::open(&entry.path)?;
                     copy_region(
-                        &mut merged_file,
-                        start,
+                        &mut source,
+                        entry.offset,
                         entry.size,
                         target,
                         cancel,
@@ -167,7 +217,7 @@ pub(crate) fn build_merged_xci_from_template(
     let secure_index = hfs0::Hfs0Index::parse_at(&mut out, secure_start, padded)
         .context("생성된 XCI secure 인덱스 검증 실패")?;
     anyhow::ensure!(
-        secure_index.entries.len() == nsp_index.entries.len(),
+        secure_index.entries.len() == sources.len(),
         "생성된 XCI secure의 콘텐츠 수가 일치하지 않습니다"
     );
     let header_len = new_root
@@ -308,6 +358,27 @@ mod tests {
         assert_eq!(sub.entries[1].name, "patch.cnmt.nca");
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert_eq!(std::fs::read(&merged).unwrap(), raw);
+        // Stage 10 must produce exactly the same XCI with selected files,
+        // without building or reading the legacy giant merged NSP.
+        let selected_base = temp.path().join("selected_base.nca");
+        let selected_patch = temp.path().join("selected_patch.cnmt.nca");
+        std::fs::write(&selected_base, [3u8; 0xC00]).unwrap();
+        std::fs::write(&selected_patch, [3u8; 0xC00]).unwrap();
+        let direct = temp.path().join("direct_selected.xci");
+        build_merged_xci_from_selected_files(
+            &source,
+            &[
+                ("base.nca".into(), selected_base),
+                ("patch.cnmt.nca".into(), selected_patch),
+            ],
+            &direct,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&direct).unwrap(),
+            std::fs::read(&result).unwrap()
+        );
     }
 
     #[test]

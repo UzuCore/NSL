@@ -1,8 +1,9 @@
 //! Safe NSRP-backed game patch merger, with native XCI assembly.
 //!
 //! The original title and downloaded update are *read-only*. NSRP operates in
-//! private workspaces, produces a CNMT-selected merged NSP, and optionally
-//! recompresses it to NSZ or builds and compresses an XCI/XCZ. Nothing is
+//! private workspaces. NSP/NSZ uses CNMT-selected NSP assembly; XCI/XCZ
+//! streams the selected materialized files directly into the gamecard without
+//! a redundant merged NSP (and reuses prepared XCZ inputs). Nothing is
 //! published beside the original before the result passes CNMT validation.
 
 use crate::{scanner, xci_merge};
@@ -313,23 +314,57 @@ pub(crate) fn merge_verified_package(
         };
         let sources = [original.to_path_buf(), patch.to_path_buf()];
         let mut logs = Vec::new();
-        let merged_outputs = merge::merge_packages(
-            &sources,
-            work.path(),
-            true,
-            work.path(),
-            &disabled_tool,
-            &prod_keys,
-            &mut keys,
-            &options,
-            &cancelled,
-            &mut |_| {},
-            &mut |line| {
-                if logs.len() < 100 {
-                    logs.push(line);
-                }
-            },
-        )
+        let merged_outputs = if matches!(format, OutputKind::Xci | OutputKind::Xcz) {
+            // The CNMT selector already materializes only the required
+            // NCAs/tickets. Feed them straight into the native gamecard
+            // writer while its workspace is alive: do not also assemble a
+            // full-size NSP and do not decode the XCZ template a second time.
+            let xci_output = work.path().join("merged.xci");
+            merge::merge_packages_selected(
+                &sources,
+                work.path(),
+                true,
+                work.path(),
+                &disabled_tool,
+                &prod_keys,
+                &mut keys,
+                &options,
+                &cancelled,
+                &mut |_| {},
+                &mut |line| {
+                    if logs.len() < 100 {
+                        logs.push(line);
+                    }
+                },
+                &mut |group| {
+                    xci_merge::build_merged_xci_from_selected_files(
+                        group.prepared_base,
+                        group.files,
+                        &xci_output,
+                        group.cancel,
+                    )?;
+                    Ok(xci_output.clone())
+                },
+            )
+        } else {
+            merge::merge_packages(
+                &sources,
+                work.path(),
+                true,
+                work.path(),
+                &disabled_tool,
+                &prod_keys,
+                &mut keys,
+                &options,
+                &cancelled,
+                &mut |_| {},
+                &mut |line| {
+                    if logs.len() < 100 {
+                        logs.push(line);
+                    }
+                },
+            )
+        }
         .with_context(|| format!("NSRP CNMT 병합 실패: {}", logs.join(" | ")))?;
         anyhow::ensure!(
             merged_outputs.len() == 1,
@@ -356,20 +391,9 @@ pub(crate) fn merge_verified_package(
                 target
             }
             OutputKind::Xci | OutputKind::Xcz => {
-                let template = if format == OutputKind::Xcz {
-                    let template = work.path().join("original.xci");
-                    xcz::decompress_xcz(original, &template, &cancelled, &mut |_| {}, &mut |_| {})?;
-                    template
-                } else {
-                    original.to_path_buf()
-                };
-                let xci_output = work.path().join("merged.xci");
-                xci_merge::build_merged_xci_from_template(
-                    &template,
-                    merged_nsp,
-                    &xci_output,
-                    &cancelled,
-                )?;
+                // `merge_packages_selected` already assembled this XCI
+                // directly from the selected raw content files.
+                let xci_output = merged_outputs[0].clone();
                 if format == OutputKind::Xci {
                     xci_output
                 } else {
@@ -473,6 +497,14 @@ pub(crate) fn merge_or_recover_existing(
 #[cfg(test)]
 #[path = "update_merge/real_qa.rs"]
 mod real_qa;
+
+#[cfg(test)]
+#[path = "update_merge/stage10_real_qa.rs"]
+mod stage10_real_qa;
+
+#[cfg(test)]
+#[path = "update_merge/stage10_wrapper_qa.rs"]
+mod stage10_wrapper_qa;
 
 #[cfg(test)]
 mod tests {

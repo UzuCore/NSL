@@ -379,9 +379,9 @@ impl NslApp {
                                             self.current_page = 0;
                                         }
                                         ui.horizontal(|ui| {
-                                            ui.label("타이틀 개수:");
-                                            let response = ui.add_enabled(
-                                                paging,
+                                            ui.label("타이틀 개수:")
+                                                .on_hover_text("스토어는 페이징 사용 여부와 관계없이 이 개수로 표시합니다.");
+                                            let response = ui.add(
                                                 egui::TextEdit::singleline(&mut page_size)
                                                     .desired_width(70.0),
                                             );
@@ -395,6 +395,8 @@ impl NslApp {
                                                     serde_json::Value::String(page_size.clone()),
                                                 );
                                                 self.current_page = 0;
+                                                self.catalog_page = 0;
+                                                self.catalog_scroll_reset = true;
                                             }
                                         });
                                     });

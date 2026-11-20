@@ -358,10 +358,107 @@ impl NslApp {
                 download_matches_filters(key, progress, &query, &self.download_status_filter)
             })
             .count();
-        let (pagination_rect, next_button_rect, page_changed) =
-            management_pagination_ui(ui, &mut self.download_page, matching_count);
+        let (pagination_rect, next_button_rect, page_changed) = management_pagination_ui(
+            ui,
+            &mut self.download_page,
+            matching_count,
+            MANAGEMENT_PAGE_SIZE,
+        );
         if page_changed {
             self.download_scroll_reset = true;
+        }
+        let focus_id = ui.make_persistent_id("downloads_keyboard_navigation");
+        let _focus_anchor = ui.interact(
+            ui.available_rect_before_wrap(),
+            focus_id,
+            egui::Sense::focusable_noninteractive(),
+        );
+        let visible_rows = (ui.available_height() / (130.0 + ui.spacing().item_spacing.y))
+            .floor()
+            .max(1.0) as usize;
+        let navigation = management_navigation_input(
+            ui.ctx(),
+            self.management_navigation_enabled(ui.ctx()),
+            visible_rows,
+        );
+        // Read the matching order, not the full unfiltered torrent array.
+        // This supports keyboard moves across 100-item download pages.
+        let mut keyboard_scroll_to_selected = false;
+        if page_changed || navigation.is_some() {
+            let query = self.download_search.trim().to_lowercase();
+            let matching: Vec<usize> = self
+                .torrent_progress
+                .iter()
+                .enumerate()
+                .filter(|(_, (key, progress))| {
+                    download_matches_filters(key, progress, &query, &self.download_status_filter)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let start = self.download_page * MANAGEMENT_PAGE_SIZE;
+            let end = (start + MANAGEMENT_PAGE_SIZE).min(matching.len());
+            let mut selected_index = matching.iter().position(|&index| {
+                self.download_selected.as_deref() == Some(self.torrent_progress[index].0.as_str())
+            });
+            if page_changed && !selected_index.is_some_and(|index| (start..end).contains(&index)) {
+                self.download_selected = matching
+                    .get(start)
+                    .map(|&index| self.torrent_progress[index].0.clone());
+                selected_index = (start < matching.len()).then_some(start);
+            }
+            if let Some(navigation) = navigation {
+                if let Some(target) = library_navigation_target(
+                    selected_index,
+                    matching.len(),
+                    start,
+                    end,
+                    navigation.step,
+                    navigation.home,
+                    navigation.end,
+                ) {
+                    let index = matching[target];
+                    self.download_selected = Some(self.torrent_progress[index].0.clone());
+                    let next_page = target / MANAGEMENT_PAGE_SIZE;
+                    if self.download_page != next_page {
+                        self.download_page = next_page;
+                        self.download_scroll_reset = true;
+                    }
+                    keyboard_scroll_to_selected = true;
+                    ui.ctx().memory_mut(|memory| memory.request_focus(focus_id));
+                    ui.ctx().request_repaint();
+                }
+                // Enter is the safe, reversible default action on a download:
+                // pause a running transfer or resume a paused one. Never delete.
+                if navigation.enter {
+                    if let Some((key, paused, finished, failed)) =
+                        self.download_selected.as_deref().and_then(|selected| {
+                            matching.iter().find_map(|&index| {
+                                let (key, progress) = &self.torrent_progress[index];
+                                (key == selected).then(|| {
+                                    (
+                                        key.clone(),
+                                        progress.paused,
+                                        progress.finished,
+                                        progress.error.is_some(),
+                                    )
+                                })
+                            })
+                        })
+                    {
+                        if !finished && !failed {
+                            if let Some(engine) = &self.torrent_engine {
+                                if paused {
+                                    engine.resume(&key);
+                                    self.status = "다운로드 재개 요청됨".into();
+                                } else {
+                                    engine.pause(&key);
+                                    self.status = "다운로드 일시정지 요청됨".into();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
@@ -404,7 +501,8 @@ impl NslApp {
         if std::mem::take(&mut self.download_scroll_reset) {
             download_scroll = download_scroll.vertical_scroll_offset(0.0);
         }
-        download_scroll.show(ui, |ui| {
+        let mut keyboard_selected_rect = None;
+        let _scroll = download_scroll.show(ui, |ui| {
             for (key, progress) in &entries {
                 let row_width = ui.available_width();
                 let card_id = ui.make_persistent_id(("download-card", key));
@@ -572,6 +670,18 @@ impl NslApp {
                     });
                 });
                 remember_card_geometry(ui.ctx(), card_id, card.rect, _row.response.rect);
+                #[cfg(test)]
+                if selected {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("nsl_test_download_selected_row"),
+                            (key.clone(), card.rect),
+                        );
+                    });
+                }
+                if keyboard_scroll_to_selected && selected {
+                    keyboard_selected_rect = Some(card.rect);
+                }
                 if card.clicked() || clicked_content {
                     self.download_selected = Some(key.clone());
                     ui.ctx().request_repaint();
@@ -584,6 +694,33 @@ impl NslApp {
                     }
                 });
             }
+        });
+        // A key jump may land far below the current viewport. Set the exact
+        // scroll state from the rendered card geometry so even End/PageDown
+        // reveal the selection on the very next frame (no long animation).
+        if let Some(rect) = keyboard_selected_rect {
+            let viewport = _scroll.inner_rect;
+            let delta = if rect.top() < viewport.top() {
+                rect.top() - viewport.top()
+            } else if rect.bottom() > viewport.bottom() {
+                rect.bottom() - viewport.bottom()
+            } else {
+                0.0
+            };
+            if delta.abs() > 0.5 {
+                let mut state = _scroll.state;
+                let max_offset = (_scroll.content_size.y - viewport.height()).max(0.0);
+                state.offset.y = (state.offset.y + delta).clamp(0.0, max_offset);
+                state.store(ui.ctx(), _scroll.id);
+                ui.ctx().request_repaint();
+            }
+        }
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_download_viewport"),
+                _scroll.inner_rect,
+            );
         });
     }
 }

@@ -484,6 +484,55 @@ fn library_navigation_target(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ManagementNavigation {
+    step: Option<isize>,
+    home: bool,
+    end: bool,
+    enter: bool,
+}
+
+/// Both Store and Downloads are vertical lists: either arrow changes one
+/// selection, Page Up/Down follows the visible viewport, Home/End span pages.
+/// This only reads raw input; callers reject focused text editors and dialogs.
+fn management_navigation_input(
+    ctx: &egui::Context,
+    enabled: bool,
+    visible_rows: usize,
+) -> Option<ManagementNavigation> {
+    if !enabled {
+        return None;
+    }
+    ctx.input(|input| {
+        let plain = !input.modifiers.ctrl && !input.modifiers.alt && !input.modifiers.shift;
+        let jump = !input.modifiers.alt && !input.modifiers.shift;
+        let step = if plain && input.key_pressed(egui::Key::PageUp) {
+            Some(-(visible_rows.max(1) as isize))
+        } else if plain && input.key_pressed(egui::Key::PageDown) {
+            Some(visible_rows.max(1) as isize)
+        } else if plain
+            && (input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowLeft))
+        {
+            Some(-1)
+        } else if plain
+            && (input.key_pressed(egui::Key::ArrowDown) || input.key_pressed(egui::Key::ArrowRight))
+        {
+            Some(1)
+        } else {
+            None
+        };
+        let home = jump && input.key_pressed(egui::Key::Home);
+        let end = jump && input.key_pressed(egui::Key::End);
+        let enter = plain && input.key_pressed(egui::Key::Enter);
+        (step.is_some() || home || end || enter).then_some(ManagementNavigation {
+            step,
+            home,
+            end,
+            enter,
+        })
+    })
+}
+
 /// Fit up to five directory tabs plus the fixed library tabs into the
 /// available width. Very narrow windows keep horizontal scrolling as a
 /// fallback instead of overlapping the controls.
@@ -608,6 +657,21 @@ fn draw_tab_button(
             [rect.right_top(), rect.right_bottom()],
             egui::Stroke::new(1.0_f32, border),
         );
+    }
+    if selected {
+        // The palette's active widget fill is its primary accent, unlike
+        // hyperlink_color (the secondary accent). Overlay a 2-point strip
+        // inside the tab without changing its layout or click area.
+        let accent_bar = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 2.0));
+        let accent_color = visuals.widgets.active.bg_fill;
+        painter.rect_filled(accent_bar, 0.0, accent_color);
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nsl_test_active_tab_top_bar"),
+                (accent_bar, accent_color),
+            );
+        });
     }
     let text_font = egui::TextStyle::Button.resolve(ui.style());
     let displayed = elide_tab_label(label, (width - 12.0).max(0.0), |text| {
@@ -1009,6 +1073,18 @@ fn download_matches_filters(
             || key.to_lowercase().contains(query))
 }
 
+/// Use the same configured page size for the library and the Store, even
+/// when library paging is disabled. Downloads retain their separate limit.
+fn configured_game_page_size(settings: &serde_json::Map<String, serde_json::Value>) -> usize {
+    settings
+        .get("page_size")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(500)
+        .min(99_999)
+}
+
 /// Use the library's compact previous / page / next layout in both management
 /// lists. Navigation belongs above the rows, never inside the right sidebar.
 const MANAGEMENT_PAGE_SIZE: usize = 100;
@@ -1017,8 +1093,9 @@ fn management_pagination_ui(
     ui: &mut egui::Ui,
     current_page: &mut usize,
     total_items: usize,
+    page_size: usize,
 ) -> (egui::Rect, egui::Rect, bool) {
-    let total_pages = total_items.div_ceil(MANAGEMENT_PAGE_SIZE).max(1);
+    let total_pages = total_items.div_ceil(page_size.max(1)).max(1);
     let previous = *current_page;
     *current_page = (*current_page).min(total_pages - 1);
     let mut next_button_rect = egui::Rect::NOTHING;

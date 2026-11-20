@@ -3,6 +3,35 @@
 use crate::*;
 
 impl NslApp {
+    /// Leave list shortcuts available while a row or paging button has focus,
+    /// but never intercept arrows from the search text edits or any popup.
+    pub(crate) fn management_navigation_enabled(&self, ctx: &egui::Context) -> bool {
+        let dialog_open = self.rename_preview.is_some()
+            || self.catalog_torrent_dialog.is_some()
+            || self.download_delete_confirm.is_some()
+            || self.bulk_rename_preview.is_some()
+            || self.titledb_info.is_some()
+            || self.clear_titledb_confirm
+            || self.clear_library_confirm
+            || self.remove_folder_confirm.is_some()
+            || self.folder_notice.is_some()
+            || self.orphan_cleanup_confirm
+            || self.workspace_cleanup_confirm
+            || self.update_info.is_some()
+            || self.update_ready.is_some()
+            || self.cache_info.is_some()
+            || self.shortcuts_open
+            || self.about_open
+            || self.exit_confirm;
+        !dialog_open
+            && !self.settings_open
+            && !ctx.memory(|memory| memory.any_popup_open())
+            && !ctx.memory(|memory| {
+                memory.has_focus(egui::Id::new("catalog_search"))
+                    || memory.has_focus(egui::Id::new("download_search"))
+            })
+    }
+
     /// Close just one visible overlay per Esc press. Popup drawing order in
     /// `ui_frame` determines which dialog is on top (last drawn wins). Never
     /// confirm destructive actions, launch updates or cancel running jobs.
@@ -260,7 +289,12 @@ impl NslApp {
                 }
             }
         }
-        if enter && !ctx.wants_keyboard_input() {
+        if enter
+            && !ctx.wants_keyboard_input()
+            && !self.settings_open
+            && !matches!(self.folder_filter.as_str(), "CATALOG" | "DOWNLOADS")
+            && !ctx.memory(|memory| memory.any_popup_open())
+        {
             if let Some(row) = self
                 .selected
                 .and_then(|id| self.rows.iter().find(|row| row.id == id))
@@ -1382,15 +1416,7 @@ impl NslApp {
                     .and_then(|v| v.as_str())
                     .unwrap_or("1")
                     == "1";
-                let page_size = self
-                    .config
-                    .settings
-                    .get("page_size")
-                    .and_then(|v| v.as_str())
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .filter(|v| *v > 0)
-                    .unwrap_or(200)
-                    .min(99_999);
+                let page_size = configured_game_page_size(&self.config.settings);
                 let page_count = matching.len().div_ceil(page_size).max(1);
                 self.current_page = self.current_page.min(page_count - 1);
                 let previous_page = self.current_page;

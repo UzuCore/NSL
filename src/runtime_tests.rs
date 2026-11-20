@@ -1963,6 +1963,10 @@ fn download_paging_clicks_and_clamps_to_filtered_job_count() {
 #[test]
 fn store_left_paging_click_and_filter_reset_keep_all_catalog_rows() {
     let (mut app, _dir) = seeded_app();
+    // Keep this fixture's historical 100-item page expectations explicit;
+    // Store now uses Settings.page_size rather than a hard-coded value.
+    app.config.settings.insert("page_size".into(), "100".into());
+    app.config.settings.insert("paging_on".into(), "0".into());
     app.folder_filter = "CATALOG".into();
     app.catalog_state.items = (0..225)
         .map(|i| catalog::CatalogItem {
@@ -2502,6 +2506,8 @@ fn store_first_catalog_item_is_fully_visible_after_opening_tab() {
 #[test]
 fn store_catalog_does_not_truncate_at_two_thousand_entries() {
     let (mut app, _dir) = seeded_app();
+    app.config.settings.insert("page_size".into(), "100".into());
+    app.config.settings.insert("paging_on".into(), "0".into());
     app.catalog_state.items = (0..2_101)
         .map(|i| catalog::CatalogItem {
             title: format!("Catalog item {i}"),
@@ -3012,6 +3018,262 @@ fn escape_closes_native_context_menu_before_dialogs_and_log() {
     assert_eq!(app.download_search, "preserved query");
     send_escape_to_app(&mut app, &ctx);
     assert!(app.download_search.is_empty());
+}
+
+/// A desktop-style key-down/up cycle through the real egui update loop.
+fn management_key_frame(app: &mut NslApp, ctx: &egui::Context, key: egui::Key) {
+    for pressed in [true, false] {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1456.0, 900.0),
+            )),
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        });
+        app.ui_frame(ctx);
+        let _ = ctx.end_pass();
+    }
+}
+
+#[test]
+fn store_uses_configured_page_size_even_when_library_paging_is_disabled() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_title_metadata_loaded = true;
+    app.catalog_state.items = (0..9)
+        .map(|i| catalog::CatalogItem {
+            title: format!("Store title {i}"),
+            topic_id: format!("store-{i:03}"),
+            ..Default::default()
+        })
+        .collect();
+    app.config.settings.insert("paging_on".into(), "0".into());
+    app.config.settings.insert("page_size".into(), "3".into());
+    app.catalog_search_cache = None;
+    draw_card_test_frames(&ctx, &mut app, 3);
+    assert_eq!(app.catalog_page, 0);
+    assert_eq!(app.catalog_matching_indices.len(), 9);
+    let visible = ctx.data_mut(|data| {
+        data.get_temp::<usize>(egui::Id::new("nsl_test_catalog_visible_items"))
+            .unwrap()
+    });
+    assert_eq!(visible, 3);
+
+    app.catalog_page = 1;
+    draw_card_test_frames(&ctx, &mut app, 2);
+    assert_eq!(app.catalog_page, 1);
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<usize>(egui::Id::new("nsl_test_catalog_visible_items"))),
+        Some(3)
+    );
+    app.config.settings.insert("page_size".into(), "2".into());
+    app.catalog_page = 0;
+    draw_card_test_frames(&ctx, &mut app, 2);
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<usize>(egui::Id::new("nsl_test_catalog_visible_items"))),
+        Some(2)
+    );
+    app.catalog_page = 4;
+    draw_card_test_frames(&ctx, &mut app, 2);
+    assert_eq!(app.catalog_page, 4);
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<usize>(egui::Id::new("nsl_test_catalog_visible_items"))),
+        Some(1)
+    );
+    assert_eq!(configured_game_page_size(&app.config.settings), 2);
+}
+
+#[test]
+fn store_and_downloads_keyboard_navigation_crosses_page_boundaries() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_title_metadata_loaded = true;
+    app.catalog_state.items = (0..9)
+        .map(|i| catalog::CatalogItem {
+            title: format!("Keyboard title {i}"),
+            topic_id: format!("store-{i:03}"),
+            ..Default::default()
+        })
+        .collect();
+    app.catalog_search_cache = None;
+    app.config.settings.insert("page_size".into(), "3".into());
+    app.config.settings.insert("paging_on".into(), "0".into());
+    draw_card_test_frames(&ctx, &mut app, 3);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-000"));
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowDown);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-001"));
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowRight);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-002"));
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowDown);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-003"));
+    assert_eq!(app.catalog_page, 1);
+    management_key_frame(&mut app, &ctx, egui::Key::End);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-008"));
+    assert_eq!(app.catalog_page, 2);
+    management_key_frame(&mut app, &ctx, egui::Key::Home);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-000"));
+    assert_eq!(app.catalog_page, 0);
+    // Search text editing and a modal dialog must override list shortcuts.
+    ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("catalog_search")));
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowDown);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-000"));
+    ctx.memory_mut(|memory| memory.surrender_focus(egui::Id::new("catalog_search")));
+    app.about_open = true;
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowDown);
+    assert_eq!(app.catalog_selected.as_deref(), Some("store-000"));
+    app.about_open = false;
+
+    app.folder_filter = "DOWNLOADS".into();
+    app.download_selected = None;
+    app.torrent_progress = (0..105)
+        .map(|i| {
+            (
+                format!("job-{i:03}"),
+                torrent::TorrentProgress {
+                    name: format!("Download {i}"),
+                    total_bytes: 1000,
+                    progress_bytes: 100,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    draw_card_test_frames(&ctx, &mut app, 3);
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowDown);
+    assert_eq!(app.download_selected.as_deref(), Some("job-000"));
+    management_key_frame(&mut app, &ctx, egui::Key::ArrowRight);
+    assert_eq!(app.download_selected.as_deref(), Some("job-001"));
+    management_key_frame(&mut app, &ctx, egui::Key::End);
+    assert_eq!(app.download_selected.as_deref(), Some("job-104"));
+    assert_eq!(app.download_page, 1);
+    management_key_frame(&mut app, &ctx, egui::Key::Home);
+    assert_eq!(app.download_selected.as_deref(), Some("job-000"));
+    assert_eq!(app.download_page, 0);
+    // Store's configured page size must not silently change download paging.
+    assert_eq!(
+        ctx.data_mut(
+            |data| data.get_temp::<usize>(egui::Id::new("nsl_test_download_visible_items"))
+        ),
+        Some(100)
+    );
+}
+
+#[test]
+fn management_keyboard_end_reveals_selected_row_in_long_scrollable_lists() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_title_metadata_loaded = true;
+    app.config.settings.insert("page_size".into(), "120".into());
+    app.catalog_state.items = (0..120)
+        .map(|index| catalog::CatalogItem {
+            title: format!("Scrolled title {index}"),
+            topic_id: format!("scroll-{index:03}"),
+            ..Default::default()
+        })
+        .collect();
+    app.catalog_search_cache = None;
+    draw_card_test_frames(&ctx, &mut app, 3);
+    management_key_frame(&mut app, &ctx, egui::Key::End);
+    draw_card_test_frames(&ctx, &mut app, 3);
+    assert_eq!(app.catalog_selected.as_deref(), Some("scroll-119"));
+    let ((id, row), viewport) = ctx.data_mut(|data| {
+        (
+            data.get_temp::<(String, egui::Rect)>(egui::Id::new("nsl_test_catalog_selected_row"))
+                .expect("selected virtualized store row was not rendered"),
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_catalog_viewport"))
+                .unwrap(),
+        )
+    });
+    assert_eq!(id, "scroll-119");
+    assert!(
+        row.top() >= viewport.top() - 3.0 && row.bottom() <= viewport.bottom() + 3.0,
+        "selected Store row is outside the visible viewport: row={row:?}, viewport={viewport:?}"
+    );
+
+    app.folder_filter = "DOWNLOADS".into();
+    app.torrent_progress = (0..100)
+        .map(|index| {
+            (
+                format!("download-{index:03}"),
+                torrent::TorrentProgress {
+                    name: format!("Test task {index}"),
+                    total_bytes: 10_000,
+                    progress_bytes: 1_000,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+    app.download_page = 0;
+    app.download_selected = None;
+    app.download_scroll_reset = true;
+    draw_card_test_frames(&ctx, &mut app, 2);
+    management_key_frame(&mut app, &ctx, egui::Key::End);
+    draw_card_test_frames(&ctx, &mut app, 3);
+    assert_eq!(app.download_selected.as_deref(), Some("download-099"));
+    let ((id, row), viewport) = ctx.data_mut(|data| {
+        (
+            data.get_temp::<(String, egui::Rect)>(egui::Id::new("nsl_test_download_selected_row"))
+                .expect("selected Download row was not rendered"),
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_download_viewport"))
+                .unwrap(),
+        )
+    });
+    assert_eq!(id, "download-099");
+    assert!(
+        row.top() >= viewport.top() - 3.0 && row.bottom() <= viewport.bottom() + 3.0,
+        "selected Download row is outside the visible viewport: row={row:?}, viewport={viewport:?}"
+    );
+}
+
+#[test]
+fn active_tab_draws_two_pixel_primary_theme_accent_for_each_screen() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.torrent_engine = None;
+    for theme_id in ["github_dark", "github_light", "catppuccin_mocha"] {
+        app.config.settings.insert("theme".into(), theme_id.into());
+        for tab_key in ["", "CATALOG", "DOWNLOADS"] {
+            app.folder_filter = tab_key.into();
+            draw_card_test_frames(&ctx, &mut app, 2);
+            let tabs = app.library_tabs_cached().to_vec();
+            let selected_index = tabs.iter().position(|(key, _)| key == tab_key).unwrap();
+            let (_, _, rects) = ctx.data_mut(|data| {
+                data.get_temp::<(f32, Vec<f32>, Vec<egui::Rect>)>(egui::Id::new(
+                    "nsl_test_directory_tab_layout",
+                ))
+                .unwrap()
+            });
+            let (bar, color) = ctx.data_mut(|data| {
+                data.get_temp::<(egui::Rect, egui::Color32)>(egui::Id::new(
+                    "nsl_test_active_tab_top_bar",
+                ))
+                .unwrap()
+            });
+            let tab = rects[selected_index];
+            assert_eq!(bar.width(), tab.width());
+            assert_eq!(bar.height(), 2.0);
+            assert_eq!(bar.min, tab.min);
+            assert_eq!(color, ctx.style().visuals.widgets.active.bg_fill);
+        }
+    }
 }
 
 #[test]

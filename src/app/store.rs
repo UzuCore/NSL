@@ -671,13 +671,89 @@ impl NslApp {
             });
             return;
         }
+        // Store paging is always on, irrespective of the library's paging_on
+        // checkbox, but uses the same user-selected games-per-page setting.
+        let page_size = configured_game_page_size(&self.config.settings);
         let (pagination_rect, next_button_rect, page_changed) = management_pagination_ui(
             ui,
             &mut self.catalog_page,
             self.catalog_matching_indices.len(),
+            page_size,
         );
         if page_changed {
             self.catalog_scroll_reset = true;
+        }
+        // Selecting a different page must not highlight a hidden title.
+        if page_changed {
+            let start = self.catalog_page * page_size;
+            let end = start
+                .saturating_add(page_size)
+                .min(self.catalog_matching_indices.len());
+            let is_visible = self.catalog_matching_indices[start..end]
+                .iter()
+                .any(|&index| {
+                    self.catalog_selected.as_deref()
+                        == Some(self.catalog_state.items[index].topic_id.as_str())
+                });
+            if !is_visible {
+                self.catalog_selected = self
+                    .catalog_matching_indices
+                    .get(start)
+                    .map(|&index| self.catalog_state.items[index].topic_id.clone());
+            }
+        }
+        let focus_id = ui.make_persistent_id("catalog_keyboard_navigation");
+        let _focus_anchor = ui.interact(
+            ui.available_rect_before_wrap(),
+            focus_id,
+            egui::Sense::focusable_noninteractive(),
+        );
+        let visible_rows = (ui.available_height() / (72.0 + ui.spacing().item_spacing.y))
+            .floor()
+            .max(1.0) as usize;
+        let navigation = management_navigation_input(
+            ui.ctx(),
+            self.management_navigation_enabled(ui.ctx()),
+            visible_rows,
+        );
+        let mut keyboard_scroll_row = None;
+        if let Some(navigation) = navigation {
+            let selected_index = self.catalog_matching_indices.iter().position(|&index| {
+                self.catalog_selected.as_deref()
+                    == Some(self.catalog_state.items[index].topic_id.as_str())
+            });
+            let page_start = self.catalog_page * page_size;
+            let page_end = (page_start + page_size).min(self.catalog_matching_indices.len());
+            if let Some(target) = library_navigation_target(
+                selected_index,
+                self.catalog_matching_indices.len(),
+                page_start,
+                page_end,
+                navigation.step,
+                navigation.home,
+                navigation.end,
+            ) {
+                let index = self.catalog_matching_indices[target];
+                self.catalog_selected = Some(self.catalog_state.items[index].topic_id.clone());
+                let next_page = target / page_size;
+                if self.catalog_page != next_page {
+                    self.catalog_page = next_page;
+                    self.catalog_scroll_reset = true;
+                }
+                keyboard_scroll_row = Some(target % page_size);
+                ui.ctx().memory_mut(|memory| memory.request_focus(focus_id));
+                ui.ctx().request_repaint();
+            }
+            if navigation.enter {
+                if let Some(item) = self.catalog_selected.as_deref().and_then(|selected| {
+                    self.catalog_matching_indices.iter().find_map(|&index| {
+                        let item = &self.catalog_state.items[index];
+                        (item.topic_id == selected).then(|| item.clone())
+                    })
+                }) {
+                    self.start_catalog_torrent(&item);
+                }
+            }
         }
         #[cfg(test)]
         ui.ctx().data_mut(|data| {
@@ -693,7 +769,6 @@ impl NslApp {
         #[cfg(not(test))]
         let _ = (pagination_rect, next_button_rect);
         ui.add_space(6.0);
-        let page_size = MANAGEMENT_PAGE_SIZE;
         // Keep only lightweight indices for the page. Clone heavyweight
         // catalog entries (magnet links and other strings) only for the rows
         // that the virtualized scroll area will actually display.
@@ -723,8 +798,32 @@ impl NslApp {
         let mut catalog_scroll = egui::ScrollArea::vertical()
             .id_salt("catalog_rows")
             .auto_shrink([false, false]);
-        if std::mem::take(&mut self.catalog_scroll_reset) {
+        let reset_scroll = std::mem::take(&mut self.catalog_scroll_reset);
+        if reset_scroll {
             catalog_scroll = catalog_scroll.vertical_scroll_offset(0.0);
+        }
+        if let Some(index) = keyboard_scroll_row {
+            let old_offset = if reset_scroll {
+                0.0
+            } else {
+                ui.ctx().data_mut(|data| {
+                    data.get_temp::<f32>(egui::Id::new("catalog_last_scroll_y"))
+                        .unwrap_or(0.0)
+                })
+            };
+            let viewport_height = ui.ctx().data_mut(|data| {
+                data.get_temp::<f32>(egui::Id::new("catalog_last_viewport_height"))
+                    .unwrap_or_else(|| ui.available_height())
+            });
+            if let Some(offset) = scroll_offset_for_selected_row(
+                old_offset,
+                viewport_height,
+                index,
+                72.0 + ui.spacing().item_spacing.y,
+                72.0,
+            ) {
+                catalog_scroll = catalog_scroll.vertical_scroll_offset(offset);
+            }
         }
         let _catalog_scroll =
             catalog_scroll.show_rows(ui, 72.0, page_indices.len(), |ui, row_range| {
@@ -872,6 +971,15 @@ impl NslApp {
                     // Labels and cover images also have their own hit regions.
                     // Never turn the action button into a selection click.
                     remember_card_geometry(ui.ctx(), card_id, card.rect, _response.response.rect);
+                    #[cfg(test)]
+                    if selected {
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_catalog_selected_row"),
+                                (item.topic_id.clone(), card.rect),
+                            );
+                        });
+                    }
                     if card.clicked() || clicked_content {
                         self.catalog_selected = Some(item.topic_id.clone());
                         ui.ctx().request_repaint();
@@ -894,6 +1002,16 @@ impl NslApp {
                 egui::Id::new("nsl_test_catalog_viewport"),
                 _catalog_scroll.inner_rect,
             )
+        });
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("catalog_last_scroll_y"),
+                _catalog_scroll.state.offset.y,
+            );
+            data.insert_temp(
+                egui::Id::new("catalog_last_viewport_height"),
+                _catalog_scroll.inner_rect.height(),
+            );
         });
         self.start_cover_prefetch(cover_jobs);
     }

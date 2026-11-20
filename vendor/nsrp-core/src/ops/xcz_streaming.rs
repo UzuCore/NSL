@@ -103,49 +103,8 @@ pub(super) fn transform_xci_streamed(
     // keys (or an XCZ can contain no NCZ). Rebuilding such a file would
     // normalize otherwise untouched headers, and then copying again would
     // waste multiple GiB of I/O. Inspect only the small nested headers first.
-    let mut planned_changes = false;
-    let mut inspected_ncas = 0usize;
-    'partitions: for partition in &root.entries {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("작업이 중단되었습니다");
-        }
-        let partition_abs = root
-            .data_start
-            .checked_add(partition.offset)
-            .context("XCI partition offset overflow")?;
-        let Ok(sub) = Hfs0Index::parse_at(&mut source, partition_abs, input_size) else {
-            continue;
-        };
-        for entry in &sub.entries {
-            if cancel.load(Ordering::Relaxed) {
-                bail!("작업이 중단되었습니다");
-            }
-            let lower = entry.name.to_ascii_lowercase();
-            if let Some((keys, _)) = compress.as_mut() {
-                if !lower.ends_with(".nca") {
-                    continue;
-                }
-                inspected_ncas += 1;
-                if entry.size < NCA_NCZ_HEADER_SIZE as u64 {
-                    continue;
-                }
-                let abs = sub
-                    .data_start
-                    .checked_add(entry.offset)
-                    .context("XCI NCA offset overflow")?;
-                let mut header = vec![0u8; NCA_NCZ_HEADER_SIZE];
-                source.seek(SeekFrom::Start(abs))?;
-                source.read_exact(&mut header)?;
-                if make_ncz_plan_from_reader(&mut source, abs, entry.size, &header, keys).is_ok() {
-                    planned_changes = true;
-                    break 'partitions;
-                }
-            } else if lower.ends_with(".ncz") {
-                planned_changes = true;
-                break 'partitions;
-            }
-        }
-    }
+    let (planned_changes, inspected_ncas) =
+        super::preflight_xci_change(&mut source, input_size, &root, &mut compress, cancel)?;
     if !planned_changes {
         let out = temporary.as_file_mut();
         source.seek(SeekFrom::Start(0))?;

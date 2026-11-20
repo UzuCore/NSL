@@ -58,6 +58,58 @@ fn publish_xcz_output(mut staged: tempfile::NamedTempFile, output: &Path) -> Res
     Ok(fs::metadata(output)?.len())
 }
 
+/// Inspect only nested HFS0 indexes and small NCA headers to determine
+/// whether this XCZ operation can preserve every input byte unchanged.
+/// Both streaming and compatibility implementations share this decision.
+fn preflight_xci_change<R: Read + Seek>(
+    source: &mut R,
+    source_size: u64,
+    root: &Hfs0Index,
+    compress: &mut Option<(&mut KeySet, &XczOptions)>,
+    cancel: &AtomicBool,
+) -> Result<(bool, usize)> {
+    let mut inspected_ncas = 0usize;
+    for partition in &root.entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("작업이 중단되었습니다");
+        }
+        let partition_at = root
+            .data_start
+            .checked_add(partition.offset)
+            .context("XCI 파티션 오프셋 오버플로")?;
+        let Ok(sub) = Hfs0Index::parse_at(source, partition_at, source_size) else {
+            continue;
+        };
+        for entry in &sub.entries {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("작업이 중단되었습니다");
+            }
+            if let Some((keys, _)) = compress.as_mut() {
+                if !entry.name.to_ascii_lowercase().ends_with(".nca") {
+                    continue;
+                }
+                inspected_ncas += 1;
+                if entry.size < NCA_NCZ_HEADER_SIZE as u64 {
+                    continue;
+                }
+                let absolute = sub
+                    .data_start
+                    .checked_add(entry.offset)
+                    .context("XCI NCA 오프셋 오버플로")?;
+                let mut header = vec![0u8; NCA_NCZ_HEADER_SIZE];
+                source.seek(SeekFrom::Start(absolute))?;
+                source.read_exact(&mut header)?;
+                if make_ncz_plan_from_reader(source, absolute, entry.size, &header, keys).is_ok() {
+                    return Ok((true, inspected_ncas));
+                }
+            } else if entry.name.to_ascii_lowercase().ends_with(".ncz") {
+                return Ok((true, inspected_ncas));
+            }
+        }
+    }
+    Ok((false, inspected_ncas))
+}
+
 pub fn compress_xci(
     input: &Path,
     output: &Path,
@@ -148,9 +200,6 @@ fn transform_xci_staged(
             output.display()
         );
     }
-    let temp = tempfile::Builder::new()
-        .prefix("nsrp_xcz_")
-        .tempdir_in(out_parent)?;
     let mut source = BufReader::with_capacity(8 * 1024 * 1024, File::open(input)?);
     // Reuse one bounded copy buffer across all partition files instead of
     // repeatedly allocating an 8MiB scratch area for every small entry.
@@ -159,6 +208,54 @@ fn transform_xci_staged(
     if let Some((keys, _)) = compress.as_mut() {
         collect_xci_ticket_keys(&mut source, input_size, &root, keys)?;
     }
+
+    let (planned_changes, inspected_ncas) =
+        preflight_xci_change(&mut source, input_size, &root, &mut compress, cancel)?;
+    if !planned_changes {
+        // Compatibility staging used to materialize every NCA, rebuild
+        // every HFS0 layer and copy them again even when all NCAs were
+        // uncompressible. Preserve the original *bytes* with one bounded
+        // copy and no large intermediate files instead.
+        let mut staged = tempfile::Builder::new()
+            .prefix(".nsrp-xcz-unchanged-")
+            .suffix(".partial")
+            .tempfile_in(out_parent)?;
+        source.seek(SeekFrom::Start(0))?;
+        let mut copied = 0u64;
+        {
+            let mut writer = BufWriter::with_capacity(scratch.len(), staged.as_file_mut());
+            while copied < input_size {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("작업이 중단되었습니다");
+                }
+                let length = (input_size - copied).min(scratch.len() as u64) as usize;
+                source.read_exact(&mut scratch[..length])?;
+                writer.write_all(&scratch[..length])?;
+                copied += length as u64;
+                progress(copied as f32 / input_size.max(1) as f32 * 0.99);
+            }
+            writer.flush()?;
+        }
+        if staged.as_file().metadata()?.len() != input_size {
+            bail!("변경 없는 XCI 복사 길이가 일치하지 않습니다");
+        }
+        if cancel.load(Ordering::Relaxed) {
+            bail!("작업이 중단되었습니다");
+        }
+        let output_size = publish_xcz_output(staged, output)?;
+        log("No NCA/NCZ was transformed; original XCI bytes preserved".into());
+        progress(1.0);
+        return Ok(XczStats {
+            input_size,
+            output_size,
+            nca_count: inspected_ncas,
+            ncz_count: 0,
+        });
+    }
+
+    let temp = tempfile::Builder::new()
+        .prefix("nsrp_xcz_")
+        .tempdir_in(out_parent)?;
 
     let total_payload = root.entries.iter().map(|e| e.size).sum::<u64>().max(1);
     let mut root_done = 0u64;
@@ -473,6 +570,10 @@ fn replace_extension(name: &str, extension: &str) -> String {
 mod bktr_tests;
 
 #[cfg(test)]
+#[path = "xcz_stage9_real_qa.rs"]
+mod stage9_real_qa;
+
+#[cfg(test)]
 mod stage8_compat_tests {
     use super::*;
 
@@ -553,12 +654,89 @@ mod stage8_compat_tests {
             assert_eq!(content[0].2, 1024 * 1024 + 127);
         }
         assert_eq!(fs::read(&streamed)?, fs::read(&original)?);
+        assert_eq!(
+            fs::read(&staged)?,
+            fs::read(&original)?,
+            "unchanged compatibility path must keep noncanonical XCI bytes"
+        );
         let old_hash = sha256_file(&staged)?;
         assert!(
             transform_xci_staged(&original, &staged, None, &cancel, &mut |_| {}, &mut |_| {})
                 .is_err()
         );
         assert_eq!(sha256_file(&staged)?, old_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_compression_without_usable_keys_skips_intermediate_rebuilds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let original = test_xci(temp.path())?;
+        let output = temp.path().join("unmodified.xcz");
+        let before = sha256_file(&original)?;
+        let cancel = AtomicBool::new(false);
+        let mut keys = KeySet::default();
+        let mut messages = Vec::new();
+        let stats = transform_xci_staged(
+            &original,
+            &output,
+            Some((&mut keys, &XczOptions::default())),
+            &cancel,
+            &mut |_| {},
+            &mut |message| messages.push(message),
+        )?;
+        assert_eq!(stats.nca_count, 1);
+        assert_eq!(stats.ncz_count, 0);
+        assert_eq!(stats.input_size, stats.output_size);
+        assert_eq!(before, sha256_file(&output)?);
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("original XCI bytes preserved"))
+        );
+        assert!(fs::read_dir(temp.path())?.all(|entry| {
+            let name = entry.expect("temporary entry").file_name();
+            !name.to_string_lossy().starts_with("nsrp_xcz_")
+                && !name.to_string_lossy().ends_with(".partial")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_nochange_cancel_during_copy_removes_private_partial() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = test_xci(temp.path())?;
+        // Make the unchanged gamecard larger than the 2MiB copy buffer.
+        // The appended opaque bytes are preserved by the valid HFS0 index.
+        let mut append = fs::OpenOptions::new().append(true).open(&source)?;
+        append.write_all(&vec![0x5au8; 5 * 1024 * 1024])?;
+        drop(append);
+        let input_hash = sha256_file(&source)?;
+        let target = temp.path().join("cancelled-mid-copy.xcz");
+        let cancel = AtomicBool::new(false);
+        let result = transform_xci_staged(
+            &source,
+            &target,
+            None,
+            &cancel,
+            &mut |p| {
+                if p > 0.0 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+            &mut |_| {},
+        );
+        assert!(result.is_err());
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!target.exists());
+        assert_eq!(input_hash, sha256_file(&source)?);
+        assert!(fs::read_dir(temp.path())?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("nsrp-xcz-unchanged-")
+        }));
         Ok(())
     }
 

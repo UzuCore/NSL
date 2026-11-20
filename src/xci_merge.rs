@@ -13,13 +13,34 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::Path,
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
-fn copy_region(input: &mut File, start: u64, len: u64, out: &mut File) -> Result<()> {
+/// Bounded XCI copy that stays cancellable even inside a huge NCA or opaque
+/// gamecard partition. Reuse a buffer across all nested output entries.
+fn copy_region(
+    input: &mut File,
+    start: u64,
+    len: u64,
+    out: &mut File,
+    cancel: &AtomicBool,
+    buffer: &mut [u8],
+) -> Result<()> {
+    anyhow::ensure!(!buffer.is_empty(), "XCI 복사 버퍼가 비었습니다");
+    let end = start.checked_add(len).context("XCI 복사 크기 오버플로")?;
+    anyhow::ensure!(
+        end <= input.metadata()?.len(),
+        "XCI 파티션 데이터가 원본 파일 범위를 초과합니다"
+    );
     input.seek(SeekFrom::Start(start))?;
-    let copied = std::io::copy(&mut input.take(len), out)?;
-    anyhow::ensure!(copied == len, "XCI 파티션 데이터가 잘렸습니다");
+    let mut remaining = len;
+    while remaining > 0 {
+        anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 복사가 취소되었습니다");
+        let take = remaining.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..take])?;
+        out.write_all(&buffer[..take])?;
+        remaining -= take as u64;
+    }
     Ok(())
 }
 
@@ -29,6 +50,7 @@ pub(crate) fn build_merged_xci_from_template(
     output: &Path,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 병합이 취소되었습니다");
     anyhow::ensure!(
         template != output && merged_nsp != output,
         "입출력 경로 충돌"
@@ -65,6 +87,7 @@ pub(crate) fn build_merged_xci_from_template(
         .collect();
     let mut template_file = File::open(template)?;
     let mut merged_file = File::open(merged_nsp)?;
+    let mut buffer = vec![0u8; 2 * 1024 * 1024];
     let mut out = OpenOptions::new()
         .read(true)
         .write(true)
@@ -73,7 +96,14 @@ pub(crate) fn build_merged_xci_from_template(
         .with_context(|| format!("XCI 출력 파일 생성 실패: {}", output.display()))?;
     // Only the private temporary file is ever partially written. The caller
     // owns the enclosing staging directory and never publishes on failure.
-    copy_region(&mut template_file, 0, root.base, &mut out)?;
+    copy_region(
+        &mut template_file,
+        0,
+        root.base,
+        &mut out,
+        cancel,
+        &mut buffer,
+    )?;
 
     let original_root_data_start = root.data_start;
     out.seek(SeekFrom::Start(root.base))?;
@@ -92,17 +122,32 @@ pub(crate) fn build_merged_xci_from_template(
                         .data_start
                         .checked_add(entry.offset)
                         .context("NSP 엔트리 오프셋 초과")?;
-                    copy_region(&mut merged_file, start, entry.size, target)
+                    copy_region(
+                        &mut merged_file,
+                        start,
+                        entry.size,
+                        target,
+                        cancel,
+                        &mut buffer,
+                    )
                 })?;
             } else {
                 let start = original_root_data_start
                     .checked_add(partition.offset)
                     .context("XCI 파티션 오프셋 초과")?;
-                copy_region(&mut template_file, start, partition.size, output)?;
+                copy_region(
+                    &mut template_file,
+                    start,
+                    partition.size,
+                    output,
+                    cancel,
+                    &mut buffer,
+                )?;
             }
             Ok(())
         },
     )?;
+    anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 병합이 취소되었습니다");
 
     let end = out.seek(SeekFrom::End(0))?;
     let padded = end
@@ -158,6 +203,7 @@ pub(crate) fn build_merged_xci_from_template(
     head[0x140..0x160].copy_from_slice(&hash);
     out.seek(SeekFrom::Start(head_base))?;
     out.write_all(&head)?;
+    anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 병합이 취소되었습니다");
     out.sync_all()?;
     Ok(())
 }
@@ -262,5 +308,63 @@ mod tests {
         assert_eq!(sub.entries[1].name, "patch.cnmt.nca");
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert_eq!(std::fs::read(&merged).unwrap(), raw);
+    }
+
+    #[test]
+    fn bounded_large_region_copy_preserves_bytes_and_rejects_cancel() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("large_source.bin");
+        let destination = temp.path().join("copied.bin");
+        let bytes = (0..(7 * 1024 * 1024 + 137))
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&source, &bytes).unwrap();
+        let mut input = File::open(&source).unwrap();
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&destination)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut scratch = vec![0u8; 256 * 1024];
+        let start = 173;
+        let len = bytes.len() as u64 - 319;
+        copy_region(&mut input, start, len, &mut output, &cancel, &mut scratch).unwrap();
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            bytes[start as usize..start as usize + len as usize]
+        );
+        let before = output.metadata().unwrap().len();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(copy_region(&mut input, 0, 1024, &mut output, &cancel, &mut scratch).is_err());
+        assert_eq!(output.metadata().unwrap().len(), before);
+
+        cancel.store(false, Ordering::Relaxed);
+        assert!(copy_region(
+            &mut input,
+            bytes.len() as u64 - 20,
+            200,
+            &mut output,
+            &cancel,
+            &mut scratch,
+        )
+        .is_err());
+        assert_eq!(output.metadata().unwrap().len(), before);
+    }
+
+    #[test]
+    fn cancelled_xci_builder_does_not_create_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("must_not_exist.xci");
+        let cancel = AtomicBool::new(true);
+        assert!(build_merged_xci_from_template(
+            &temp.path().join("absent.xci"),
+            &temp.path().join("absent.nsp"),
+            &output,
+            &cancel,
+        )
+        .is_err());
+        assert!(!output.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

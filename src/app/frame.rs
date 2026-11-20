@@ -70,6 +70,7 @@ impl NslApp {
         } else if self.catalog_torrent_dialog.is_some() {
             // Dropping an outstanding preview also cancels its metadata request.
             self.catalog_torrent_dialog = None;
+            self.status = "토렌트 파일 선택 취소됨".into();
         } else if self.rename_preview.is_some() {
             self.rename_preview = None;
         } else if self.settings_open {
@@ -129,6 +130,15 @@ impl NslApp {
                 || ProgressView::busy("게임 카탈로그 다운로드"),
                 |progress| ProgressView::from_task(progress.snapshot()),
             ));
+        }
+        if self
+            .catalog_torrent_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.request.is_some())
+        {
+            // Treat magnet metadata resolution as progress only while the
+            // actual request is alive, never as a sticky status string.
+            views.push(ProgressView::busy("토렌트 파일 목록 확인"));
         }
         if self.bulk_rename_result.is_some() {
             views.push(self.rename_progress.as_ref().map_or_else(
@@ -920,6 +930,13 @@ impl NslApp {
                         ui.visuals().text_color(),
                     );
                     message_response.on_hover_text(&status_message);
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("nsl_test_status_message"),
+                            status_message.clone(),
+                        );
+                    });
                     let progress_response =
                         if primary.is_some_and(|task| task.fraction.is_none()) {
                             // An animated segment, not a fabricated 0-100% value,
@@ -2393,21 +2410,38 @@ impl NslApp {
                     Ok(Ok(preview)) => {
                         dialog.request = None;
                         match torrent_file_picker::TorrentFilePicker::new(preview) {
-                            Ok(files) => dialog.files = Some(files),
-                            Err(error) => dialog.error = Some(error.to_string()),
+                            Ok(files) => {
+                                self.status = format!(
+                                    "토렌트 파일 목록 준비 완료 · {}개",
+                                    files.total_files()
+                                );
+                                dialog.files = Some(files);
+                            }
+                            Err(error) => {
+                                self.status = format!("토렌트 파일 목록 조회 실패: {error}");
+                                dialog.error = Some(error.to_string());
+                            }
                         }
                     }
                     Ok(Err(error)) => {
                         dialog.request = None;
+                        self.status = format!("토렌트 파일 목록 조회 실패: {error}");
                         dialog.error = Some(error);
                     }
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                         dialog.request = None;
-                        dialog.error = Some("토렌트 파일 목록을 가져올 수 없습니다".into());
+                        let error = "토렌트 파일 목록을 가져올 수 없습니다";
+                        self.status = format!("토렌트 파일 목록 조회 실패: {error}");
+                        dialog.error = Some(error.into());
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => {
                         ctx.request_repaint_after(std::time::Duration::from_millis(90));
                     }
+                }
+                if dialog.request.is_none() {
+                    // The status bar was drawn before this modal, so force a
+                    // fresh frame that removes the pending indicator promptly.
+                    ctx.request_repaint();
                 }
             }
             let mut canceled = false;
@@ -2508,6 +2542,9 @@ impl NslApp {
                 }
             } else if !canceled {
                 self.catalog_torrent_dialog = Some(dialog);
+            } else {
+                self.status = "토렌트 파일 선택 취소됨".into();
+                ctx.request_repaint();
             }
         }
         if let Some((key, name)) = self.download_delete_confirm.clone() {

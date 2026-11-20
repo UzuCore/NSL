@@ -84,6 +84,24 @@ pub struct TorrentPreviewRequest {
     cancel: Arc<AtomicBool>,
 }
 
+#[cfg(test)]
+pub(crate) fn synthetic_preview_request() -> (
+    TorrentPreviewRequest,
+    mpsc::Sender<Result<TorrentPreview, String>>,
+    Arc<AtomicBool>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    (
+        TorrentPreviewRequest {
+            receiver,
+            cancel: cancel.clone(),
+        },
+        sender,
+        cancel,
+    )
+}
+
 impl Drop for TorrentPreviewRequest {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);

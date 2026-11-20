@@ -1745,6 +1745,158 @@ fn store_download_popup_selects_nested_directories_and_can_cancel() {
 }
 
 #[test]
+fn torrent_preview_status_bar_only_shows_loading_while_request_is_pending() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_title_metadata_loaded = true;
+    app.status = "이전 작업 완료".into();
+    let (request, response, canceled_flag) = torrent::synthetic_preview_request();
+    app.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+        item: catalog::CatalogItem {
+            title: "Status bar regression".into(),
+            topic_id: "status-qa".into(),
+            ..Default::default()
+        },
+        request: Some(request),
+        files: None,
+        error: None,
+    });
+
+    assert!(app
+        .active_progress_views()
+        .iter()
+        .any(|view| view.label == "토렌트 파일 목록 확인" && view.fraction.is_none()));
+    draw_card_test_frames(&ctx, &mut app, 1);
+    assert_eq!(
+        app.status, "이전 작업 완료",
+        "loading must not stick in self.status"
+    );
+    let pending = ctx.data_mut(|data| {
+        data.get_temp::<String>(egui::Id::new("nsl_test_status_message"))
+            .expect("status bar was not drawn")
+    });
+    assert!(pending.contains("토렌트 파일 목록 확인"), "{pending}");
+
+    response
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: PathBuf::from("content/base.nsp"),
+                size: 4096,
+            }],
+            torrent_bytes: vec![1, 2, 3],
+        }))
+        .unwrap();
+    draw_card_test_frames(&ctx, &mut app, 2);
+    let dialog = app.catalog_torrent_dialog.as_ref().unwrap();
+    assert!(dialog.request.is_none());
+    assert_eq!(dialog.files.as_ref().unwrap().total_files(), 1);
+    assert_eq!(app.status, "토렌트 파일 목록 준비 완료 · 1개");
+    assert!(!app
+        .active_progress_views()
+        .iter()
+        .any(|view| view.label == "토렌트 파일 목록 확인"));
+    assert!(canceled_flag.load(Ordering::Relaxed));
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<String>(egui::Id::new("nsl_test_status_message"))),
+        Some(app.status.clone())
+    );
+
+    let cancel = ctx.data_mut(|data| {
+        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_cancel_button"))
+            .unwrap()
+    });
+    click_cell(&ctx, &mut app, cancel.center(), 1456.0, 900.0);
+    draw_card_test_frames(&ctx, &mut app, 3);
+    assert!(app.catalog_torrent_dialog.is_none());
+    assert_eq!(app.status, "토렌트 파일 선택 취소됨");
+    assert_eq!(
+        ctx.data_mut(|data| data.get_temp::<String>(egui::Id::new("nsl_test_status_message"))),
+        Some(app.status.clone())
+    );
+    assert!(app.torrent_progress.is_empty());
+}
+
+#[test]
+fn torrent_preview_failure_disconnect_and_escape_clear_busy_status() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_title_metadata_loaded = true;
+    let item = catalog::CatalogItem {
+        title: "Failure and cancel status QA".into(),
+        topic_id: "failure-status".into(),
+        ..Default::default()
+    };
+
+    for disconnected in [false, true] {
+        app.status = "준비".into();
+        let (request, sender, canceled_flag) = torrent::synthetic_preview_request();
+        app.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+            item: item.clone(),
+            request: Some(request),
+            files: None,
+            error: None,
+        });
+        if disconnected {
+            drop(sender);
+        } else {
+            sender
+                .send(Err("테스트 메타데이터 조회 실패".into()))
+                .unwrap();
+        }
+        draw_card_test_frames(&ctx, &mut app, 2);
+        let dialog = app.catalog_torrent_dialog.as_ref().unwrap();
+        assert!(dialog.request.is_none());
+        assert!(dialog.error.is_some());
+        assert!(app.status.contains("토렌트 파일 목록 조회 실패"));
+        assert!(!app.status.contains("확인 중"));
+        assert_eq!(
+            ctx.data_mut(|data| data.get_temp::<String>(egui::Id::new("nsl_test_status_message"))),
+            Some(app.status.clone())
+        );
+        assert!(!app
+            .active_progress_views()
+            .iter()
+            .any(|view| view.label == "토렌트 파일 목록 확인"));
+        assert!(canceled_flag.load(Ordering::Relaxed));
+        send_escape_to_app(&mut app, &ctx);
+        assert!(app.catalog_torrent_dialog.is_none());
+        assert_eq!(app.status, "토렌트 파일 선택 취소됨");
+    }
+
+    let (request, _sender, canceled_flag) = torrent::synthetic_preview_request();
+    app.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+        item,
+        request: Some(request),
+        files: None,
+        error: None,
+    });
+    draw_card_test_frames(&ctx, &mut app, 1);
+    assert!(app
+        .active_progress_views()
+        .iter()
+        .any(|view| view.label == "토렌트 파일 목록 확인"));
+    send_escape_to_app(&mut app, &ctx);
+    assert!(app.catalog_torrent_dialog.is_none());
+    assert!(
+        canceled_flag.load(Ordering::Relaxed),
+        "Esc must cancel the actual metadata request"
+    );
+    assert_eq!(app.status, "토렌트 파일 선택 취소됨");
+    assert!(!app
+        .active_progress_views()
+        .iter()
+        .any(|view| view.label == "토렌트 파일 목록 확인"));
+    assert!(app.torrent_progress.is_empty());
+}
+
+#[test]
 fn store_original_post_button_opens_selected_web_url() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);

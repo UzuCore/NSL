@@ -71,7 +71,9 @@ impl NslApp {
                     files: None,
                     error: None,
                 });
-                self.status = "토렌트 파일 목록 확인 중…".into();
+                // The status bar derives this transient activity from the
+                // live preview request. Do not store a permanent 'loading'
+                // message that survives success, failure or cancellation.
             }
             Err(error) => self.status = format!("토렌트 파일 목록 조회 실패: {error}"),
         }

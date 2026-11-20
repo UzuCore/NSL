@@ -21,9 +21,11 @@ mod torrent;
 mod torrent_file_picker;
 mod translate;
 mod update_batch;
+mod update_manifest;
 mod update_merge;
 mod updater;
 mod xci;
+mod xci_merge;
 
 use anyhow::Result;
 use eframe::egui;
@@ -773,6 +775,8 @@ struct NslApp {
     reset_panel_width: bool,
     status: String,
     scan_result: Option<Receiver<std::result::Result<ScanOutcome, String>>>,
+    /// When a merge finishes during an existing scan, run a follow-up scan.
+    batch_rescan_pending: bool,
     scan_cancel: Option<Arc<AtomicBool>>,
     scan_progress: Option<Arc<ScanProgress>>,
     titledb_progress: Option<Arc<TaskProgress>>,

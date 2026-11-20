@@ -50,12 +50,20 @@ pub(crate) struct UpdateBatchMatch {
 
 pub(crate) struct UpdateBatchJob {
     pub(crate) key: String,
+    /// Stable torrent output directory. Runtime torrent keys are not stable
+    /// across a restored librqbit session.
+    pub(crate) directory: PathBuf,
     pub(crate) output: PathBuf,
+    pub(crate) expected_version: i64,
+    pub(crate) expected_file_size: u64,
+    pub(crate) original_size: u64,
+    pub(crate) transfer_finished: bool,
+    pub(crate) recovering_since: Option<std::time::Instant>,
     pub(crate) status: UpdateBatchJobStatus,
     pub(crate) verifying: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum UpdateBatchJobStatus {
     Queued,
     Downloading,

@@ -2,6 +2,11 @@
 
 Date: 2026-11-20 KST. Baseline: `1a10531`.
 
+**Historical Stage 1 record.** The compressed merge and restart-recovery limits
+documented below were addressed in the subsequent
+[Stage 2 native merge/recompression/recovery work](QA_NSL_NATIVE_MERGE_RESTORE_2026-11-20.md).
+This original Stage 1 QA record is retained for the change history.
+
 ## Scope implemented
 
 - Only the **미보유 업데이트** tab displays the new **카탈로그 전체 대조** action. Other library tabs, Store, and Downloads retain their existing navigation.

@@ -3,7 +3,85 @@
 
 use crate::*;
 
+// Streaming game merges can occupy tens of GiB of scratch disk space. Never
+// start one worker per completed torrent: process just one merge at a time.
+const MAX_PARALLEL_UPDATE_MERGES: usize = 1;
+
+/// A completed torrent is rechecked from disk after restart. Never trust a
+/// filename or a progress bar without scanning the actual package CNMT.
+fn spawn_batch_merge(base_dir: PathBuf, row: &mut update_batch::UpdateBatchRow) {
+    let Some(job) = row.job.as_mut() else {
+        return;
+    };
+    if job.verifying.is_some() {
+        return;
+    }
+    job.transfer_finished = true;
+    let path = job.output.clone();
+    let title_id = row.title_id.clone();
+    let wanted = job.expected_version;
+    let installed = row.installed_version;
+    let original = row.original_path.clone();
+    let original_size = job.original_size;
+    let expected_file_size = job.expected_file_size;
+    let (sender, receiver) = mpsc::channel();
+    job.verifying = Some(receiver);
+    job.status = update_batch::UpdateBatchJobStatus::Verifying;
+    std::thread::spawn(move || {
+        let result = (|| -> anyhow::Result<Option<PathBuf>> {
+            anyhow::ensure!(original_size > 0, "원본 게임 파일 크기 정보가 없습니다");
+            anyhow::ensure!(
+                std::fs::metadata(&original)?.len() == original_size,
+                "다운로드 대기 중 원본 게임 크기가 변경되어 병합을 중단했습니다"
+            );
+            anyhow::ensure!(
+                expected_file_size > 0 && std::fs::metadata(&path)?.len() == expected_file_size,
+                "다운로드 파일 크기가 검증된 토렌트 목록과 일치하지 않습니다"
+            );
+            update_batch::verify_downloaded_patch(&base_dir, &path, &title_id, wanted, installed)?;
+            let merged =
+                update_merge::merge_or_recover_existing(&original, &path, &title_id, wanted)?;
+            Ok(Some(merged))
+        })()
+        .map_err(|error| error.to_string());
+        let _ = sender.send(result);
+    });
+}
+
 impl NslApp {
+    pub(crate) fn retry_failed_batch_merges(&mut self) {
+        let Some(batch) = self.update_batch.as_mut() else {
+            return;
+        };
+        let mut queued = 0;
+        for row in &mut batch.rows {
+            let Some(job) = row.job.as_mut() else {
+                continue;
+            };
+            if job.transfer_finished
+                && matches!(job.status, update_batch::UpdateBatchJobStatus::Failed(_))
+            {
+                job.status = update_batch::UpdateBatchJobStatus::Queued;
+                job.recovering_since = None;
+                queued += 1;
+            }
+        }
+        if queued > 0 {
+            self.status =
+                format!("다운로드 완료 항목 {queued}개를 재검증·병합 대기열에 등록했습니다");
+            self.persist_batch_jobs();
+        }
+    }
+
+    pub(crate) fn persist_batch_jobs(&mut self) {
+        if let Some(batch) = &self.update_batch {
+            if let Err(error) = update_manifest::save(&self.base_dir, batch) {
+                self.status = format!("일괄 업데이트 재시작 복구 기록 저장 실패: {error}");
+                let _ = self.log_sender.send(format!("⚠ {}", self.status));
+            }
+        }
+    }
+
     pub(crate) fn start_missing_update_audit(&mut self) {
         if self.folder_filter != "MISSING_UPDATES" {
             return;
@@ -59,6 +137,8 @@ impl NslApp {
             return;
         };
         let mut needs_scan = false;
+        let mut changed = false;
+        let mut verify_rows = Vec::new();
         if batch.running {
             batch.tick(&self.catalog_state.items, self.torrent_engine.as_deref());
             if !batch.running {
@@ -71,25 +151,57 @@ impl NslApp {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
         }
-        for row in &mut batch.rows {
+        for (index, row) in batch.rows.iter_mut().enumerate() {
             let Some(job) = row.job.as_mut() else {
                 continue;
             };
-            if job.status == update_batch::UpdateBatchJobStatus::Queued
-                && self
-                    .torrent_progress
-                    .iter()
-                    .any(|(key, state)| key == &job.key && !state.finished && state.error.is_none())
-            {
-                job.status = update_batch::UpdateBatchJobStatus::Downloading;
+            if matches!(
+                job.status,
+                update_batch::UpdateBatchJobStatus::Queued
+                    | update_batch::UpdateBatchJobStatus::Downloading
+            ) {
+                if job.transfer_finished {
+                    verify_rows.push(index);
+                } else if let Some((key, progress)) =
+                    self.torrent_progress.iter().find(|(key, progress)| {
+                        key == &job.key
+                            || progress.output_folder.as_deref() == Some(job.directory.as_path())
+                    })
+                {
+                    if job.key != *key {
+                        job.key = key.clone();
+                        changed = true;
+                    }
+                    job.recovering_since = None;
+                    if let Some(error) = &progress.error {
+                        job.status = update_batch::UpdateBatchJobStatus::Failed(error.clone());
+                        changed = true;
+                    } else if progress.finished {
+                        verify_rows.push(index);
+                    } else if job.status != update_batch::UpdateBatchJobStatus::Downloading {
+                        job.status = update_batch::UpdateBatchJobStatus::Downloading;
+                        changed = true;
+                    }
+                } else if job
+                    .recovering_since
+                    .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(60))
+                {
+                    job.status = update_batch::UpdateBatchJobStatus::Failed(
+                        "재시작 후 다운로드 세션을 복구할 수 없습니다. 다운로드 목록을 확인하세요"
+                            .into(),
+                    );
+                    changed = true;
+                }
             }
             if let Some(receiver) = &job.verifying {
                 match receiver.try_recv() {
                     Ok(Ok(output)) => {
                         job.verifying = None;
+                        changed = true;
                         if let Some(output) = output {
                             job.status = update_batch::UpdateBatchJobStatus::Merged(output);
                             self.status = format!("업데이트 병합 완료: {}", row.name);
+                            let _ = self.log_sender.send(format!("✅ {}", self.status));
                             needs_scan = true;
                         } else {
                             job.status = update_batch::UpdateBatchJobStatus::Verified;
@@ -100,12 +212,14 @@ impl NslApp {
                     Ok(Err(error)) => {
                         job.verifying = None;
                         job.status = update_batch::UpdateBatchJobStatus::Failed(error);
+                        changed = true;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         job.verifying = None;
                         job.status = update_batch::UpdateBatchJobStatus::Failed(
                             "패키지 검증 작업이 예기치 않게 종료됨".into(),
                         );
+                        changed = true;
                     }
                     Err(mpsc::TryRecvError::Empty) => {
                         ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -113,8 +227,23 @@ impl NslApp {
                 }
             }
         }
-        if needs_scan && self.scan_result.is_none() {
-            self.start_scan(true);
+        let active_merges = batch
+            .rows
+            .iter()
+            .filter(|row| row.job.as_ref().is_some_and(|job| job.verifying.is_some()))
+            .count();
+        for index in verify_rows
+            .into_iter()
+            .take(MAX_PARALLEL_UPDATE_MERGES.saturating_sub(active_merges))
+        {
+            spawn_batch_merge(self.base_dir.clone(), &mut batch.rows[index]);
+            changed = true;
+        }
+        if changed {
+            self.persist_batch_jobs();
+        }
+        if needs_scan {
+            self.batch_rescan_pending = true;
         }
     }
 
@@ -138,43 +267,22 @@ impl NslApp {
         let Some(job) = row.job.as_mut() else {
             return;
         };
-        if let Err(error) = result {
-            job.status = update_batch::UpdateBatchJobStatus::Failed(error.clone());
+        if !matches!(
+            job.status,
+            update_batch::UpdateBatchJobStatus::Queued
+                | update_batch::UpdateBatchJobStatus::Downloading
+        ) {
             return;
         }
-        let path = job.output.clone();
-        let base_dir = self.base_dir.clone();
-        let title_id = row.title_id.clone();
-        let wanted = row.found.as_ref().map(|item| item.version).unwrap_or(0);
-        let installed = row.installed_version;
-        let original = row.original_path.clone();
-        let original_type = row.original_type.clone();
-        let (send, recv) = mpsc::channel();
-        job.verifying = Some(recv);
-        job.status = update_batch::UpdateBatchJobStatus::Verifying;
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<Option<PathBuf>> {
-                update_batch::verify_downloaded_patch(
-                    &base_dir, &path, &title_id, wanted, installed,
-                )?;
-                if original_type == "nsp"
-                    && path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsp"))
-                {
-                    let output =
-                        update_merge::merge_verified_nsp(&original, &path, &title_id, wanted)?;
-                    Ok(Some(output))
-                } else {
-                    // NSZ/XCZ need genuine NCZ compression and XCI partition
-                    // packing. Preserve the verified download and original.
-                    Ok(None)
-                }
-            })()
-            .map_err(|error| error.to_string());
-            let _ = send.send(result);
-        });
+        if let Err(error) = result {
+            job.status = update_batch::UpdateBatchJobStatus::Failed(error.clone());
+        } else {
+            // Mark durable completion first. The frame schedules exactly one
+            // merge worker after the remaining transfers have been polled.
+            job.transfer_finished = true;
+            job.status = update_batch::UpdateBatchJobStatus::Queued;
+        }
+        self.persist_batch_jobs();
     }
 
     pub(crate) fn queue_missing_updates(&mut self) {
@@ -223,6 +331,14 @@ impl NslApp {
                 row.failure = Some("일괄 다운로드 폴더가 이미 존재함".into());
                 continue;
             }
+            let original_size = match std::fs::metadata(&row.original_path) {
+                Ok(meta) if meta.is_file() && meta.len() > 0 => meta.len(),
+                _ => {
+                    failed += 1;
+                    row.failure = Some("원본 게임 파일을 확인할 수 없어 큐 등록 중단".into());
+                    continue;
+                }
+            };
             // The torrent preview enforces safe, relative file paths; only
             // one original torrent index is passed to librqbit.
             let output = destination.join(&found.file.path);
@@ -237,7 +353,13 @@ impl NslApp {
                 Ok(key) => {
                     row.job = Some(update_batch::UpdateBatchJob {
                         key,
+                        directory: destination,
                         output,
+                        expected_version: found.version,
+                        expected_file_size: found.file.size,
+                        original_size,
+                        transfer_finished: false,
+                        recovering_since: None,
                         status: update_batch::UpdateBatchJobStatus::Queued,
                         verifying: None,
                     });
@@ -253,6 +375,7 @@ impl NslApp {
         let _ = self
             .log_sender
             .send(format!("ℹ 일괄 업데이트 · {}", self.status));
+        self.persist_batch_jobs();
     }
 
     /// Rendered exclusively in the Missing Updates view. No changes to
@@ -273,6 +396,7 @@ impl NslApp {
         let mut scan = false;
         let mut queue = false;
         let mut stop = false;
+        let mut retry = false;
         ui.horizontal_wrapped(|ui| {
             scan = ui
                 .add_enabled(
@@ -286,10 +410,44 @@ impl NslApp {
                 .clicked();
             if let Some(batch) = self.update_batch.as_ref() {
                 let (done, total) = batch.progress();
-                ui.label(format!(
-                    "대조 {done}/{total} · 업데이트 가능 {}개",
-                    batch.eligible()
-                ));
+                let jobs = batch.rows.iter().filter(|row| row.job.is_some()).count();
+                if jobs > 0 {
+                    let merged = batch
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.job.as_ref().is_some_and(|job| {
+                                matches!(job.status, update_batch::UpdateBatchJobStatus::Merged(_))
+                            })
+                        })
+                        .count();
+                    ui.label(format!(
+                        "다운로드·병합 작업 {jobs}개 · 병합 완료 {merged}개"
+                    ));
+                } else {
+                    ui.label(format!(
+                        "대조 {done}/{total} · 업데이트 가능 {}개",
+                        batch.eligible()
+                    ));
+                }
+                let retryable = batch
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.job.as_ref().is_some_and(|job| {
+                            job.transfer_finished
+                                && matches!(
+                                    job.status,
+                                    update_batch::UpdateBatchJobStatus::Failed(_)
+                                )
+                        })
+                    })
+                    .count();
+                if retryable > 0 {
+                    retry = ui
+                        .button(format!("실패한 병합 재시도 {retryable}개"))
+                        .clicked();
+                }
                 if batch.running {
                     stop = ui.button("대조 중단").clicked();
                 } else {
@@ -322,6 +480,9 @@ impl NslApp {
         }
         if scan {
             self.start_missing_update_audit();
+        }
+        if retry {
+            self.retry_failed_batch_merges();
         }
         if queue {
             if let Some(batch) = self.update_batch.as_mut() {
@@ -395,7 +556,7 @@ impl NslApp {
                                         "패키지 검증 중".into()
                                     }
                                     update_batch::UpdateBatchJobStatus::Verified => {
-                                        "패키지 검증 완료 · NSZ/XCZ 병합·재압축 대기".into()
+                                        "패키지 검증 완료 · 병합 대기".into()
                                     }
                                     update_batch::UpdateBatchJobStatus::Merged(path) => {
                                         format!("병합 완료: {}", path.display())
@@ -414,8 +575,9 @@ impl NslApp {
                                     .unwrap_or_else(|| "대조 결과 없음".into())
                             };
                             ui.label(&row.name).on_hover_text(format!(
-                                "{} · 원본: {}",
+                                "{} · {} 원본: {}",
                                 row.title_id,
+                                row.original_type.to_ascii_uppercase(),
                                 row.original_path.display()
                             ));
                             ui.label(egui::RichText::new(status).small().color(if has_update {

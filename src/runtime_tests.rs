@@ -68,6 +68,76 @@ fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
 }
 
 #[test]
+fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merge() {
+    let (mut app, dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.torrent_engine = None;
+    let folder = app.base_dir.join("downloads").join("batch-restore-QA");
+    let output = folder.join("game/update.nsz");
+    let batch = update_batch::UpdateBatch {
+        rows: vec![update_batch::UpdateBatchRow {
+            library_id: 25,
+            title_id: "0100D2C0115B6000".into(),
+            name: "QA title".into(),
+            installed_version: 65536,
+            latest_version: 196608,
+            original_path: dir.path().join("original.nsz"),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: None,
+            checked: false,
+            failure: None,
+            job: Some(update_batch::UpdateBatchJob {
+                key: "t1".into(),
+                directory: folder.clone(),
+                output,
+                expected_version: 196608,
+                expected_file_size: 8192,
+                original_size: 123456,
+                transfer_finished: false,
+                recovering_since: None,
+                status: update_batch::UpdateBatchJobStatus::Queued,
+                verifying: None,
+            }),
+        }],
+        running: false,
+        cursor: 1,
+        active: None,
+        confirm_queue: false,
+    };
+    update_manifest::save(&app.base_dir, &batch).unwrap();
+    app.update_batch = update_manifest::load(&app.base_dir).unwrap();
+    app.torrent_progress = vec![(
+        "r42".into(),
+        torrent::TorrentProgress {
+            output_folder: Some(folder),
+            state: "downloading".into(),
+            ..Default::default()
+        },
+    )];
+
+    app.poll_missing_update_audit(&ctx);
+    let job = app.update_batch.as_ref().unwrap().rows[0]
+        .job
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        job.key, "r42",
+        "restored librqbit keys replace original tNN keys"
+    );
+    assert_eq!(job.status, update_batch::UpdateBatchJobStatus::Downloading);
+    assert!(!job.transfer_finished);
+    assert!(
+        job.verifying.is_none(),
+        "partial transfer must never trigger package merge"
+    );
+    let saved = update_manifest::load(&app.base_dir).unwrap().unwrap();
+    assert_eq!(saved.rows[0].job.as_ref().unwrap().key, "r42");
+}
+
+#[test]
 fn cached_scan_reuse_does_not_depend_on_nacp_names() {
     let path = normalize_scan_path_text(r"E:\NSW\sample.nsp");
     let mut records = HashMap::new();

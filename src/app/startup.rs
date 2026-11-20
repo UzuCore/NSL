@@ -85,6 +85,7 @@ impl NslApp {
             reset_panel_width: false,
             status: "대기".into(),
             scan_result: None,
+            batch_rescan_pending: false,
             scan_cancel: None,
             scan_progress: None,
             titledb_progress: None,
@@ -239,6 +240,24 @@ impl NslApp {
                 let _ = app
                     .log_sender
                     .send(format!("⚠ 토렌트 엔진 시작 실패: {error}"));
+            }
+        }
+        // Runtime torrent keys are different after restart. Restore our
+        // independent, crash-safe post-download manifest; reconnect by the
+        // torrent's original output directory once librqbit is ready.
+        match update_manifest::load(&app.base_dir) {
+            Ok(Some(batch)) => {
+                let count = batch.rows.len();
+                app.update_batch = Some(batch);
+                let _ = app.log_sender.send(format!(
+                    "ℹ 일괄 업데이트 작업 {count}개 복원 · 다운로드 상태 재연결 중"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = app.log_sender.send(format!(
+                    "⚠ 일괄 업데이트 작업 기록을 읽지 못했습니다: {error} · 원본 유지"
+                ));
             }
         }
         // Start-up checks run off the UI thread and only offer an update;

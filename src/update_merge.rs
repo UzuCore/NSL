@@ -1,200 +1,397 @@
-//! Atomic, non-destructive native PFS0 update-package merge.
+//! Safe NSRP-backed game patch merger, with native XCI assembly.
 //!
-//! Only uncompressed NSP + NSP is supported here. NSZ/XCZ must go through
-//! NSRP's separate compression/partition engines; emitting a renamed NSP as
-//! an NSZ or silently dropping XCI partitions would be incorrect.
+//! The original title and downloaded update are *read-only*. NSRP operates in
+//! private workspaces, produces a CNMT-selected merged NSP, and optionally
+//! recompresses it to NSZ or builds and compresses an XCI/XCZ. Nothing is
+//! published beside the original before the result passes CNMT validation.
 
-use crate::{container_index, scanner};
+use crate::{scanner, xci_merge};
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
+use nsrp_core::{
+    keys::KeySet,
+    ops::{
+        cnmt::{self, CnmtInfo, ContentMetaType},
+        compress::{self, CompressOptions},
+        merge::{self, MergeFormat, MergeOptions},
+        xcz::{self, XczOptions},
+    },
+};
 use std::{
-    collections::HashMap,
-    fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
-#[derive(Clone)]
-struct Part {
-    source: usize,
-    start: u64,
-    len: u64,
-    name: String,
+const MAX_COMPRESSION_WORKERS: usize = 4;
+const DEFAULT_ZSTD_LEVEL: i32 = 6;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OutputKind {
+    Nsp,
+    Nsz,
+    Xci,
+    Xcz,
 }
 
-fn hash_part(input: &mut File, start: u64, len: u64) -> Result<[u8; 32]> {
-    input.seek(SeekFrom::Start(start))?;
-    let mut limited = input.take(len);
-    let mut sha = Sha256::new();
-    let mut consumed = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let count = limited.read(&mut buffer)?;
-        if count == 0 {
-            break;
+impl OutputKind {
+    fn from_path(path: &Path) -> Result<Self> {
+        match path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "nsp" => Ok(Self::Nsp),
+            "nsz" => Ok(Self::Nsz),
+            "xci" => Ok(Self::Xci),
+            "xcz" => Ok(Self::Xcz),
+            extension => anyhow::bail!("병합을 지원하지 않는 원본 형식: {extension}"),
         }
-        sha.update(&buffer[..count]);
-        consumed += count as u64;
     }
-    anyhow::ensure!(consumed == len, "중복 패키지 엔트리가 잘렸습니다");
-    Ok(sha.finalize().into())
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Nsp => "nsp",
+            Self::Nsz => "nsz",
+            Self::Xci => "xci",
+            Self::Xcz => "xcz",
+        }
+    }
 }
 
-fn plan_inputs(inputs: &mut [File; 2]) -> Result<Vec<Part>> {
-    let mut merged: Vec<Part> = Vec::new();
-    let mut seen: HashMap<String, usize> = HashMap::new();
-    for source in 0..2 {
-        let index = {
-            let input = &mut inputs[source];
-            let end = input.metadata()?.len();
-            container_index::read_at(input, 0, end, Some(container_index::Kind::Pfs0))
-                .context("원본/업데이트 NSP의 PFS0 인덱스가 올바르지 않습니다")?
-        };
-        for item in index.entries {
-            anyhow::ensure!(
-                !item.name.to_ascii_lowercase().ends_with(".ncz"),
-                "압축된 NCZ 엔트리는 일반 NSP 병합에 사용할 수 없습니다"
-            );
-            let start = index
-                .data_start
-                .checked_add(item.offset)
-                .context("NSP 파일 오프셋이 범위를 초과했습니다")?;
-            let part = Part {
-                source,
-                start,
-                len: item.size,
-                name: item.name,
-            };
-            let key = part.name.to_ascii_lowercase();
-            if let Some(old_index) = seen.get(&key) {
-                let old = &merged[*old_index];
-                anyhow::ensure!(
-                    old.len == part.len,
-                    "중복된 NCA 이름의 크기가 다릅니다: {}",
-                    part.name
-                );
-                let (first, second) = inputs.split_at_mut(1);
-                let first = &mut first[0];
-                let second = &mut second[0];
-                let same = match (old.source, part.source) {
-                    (0, 1) => {
-                        hash_part(first, old.start, old.len)?
-                            == hash_part(second, part.start, part.len)?
-                    }
-                    _ => anyhow::bail!("동일 패키지 안에 중복된 엔트리가 있습니다"),
-                };
-                anyhow::ensure!(same, "이름이 같지만 내용이 다른 NCA: {}", part.name);
-                continue;
-            }
-            seen.insert(key, merged.len());
-            merged.push(part);
-        }
-    }
+fn output_for_game(original: &Path, base_id: &str, version: i64) -> Result<(PathBuf, OutputKind)> {
     anyhow::ensure!(
-        merged.len() >= 2 && merged.len() <= 16_384,
-        "병합할 NSP 콘텐츠 수가 잘못되었습니다"
+        base_id.len() == 16 && base_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "게임 타이틀 ID 형식이 잘못되었습니다"
     );
-    Ok(merged)
+    anyhow::ensure!(
+        version > 0 && version <= u32::MAX as i64,
+        "업데이트 버전이 잘못되었습니다"
+    );
+    let raw = u64::from_str_radix(base_id, 16)?;
+    anyhow::ensure!(raw & 0x1fff == 0, "기본 게임 타이틀 ID가 아닙니다");
+    let kind = OutputKind::from_path(original)?;
+    let parent = original
+        .parent()
+        .context("원본 게임 폴더를 확인할 수 없습니다")?;
+    Ok((
+        parent.join(format!(
+            "[NSL Merged] [{raw:016X}][v{version}].{}",
+            kind.extension()
+        )),
+        kind,
+    ))
 }
 
-fn emit_pfs0(files: &mut [File; 2], parts: &[Part], output: &mut File) -> Result<()> {
-    let mut strings = Vec::new();
-    let mut table = Vec::with_capacity(parts.len() * 24);
-    let mut offset = 0u64;
-    for part in parts {
-        let str_offset = u32::try_from(strings.len()).context("PFS0 문자열 테이블 초과")?;
-        strings.extend_from_slice(part.name.as_bytes());
-        strings.push(0);
-        table.extend_from_slice(&offset.to_le_bytes());
-        table.extend_from_slice(&part.len.to_le_bytes());
-        table.extend_from_slice(&str_offset.to_le_bytes());
-        table.extend_from_slice(&0u32.to_le_bytes());
-        offset = offset
-            .checked_add(part.len)
-            .context("병합 출력 크기 초과")?;
-    }
-    let count = u32::try_from(parts.len())?;
-    let string_len = u32::try_from(strings.len())?;
-    output.write_all(b"PFS0")?;
-    output.write_all(&count.to_le_bytes())?;
-    output.write_all(&string_len.to_le_bytes())?;
-    output.write_all(&0u32.to_le_bytes())?;
-    output.write_all(&table)?;
-    output.write_all(&strings)?;
-    for part in parts {
-        let input = &mut files[part.source];
-        input.seek(SeekFrom::Start(part.start))?;
-        let copied = std::io::copy(&mut input.take(part.len), output)?;
-        anyhow::ensure!(
-            copied == part.len,
-            "병합 중 원본 파일이 변경되었거나 잘렸습니다"
-        );
-    }
-    output.flush()?;
-    output.sync_all()?;
+fn validate_selected_cnmts(cnmts: &[CnmtInfo], base_id: &str, required_version: i64) -> Result<()> {
+    let base = u64::from_str_radix(base_id, 16)? & !0x1fff;
+    let base = format!("{base:016X}");
+    let patch = format!("{:016X}", u64::from_str_radix(&base, 16)? | 0x800);
+    anyhow::ensure!(
+        cnmts.iter().any(|cnmt| {
+            cnmt.title_id.eq_ignore_ascii_case(&base) && cnmt.meta_type == ContentMetaType::Base
+        }),
+        "병합 결과에 원본 게임 CNMT가 없습니다"
+    );
+    anyhow::ensure!(
+        cnmts.iter().any(|cnmt| {
+            cnmt.title_id.eq_ignore_ascii_case(&patch)
+                && cnmt.meta_type == ContentMetaType::Update
+                && i64::from(cnmt.version) >= required_version
+        }),
+        "병합 결과에 요청한 최신 업데이트 CNMT가 없습니다"
+    );
+    // Strictly reject a stale update for the same title. The selected
+    // package must not contain multiple versions of one patch ID.
+    anyhow::ensure!(
+        cnmts
+            .iter()
+            .filter(|cnmt| {
+                cnmt.title_id.eq_ignore_ascii_case(&patch)
+                    && cnmt.meta_type == ContentMetaType::Update
+            })
+            .count()
+            == 1,
+        "병합 결과에 중복된 업데이트 CNMT가 있습니다"
+    );
     Ok(())
 }
 
-/// Construct a distinct file next to the original. Originals and downloads
-/// are read-only, a staging file is deleted on failure, and existing output
-/// names are never overwritten.
-pub(crate) fn merge_verified_nsp(
+fn compression_options() -> CompressOptions {
+    CompressOptions {
+        level: DEFAULT_ZSTD_LEVEL,
+        threads: std::thread::available_parallelism()
+            .map_or(2, |n| n.get().clamp(1, MAX_COMPRESSION_WORKERS)),
+        block_mode: true,
+        long_mode: false,
+    }
+}
+
+fn check_space(parent: &Path, original: &Path, patch: &Path) -> Result<()> {
+    let original_size = fs::metadata(original)?.len();
+    let update_size = fs::metadata(patch)?.len();
+    let input_size = original_size.saturating_add(update_size);
+    // NSRP selects CNMT entries in a private workspace and decompresses
+    // compressed inputs; the final sibling output has its own staging dir.
+    // Leave generous headroom for intermediate files, especially NCZ data.
+    let needed = input_size
+        .saturating_mul(3)
+        .saturating_add(512 * 1024 * 1024);
+    let free = fs2::available_space(parent)?;
+    anyhow::ensure!(
+        free >= needed,
+        "병합 출력 드라이브의 여유 공간이 부족합니다: 최소 {} GiB 필요, {} GiB 사용 가능",
+        (needed + (1 << 30) - 1) >> 30,
+        free >> 30
+    );
+    let work_root = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("NSL");
+    fs::create_dir_all(&work_root)?;
+    let temp_needed = input_size
+        .saturating_mul(2)
+        .saturating_add(256 * 1024 * 1024);
+    let free_temp = fs2::available_space(&work_root)?;
+    anyhow::ensure!(
+        free_temp >= temp_needed,
+        "임시 병합 작업 드라이브의 여유 공간이 부족합니다: 최소 {} GiB 필요",
+        (temp_needed + (1 << 30) - 1) >> 30
+    );
+    Ok(())
+}
+
+fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
+    anyhow::ensure!(
+        !destination.exists(),
+        "이미 병합 결과물이 있습니다: {}",
+        destination.display()
+    );
+    let parent = destination.parent().context("병합 결과 저장 폴더 없음")?;
+    // Windows FlushFileBuffers requires a handle opened with write access.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(staged)?
+        .sync_all()?;
+    if fs::hard_link(staged, destination).is_ok() {
+        return Ok(());
+    }
+    // FAT/exFAT and some network shares disallow hardlinks. A same-directory
+    // named temporary file is slower but retains atomic no-clobber semantics.
+    let mut temp = tempfile::Builder::new()
+        .prefix(".nsl-publish-")
+        .tempfile_in(parent)?;
+    let mut source = File::open(staged)?;
+    std::io::copy(&mut source, temp.as_file_mut())?;
+    temp.as_file_mut().flush()?;
+    temp.as_file_mut().sync_all()?;
+    temp.persist_noclobber(destination).map_err(|error| {
+        anyhow::anyhow!("기존 병합 파일을 덮어쓰지 않았습니다: {}", error.error)
+    })?;
+    Ok(())
+}
+
+/// User-visible merge: preserve the original's format, including native
+/// NSZ/XCZ recompression of the merged package (not a renamed NSP/XCI).
+/// Unsupported NCAs and missing keys fail without publishing any output.
+pub(crate) fn merge_verified_package(
     original: &Path,
     patch: &Path,
-    title_id: &str,
+    base_id: &str,
+    wanted_version: i64,
+) -> Result<PathBuf> {
+    let (destination, format) = output_for_game(original, base_id, wanted_version)?;
+    let ext = patch.extension().and_then(|e| e.to_str()).unwrap_or("");
+    anyhow::ensure!(
+        ext.eq_ignore_ascii_case("nsp") || ext.eq_ignore_ascii_case("nsz"),
+        "업데이트 입력은 NSP 또는 NSZ여야 합니다"
+    );
+    anyhow::ensure!(
+        original.is_file() && patch.is_file(),
+        "병합 입력 파일이 없습니다"
+    );
+    anyhow::ensure!(
+        original.canonicalize()? != patch.canonicalize()?,
+        "원본과 업데이트 파일이 같습니다"
+    );
+    anyhow::ensure!(
+        !destination.exists(),
+        "이미 같은 업데이트 버전의 병합 파일이 있습니다"
+    );
+    let parent = destination.parent().context("원본 게임 폴더 없음")?;
+    check_space(parent, original, patch)?;
+
+    let prod_keys = scanner::prod_keys().context("NSZ/XCZ 병합에 필요한 prod.keys가 없습니다")?;
+    let mut keys = KeySet::load_with_local_title_keys(&prod_keys)
+        .context("프로그램 키 파일을 읽을 수 없습니다")?;
+    let work = tempfile::Builder::new()
+        .prefix(".nsl-merge-")
+        .tempdir_in(parent)?;
+    let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
+    let cancelled = AtomicBool::new(false);
+    let options = MergeOptions {
+        output_format: MergeFormat::Nsp,
+        compress_after: false,
+        use_game_title: false,
+        decompression_threads: 2,
+        compression: compression_options(),
+    };
+    let sources = [original.to_path_buf(), patch.to_path_buf()];
+    let mut logs = Vec::new();
+    let merged_outputs = merge::merge_packages(
+        &sources,
+        work.path(),
+        true,
+        work.path(),
+        &disabled_tool,
+        &prod_keys,
+        &mut keys,
+        &options,
+        &cancelled,
+        &mut |_| {},
+        &mut |line| {
+            if logs.len() < 100 {
+                logs.push(line);
+            }
+        },
+    )
+    .with_context(|| format!("NSRP CNMT 병합 실패: {}", logs.join(" | ")))?;
+    anyhow::ensure!(
+        merged_outputs.len() == 1,
+        "병합 출력이 게임별 단일 결과물이 아닙니다"
+    );
+    let merged_nsp = &merged_outputs[0];
+    let produced = match format {
+        OutputKind::Nsp => merged_nsp.clone(),
+        OutputKind::Nsz => {
+            let target = work.path().join("compressed.nsz");
+            let stats = compress::compress_nsp(
+                merged_nsp,
+                &target,
+                &mut keys,
+                &compression_options(),
+                &cancelled,
+                &mut |_| {},
+                &mut |_| {},
+            )?;
+            anyhow::ensure!(
+                stats.ncz_count > 0,
+                "압축된 NCA가 없어 NSZ 출력을 게시할 수 없습니다"
+            );
+            target
+        }
+        OutputKind::Xci | OutputKind::Xcz => {
+            let template = if format == OutputKind::Xcz {
+                let template = work.path().join("original.xci");
+                xcz::decompress_xcz(original, &template, &cancelled, &mut |_| {}, &mut |_| {})?;
+                template
+            } else {
+                original.to_path_buf()
+            };
+            let xci_output = work.path().join("merged.xci");
+            xci_merge::build_merged_xci_from_template(
+                &template,
+                merged_nsp,
+                &xci_output,
+                &cancelled,
+            )?;
+            if format == OutputKind::Xci {
+                xci_output
+            } else {
+                let target = work.path().join("compressed.xcz");
+                let opts = compression_options();
+                let stats = xcz::compress_xci(
+                    &xci_output,
+                    &target,
+                    &mut keys,
+                    &XczOptions {
+                        level: opts.level,
+                        threads: opts.threads,
+                        block_mode: opts.block_mode,
+                        long_mode: opts.long_mode,
+                    },
+                    &cancelled,
+                    &mut |_| {},
+                    &mut |_| {},
+                )?;
+                anyhow::ensure!(
+                    stats.ncz_count > 0,
+                    "압축된 NCA가 없어 XCZ 출력을 게시할 수 없습니다"
+                );
+                target
+            }
+        }
+    };
+    anyhow::ensure!(
+        produced.is_file() && fs::metadata(&produced)?.len() > 0,
+        "병합 출력 파일이 비어 있습니다"
+    );
+    // The output must contain a verified base *and* one CNMT update at least
+    // as new as the requested version. Unsupported crypto/rights layouts
+    // fail closed, never fall back to filename inference.
+    let (_, verified, _) = cnmt::discover_game_metadata(
+        &produced,
+        &work.path().join("verify"),
+        &disabled_tool,
+        &prod_keys,
+        &cancelled,
+    )
+    .context("병합 출력 CNMT 검증 실패")?;
+    validate_selected_cnmts(&verified, base_id, wanted_version)?;
+
+    publish_without_overwrite(&produced, &destination)?;
+    Ok(destination)
+}
+
+/// Recover an already published, independently verified package after a
+/// crash between final file creation and journal update. Never overwrite it.
+pub(crate) fn merge_or_recover_existing(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
     version: i64,
 ) -> Result<PathBuf> {
-    anyhow::ensure!(
-        original
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("nsp"))
-            && patch
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("nsp")),
-        "NSP와 NSP 파일만 이 방식으로 병합할 수 있습니다"
-    );
-    anyhow::ensure!(original != patch, "입력 파일 경로가 중복됐습니다");
-    let parent = original
-        .parent()
-        .context("기본 게임 폴더를 알 수 없습니다")?;
-    let output = parent.join(format!("[NSL Merged] [{title_id}][v{version}].nsp"));
-    anyhow::ensure!(
-        !output.exists(),
-        "이미 같은 버전의 병합 결과 파일이 있습니다: {}",
-        output.display()
-    );
-    let mut files = [File::open(original)?, File::open(patch)?];
-    let parts = plan_inputs(&mut files)?;
-    let mut staging = tempfile::Builder::new()
-        .prefix(".nsl-merging-")
-        .suffix(".nsp")
-        .tempfile_in(parent)?;
-    emit_pfs0(&mut files, &parts, staging.as_file_mut())?;
-
-    // Verify the *new container*, including its native update metadata,
-    // before exposing it as a user-visible NSP.
-    let file = staging.path();
-    let scan = scanner::scan_file_hashed(file, "merged.nsp", scanner::fast_hash(file)?)?;
-    let game = u64::from_str_radix(title_id, 16)? & !0x1fff;
-    let patch_id = format!("{:016X}", game | 0x800);
-    anyhow::ensure!(
-        scan.contents
-            .iter()
-            .any(|c| c.title_id.as_deref() == Some(patch_id.as_str())
-                && c.content_type == "update"
-                && c.version >= version
-                && matches!(c.source.as_str(), "header_native" | "header_cnmt")),
-        "병합 파일의 업데이트 CNMT를 검증하지 못했습니다"
-    );
-    staging.persist_noclobber(&output).map_err(|error| {
-        anyhow::anyhow!(
-            "원본 보호를 위해 병합 파일 저장을 중단했습니다: {}",
-            error.error
-        )
-    })?;
-    Ok(output)
+    let (destination, format) = output_for_game(original, base_id, version)?;
+    if destination.is_file() {
+        let keys = scanner::prod_keys().context("병합 결과 검증을 위한 prod.keys 없음")?;
+        let cancelled = AtomicBool::new(false);
+        let work = tempfile::tempdir()?;
+        let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
+        let (_, cnmts, _) = cnmt::discover_game_metadata(
+            &destination,
+            &work.path().join("verify"),
+            &disabled_tool,
+            &keys,
+            &cancelled,
+        )?;
+        validate_selected_cnmts(&cnmts, base_id, version)
+            .context("동일 이름의 기존 파일이 요청한 병합 결과와 일치하지 않습니다")?;
+        match format {
+            OutputKind::Nsz => {
+                let index = nsrp_core::formats::pfs0::Pfs0Index::parse(&destination)?;
+                anyhow::ensure!(
+                    index
+                        .entries
+                        .iter()
+                        .any(|entry| { entry.name.to_ascii_lowercase().ends_with(".ncz") }),
+                    "기존 NSZ에는 압축된 NCA가 없습니다"
+                );
+            }
+            OutputKind::Xcz => {
+                let files = nsrp_core::formats::hfs0::collect_leaf_entries(&destination, false)?;
+                anyhow::ensure!(
+                    files
+                        .iter()
+                        .any(|(name, _, _)| { name.to_ascii_lowercase().ends_with(".ncz") }),
+                    "기존 XCZ에는 압축된 NCA가 없습니다"
+                );
+            }
+            OutputKind::Nsp | OutputKind::Xci => {}
+        }
+        return Ok(destination);
+    }
+    merge_verified_package(original, patch, base_id, version)
 }
 
 #[cfg(test)]
@@ -202,61 +399,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pfs0_merge_preserves_entries_without_overwriting_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut first = File::create(dir.path().join("base.nsp")).unwrap();
-        let mut second = File::create(dir.path().join("patch.nsp")).unwrap();
-        let raw = |file: &mut File, name: &str, content: &[u8]| {
-            file.write_all(b"PFS0").unwrap();
-            file.write_all(&1u32.to_le_bytes()).unwrap();
-            file.write_all(&u32::try_from(name.len() + 1).unwrap().to_le_bytes())
-                .unwrap();
-            file.write_all(&0u32.to_le_bytes()).unwrap();
-            file.write_all(&0u64.to_le_bytes()).unwrap();
-            file.write_all(&(content.len() as u64).to_le_bytes())
-                .unwrap();
-            file.write_all(&0u32.to_le_bytes()).unwrap();
-            file.write_all(&0u32.to_le_bytes()).unwrap();
-            file.write_all(name.as_bytes()).unwrap();
-            file.write_all(&[0]).unwrap();
-            file.write_all(content).unwrap();
+    fn output_preserves_the_original_package_kind_and_rejects_path_injection() {
+        for format in ["nsp", "nsz", "xci", "xcz"] {
+            let path = PathBuf::from(format!("C:/Library/Game.{format}"));
+            let (target, kind) = output_for_game(&path, "0100D2C0115B6000", 196608).unwrap();
+            assert_eq!(
+                target.extension().and_then(|value| value.to_str()),
+                Some(format)
+            );
+            assert_eq!(target.parent(), path.parent());
+            assert_eq!(kind.extension(), format);
+        }
+        assert!(output_for_game(Path::new("C:/game.nsp"), "..\\..", 1).is_err());
+        assert!(output_for_game(Path::new("C:/game.nsp"), "0100D2C0115B6800", 1).is_err());
+        assert!(output_for_game(Path::new("C:/game.nsp"), "0100D2C0115B6000", 0).is_err());
+    }
+
+    #[test]
+    fn publishing_never_overwrites_existing_output() {
+        let folder = tempfile::tempdir().unwrap();
+        let from = folder.path().join("staged.nsz");
+        let dest = folder.path().join("merged.nsz");
+        fs::write(&from, b"new result").unwrap();
+        fs::write(&dest, b"previous user result").unwrap();
+        assert!(publish_without_overwrite(&from, &dest).is_err());
+        assert_eq!(fs::read(&dest).unwrap(), b"previous user result");
+        fs::remove_file(&dest).unwrap();
+        publish_without_overwrite(&from, &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"new result");
+        assert_eq!(fs::read(&from).unwrap(), b"new result");
+    }
+
+    #[test]
+    fn cnmt_acceptance_requires_base_and_new_update_and_rejects_duplicate_patches() {
+        let entry = |title: &str, kind: ContentMetaType, version: u32| CnmtInfo {
+            cnmt_nca_name: format!("meta-{title}.cnmt.nca"),
+            title_id: title.into(),
+            version,
+            meta_type: kind,
+            required_system_version: 0,
+            contents: vec![],
+            raw: vec![],
         };
-        raw(&mut first, "a.nca", &[1; 32]);
-        raw(&mut second, "b.nca", &[2; 48]);
-        drop(first);
-        drop(second);
-        let mut src = [
-            File::open(dir.path().join("base.nsp")).unwrap(),
-            File::open(dir.path().join("patch.nsp")).unwrap(),
-        ];
-        let original = [
-            std::fs::read(dir.path().join("base.nsp")).unwrap(),
-            std::fs::read(dir.path().join("patch.nsp")).unwrap(),
-        ];
-        let plan = plan_inputs(&mut src).unwrap();
-        let mut out = File::create(dir.path().join("merged.nsp")).unwrap();
-        emit_pfs0(&mut src, &plan, &mut out).unwrap();
-        drop(out);
-        let mut output = File::open(dir.path().join("merged.nsp")).unwrap();
-        let end = output.metadata().unwrap().len();
-        let index =
-            container_index::read_at(&mut output, 0, end, Some(container_index::Kind::Pfs0))
-                .unwrap();
-        assert_eq!(index.entries.len(), 2);
-        assert_eq!(
-            (
-                index.entries[0].name.as_str(),
-                index.entries[1].name.as_str()
-            ),
-            ("a.nca", "b.nca")
+        let base = entry("0100D2C0115B6000", ContentMetaType::Base, 0);
+        let patch = entry("0100D2C0115B6800", ContentMetaType::Update, 196608);
+        assert!(
+            validate_selected_cnmts(&[base.clone(), patch.clone()], &base.title_id, 196608).is_ok()
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("base.nsp")).unwrap(),
-            original[0]
+        assert!(
+            validate_selected_cnmts(std::slice::from_ref(&patch), &base.title_id, 196608).is_err()
         );
-        assert_eq!(
-            std::fs::read(dir.path().join("patch.nsp")).unwrap(),
-            original[1]
+        assert!(
+            validate_selected_cnmts(&[base.clone(), patch.clone()], &base.title_id, 262144)
+                .is_err()
+        );
+        assert!(
+            validate_selected_cnmts(&[base, patch.clone(), patch], "0100D2C0115B6000", 196608)
+                .is_err()
         );
     }
 }

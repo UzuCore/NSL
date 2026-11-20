@@ -23,6 +23,9 @@ use std::{
 #[derive(Clone, Debug, Default)]
 pub struct TorrentProgress {
     pub name: String,
+    /// Actual resolved download directory, also stable after librqbit
+    /// restores a job with a new runtime key on the next NSL launch.
+    pub output_folder: Option<PathBuf>,
     pub total_bytes: u64,
     pub progress_bytes: u64,
     pub download_speed_bps: u64,
@@ -485,6 +488,7 @@ async fn watch_torrent(
         );
         let update = TorrentProgress {
             name: name.to_owned(),
+            output_folder: Some(handle.output_folder().to_path_buf()),
             total_bytes: stats.total_bytes,
             progress_bytes: stats.progress_bytes,
             active_seeders,

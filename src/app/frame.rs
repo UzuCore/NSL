@@ -140,6 +140,13 @@ impl NslApp {
                     total as u64,
                 ));
             }
+            if batch
+                .rows
+                .iter()
+                .any(|row| row.job.as_ref().is_some_and(|job| job.verifying.is_some()))
+            {
+                views.push(ProgressView::busy("업데이트 병합·재압축"));
+            }
         }
         if self
             .catalog_torrent_dialog
@@ -637,6 +644,10 @@ impl NslApp {
             }
         }
         self.poll_missing_update_audit(ctx);
+        if self.batch_rescan_pending && self.scan_result.is_none() {
+            self.batch_rescan_pending = false;
+            self.start_scan(true);
+        }
         let update_check_done = poll_background(&self.update_check_result, "update check");
         if let Some(done) = update_check_done {
             self.update_check_result = None;

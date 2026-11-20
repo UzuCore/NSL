@@ -1,0 +1,290 @@
+//! Crash-safe batch update journal. Stores file paths and job identities,
+//! never torrent metadata, API keys, downloaded payloads or decrypted NCAs.
+
+use crate::update_batch::{UpdateBatch, UpdateBatchJob, UpdateBatchJobStatus, UpdateBatchRow};
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
+
+const SCHEMA_VERSION: u32 = 1;
+const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_JOBS: usize = 5000;
+
+#[derive(Serialize, Deserialize)]
+struct Manifest {
+    version: u32,
+    jobs: Vec<SavedJob>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedJob {
+    library_id: i64,
+    title_id: String,
+    name: String,
+    installed_version: i64,
+    latest_version: i64,
+    original_path: PathBuf,
+    original_type: String,
+    engine_key: String,
+    download_folder: PathBuf,
+    download_file: PathBuf,
+    expected_version: i64,
+    expected_file_size: u64,
+    original_size: u64,
+    transfer_finished: bool,
+    status: UpdateBatchJobStatus,
+}
+
+fn manifest_file(base_dir: &Path) -> PathBuf {
+    base_dir.join("batch-updates.json")
+}
+
+fn valid_download_location(base_dir: &Path, folder: &Path, file: &Path) -> bool {
+    let root = base_dir.join("downloads");
+    let Ok(folder_rel) = folder.strip_prefix(&root) else {
+        return false;
+    };
+    let Ok(file_rel) = file.strip_prefix(folder) else {
+        return false;
+    };
+    !folder_rel.as_os_str().is_empty()
+        && folder_rel.components().count() == 1
+        && folder_rel
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        && !file_rel.as_os_str().is_empty()
+        && file_rel.components().count() <= 64
+        && file_rel
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
+    let jobs: Vec<SavedJob> = batch
+        .rows
+        .iter()
+        .filter_map(|row| {
+            row.job.as_ref().map(|job| SavedJob {
+                library_id: row.library_id,
+                title_id: row.title_id.clone(),
+                name: row.name.clone(),
+                installed_version: row.installed_version,
+                latest_version: row.latest_version,
+                original_path: row.original_path.clone(),
+                original_type: row.original_type.clone(),
+                engine_key: job.key.clone(),
+                download_folder: job.directory.clone(),
+                download_file: job.output.clone(),
+                expected_version: job.expected_version,
+                expected_file_size: job.expected_file_size,
+                original_size: job.original_size,
+                transfer_finished: job.transfer_finished,
+                status: job.status.clone(),
+            })
+        })
+        .collect();
+    let file = manifest_file(base_dir);
+    if jobs.is_empty() {
+        if let Err(error) = fs::remove_file(&file) {
+            anyhow::ensure!(
+                error.kind() == std::io::ErrorKind::NotFound,
+                "일괄 업데이트 기록 정리 실패: {error}"
+            );
+        }
+        return Ok(());
+    }
+    anyhow::ensure!(
+        jobs.len() <= MAX_JOBS,
+        "저장할 일괄 업데이트 작업 수 한도 초과"
+    );
+    for job in &jobs {
+        anyhow::ensure!(
+            valid_download_location(base_dir, &job.download_folder, &job.download_file),
+            "저장할 일괄 다운로드 경로가 안전하지 않습니다"
+        );
+    }
+    let bytes = serde_json::to_vec_pretty(&Manifest {
+        version: SCHEMA_VERSION,
+        jobs,
+    })?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_MANIFEST_BYTES,
+        "일괄 업데이트 기록이 너무 큽니다"
+    );
+    let mut staged = tempfile::Builder::new()
+        .prefix(".nsl-batch-")
+        .suffix(".json.tmp")
+        .tempfile_in(base_dir)?;
+    staged.write_all(&bytes)?;
+    staged.as_file_mut().sync_all()?;
+    staged.persist(&file).map_err(|error| {
+        anyhow::anyhow!(
+            "일괄 업데이트 기록을 안전하게 저장하지 못했습니다: {}",
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
+pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
+    let path = manifest_file(base_dir);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.len() <= MAX_MANIFEST_BYTES,
+        "일괄 업데이트 기록 크기가 안전 한도를 초과했습니다"
+    );
+    let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
+        .context("일괄 업데이트 작업 기록 형식이 올바르지 않습니다")?;
+    anyhow::ensure!(
+        manifest.version == SCHEMA_VERSION,
+        "지원하지 않는 일괄 업데이트 기록 버전"
+    );
+    anyhow::ensure!(
+        manifest.jobs.len() <= MAX_JOBS,
+        "일괄 업데이트 작업 기록 수가 너무 많습니다"
+    );
+    let mut rows = Vec::with_capacity(manifest.jobs.len());
+    for saved in manifest.jobs {
+        anyhow::ensure!(
+            valid_download_location(base_dir, &saved.download_folder, &saved.download_file),
+            "안전하지 않은 일괄 업데이트 다운로드 경로"
+        );
+        anyhow::ensure!(
+            saved.title_id.len() == 16 && saved.title_id.bytes().all(|b| b.is_ascii_hexdigit()),
+            "작업 기록의 게임 타이틀 ID가 올바르지 않습니다"
+        );
+        anyhow::ensure!(
+            saved.name.chars().count() <= 512 && saved.expected_version > 0,
+            "일괄 업데이트 작업 기록 데이터가 올바르지 않습니다"
+        );
+        let status = if matches!(saved.status, UpdateBatchJobStatus::Verifying) {
+            // The worker did not survive exit. A recorded completed transfer
+            // is safe to verify/merge again; a partial transfer must wait for
+            // the restored librqbit session to report actual completion.
+            UpdateBatchJobStatus::Queued
+        } else {
+            saved.status
+        };
+        let job = UpdateBatchJob {
+            key: saved.engine_key,
+            directory: saved.download_folder,
+            output: saved.download_file,
+            expected_version: saved.expected_version,
+            expected_file_size: saved.expected_file_size,
+            original_size: saved.original_size,
+            transfer_finished: saved.transfer_finished,
+            recovering_since: Some(std::time::Instant::now()),
+            status,
+            verifying: None,
+        };
+        rows.push(UpdateBatchRow {
+            library_id: saved.library_id,
+            title_id: saved.title_id,
+            name: saved.name,
+            installed_version: saved.installed_version,
+            latest_version: saved.latest_version,
+            original_path: saved.original_path,
+            original_type: saved.original_type,
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: None,
+            checked: false,
+            failure: None,
+            job: Some(job),
+        });
+    }
+    let count = rows.len();
+    Ok(Some(UpdateBatch {
+        rows,
+        running: false,
+        cursor: count,
+        active: None,
+        confirm_queue: false,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::update_batch::UpdateBatchJobStatus;
+
+    fn example_batch(root: &Path) -> UpdateBatch {
+        let folder = root.join("downloads").join("batch-safe-123");
+        UpdateBatch {
+            rows: vec![UpdateBatchRow {
+                library_id: 42,
+                title_id: "0100D2C0115B6000".into(),
+                name: "Game".into(),
+                installed_version: 65536,
+                latest_version: 196608,
+                original_path: root.join("original.nsz"),
+                original_type: "nsz".into(),
+                candidates: vec![],
+                next_candidate: 0,
+                found: None,
+                checked: false,
+                failure: None,
+                job: Some(UpdateBatchJob {
+                    key: "t14".into(),
+                    directory: folder.clone(),
+                    output: folder.join("nested/update.nsz"),
+                    expected_version: 196608,
+                    expected_file_size: 8192,
+                    original_size: 900,
+                    transfer_finished: true,
+                    recovering_since: None,
+                    status: UpdateBatchJobStatus::Verifying,
+                    verifying: None,
+                }),
+            }],
+            running: false,
+            cursor: 1,
+            active: None,
+            confirm_queue: false,
+        }
+    }
+
+    #[test]
+    fn journal_round_trip_restores_metadata_without_resuming_stale_worker() {
+        let dir = tempfile::tempdir().unwrap();
+        let example = example_batch(dir.path());
+        save(dir.path(), &example).unwrap();
+        let recovered = load(dir.path()).unwrap().unwrap();
+        let row = &recovered.rows[0];
+        let job = row.job.as_ref().unwrap();
+        assert_eq!(job.key, "t14");
+        assert_eq!(job.expected_version, 196608);
+        assert!(job.transfer_finished);
+        assert_eq!(job.status, UpdateBatchJobStatus::Queued);
+        assert!(job.recovering_since.is_some());
+        assert!(job.output.ends_with("nested/update.nsz"));
+        assert!(!recovered.running);
+    }
+
+    #[test]
+    fn journal_rejects_path_traversal_and_preserves_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut example = example_batch(dir.path());
+        save(dir.path(), &example).unwrap();
+        let previous = fs::read(manifest_file(dir.path())).unwrap();
+        example.rows[0].job.as_mut().unwrap().output = dir.path().join("other/place.nsp");
+        assert!(save(dir.path(), &example).is_err());
+        assert_eq!(fs::read(manifest_file(dir.path())).unwrap(), previous);
+        let mut value: serde_json::Value = serde_json::from_slice(&previous).unwrap();
+        value["jobs"][0]["download_file"] = serde_json::json!("C:\\Other\\malicious.nsp");
+        fs::write(
+            manifest_file(dir.path()),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        assert!(load(dir.path()).is_err());
+    }
+}

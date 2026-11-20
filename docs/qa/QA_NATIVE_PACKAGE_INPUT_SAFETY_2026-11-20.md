@@ -55,3 +55,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-package-verify.
 ```
 
 Passing these is **independent format-rule validation only**, not a compiled Rust regression, functional NSZ/XCZ conversion, end-to-end verification, NCA SHA-256 content validation or GUI QA. Those require the next user-authorized manual build. Existing official r22 artifacts and release are unchanged.
+
+## Follow-up: NCZ payload header compatibility and restored output names
+
+The following source-only pass expanded beyond the **container index** to all NCZ **section and block metadata** and to output name normalization before decoding. See [NCZ layout compatibility QA](QA_NCZ_LAYOUT_COMPATIBILITY_2026-11-20.md) for the complete evidence and safety limits. After bounded compatibility changes, the independent header checker recognizes **4,601/4,601** available NCZ layouts. This **does not** establish that 4,601 complete NCZ payloads decompress successfully; the Rust code still requires user-authorized compilation and full-size actual-conversion verification.

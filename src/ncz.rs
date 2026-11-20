@@ -19,7 +19,9 @@ use std::{
 
 const HEADER: u64 = 0x4000;
 const IO_CHUNK: usize = 256 * 1024;
-const MAX_SECTION_COUNT: u64 = 4096;
+// Real game archives can contain >32K distinct NCZ encryption ranges.
+// The 32,768 cap still bounds the table to 2 MiB and avoids unbounded input.
+const MAX_SECTION_COUNT: u64 = 32_768;
 const MAX_NCA_SIZE: u64 = 512 * 1024 * 1024 * 1024;
 const MAX_BLOCK_SIZE: usize = 32 * 1024 * 1024;
 
@@ -85,14 +87,29 @@ pub fn inspect<R: Read + Seek>(source: &mut R, offset: u64, size: u64) -> Result
     let mut sections = Vec::with_capacity(count as usize);
     let mut expanded_size = HEADER;
     for _ in 0..count {
-        let start = read_u64(source)?;
-        let length = read_u64(source)?;
+        let raw_start = read_u64(source)?;
+        let raw_length = read_u64(source)?;
         let crypto = read_u64(source)?;
         let _reserved = read_u64(source)?;
         let mut key = [0u8; 16];
         let mut counter = [0u8; 16];
         source.read_exact(&mut key)?;
         source.read_exact(&mut counter)?;
+        let raw_end = raw_start
+            .checked_add(raw_length)
+            .context("NCZ 섹션 크기 범위 초과")?;
+        // Some valid NCZ dumps describe the first encrypted NCA section from
+        // 0xC00 (the NCA section offset). The first 0x4000 bytes are already
+        // copied verbatim from the NCZ header, so only its portion *after*
+        // 0x4000 may be read from the compressed stream and re-encrypted.
+        let start = if sections.is_empty() && raw_start == 0xC00 && raw_end > HEADER {
+            HEADER
+        } else {
+            raw_start
+        };
+        let length = raw_end
+            .checked_sub(start)
+            .context("NCZ 섹션이 보존된 NCA 헤더와 중복됩니다")?;
         anyhow::ensure!(
             start >= expanded_size && length > 0,
             "NCZ 섹션 주소가 중복되거나 뒤바뀌었습니다"
@@ -101,9 +118,7 @@ pub fn inspect<R: Read + Seek>(source: &mut R, offset: u64, size: u64) -> Result
             matches!(crypto, 0..=4),
             "지원하지 않는 NCZ 암호화 방식: {crypto}"
         );
-        expanded_size = start
-            .checked_add(length)
-            .context("NCZ 섹션 크기 범위 초과")?;
+        expanded_size = raw_end;
         anyhow::ensure!(expanded_size <= MAX_NCA_SIZE, "NCZ 출력 크기 제한 초과");
         sections.push(Section {
             start,
@@ -136,11 +151,19 @@ pub fn inspect<R: Read + Seek>(source: &mut R, offset: u64, size: u64) -> Result
         anyhow::ensure!(block_size <= MAX_BLOCK_SIZE, "NCZBLOCK 블록 크기 제한 초과");
         let block_count = read_u32(source)? as u64;
         let unpacked_size = read_u64(source)?;
-        let expected = expanded_size - HEADER;
+        // The section list covers encrypted ranges, not necessarily every
+        // byte of the restored NCA. NCZBLOCK explicitly provides the full
+        // uncompressed length, including any unencrypted trailing content.
+        let encrypted_end = expanded_size - HEADER;
         anyhow::ensure!(
-            unpacked_size == expected,
-            "NCZBLOCK 출력 크기와 섹션 정보가 다릅니다"
+            unpacked_size >= encrypted_end,
+            "NCZBLOCK 출력 크기가 암호화 섹션 범위보다 작습니다"
         );
+        expanded_size = HEADER
+            .checked_add(unpacked_size)
+            .context("NCZBLOCK 출력 크기 범위 초과")?;
+        anyhow::ensure!(expanded_size <= MAX_NCA_SIZE, "NCZ 출력 크기 제한 초과");
+        let expected = unpacked_size;
         let expected_count = unpacked_size.div_ceil(block_size as u64);
         anyhow::ensure!(
             block_count == expected_count && block_count > 0 && block_count <= 1_000_000,
@@ -388,6 +411,17 @@ pub fn decompress<R: Read + Seek, W: Write>(
             position += len as u64;
             left -= len as u64;
         }
+    }
+    // NCZBLOCK may store unencrypted NCA data after its final encrypted
+    // section. Copy exactly the remaining declared bytes, not fabricated
+    // padding, and fail on any truncated compressed input.
+    while position < layout.expanded_size {
+        let len = (layout.expanded_size - position).min(IO_CHUNK as u64) as usize;
+        reader
+            .read_exact(&mut buffer[..len])
+            .context("NCZ 평문 후반 데이터가 잘렸습니다")?;
+        target.write_all(&buffer[..len])?;
+        position += len as u64;
     }
     anyhow::ensure!(
         position == layout.expanded_size,
@@ -682,6 +716,122 @@ mod tests {
             );
             assert_eq!(restored, original);
         }
+    }
+
+    #[test]
+    fn nca_section_starting_at_0xc00_keeps_preserved_header_and_restores_tail() {
+        let mut original = vec![0x5au8; HEADER as usize];
+        original.extend((0..0x11000u32).map(|value| (value % 241) as u8));
+        let sections = [Section {
+            start: HEADER,
+            size: 0x11000,
+            crypto: 3,
+            key: [0x21; 16],
+            counter: [0x43; 16],
+        }];
+        for block_encoding in [false, true] {
+            let mut encoded = sample_ncz(&original, &sections, block_encoding);
+            let position = HEADER as usize + 16;
+            // A genuine NCZ section descriptor can cover encrypted data from
+            // 0xC00, whereas the compressed bytes only start at 0x4000.
+            encoded[position..position + 8].copy_from_slice(&0xC00u64.to_le_bytes());
+            encoded[position + 8..position + 16]
+                .copy_from_slice(&(0x11000u64 + (HEADER - 0xC00)).to_le_bytes());
+            let mut source = Cursor::new(encoded);
+            let input_size = source.get_ref().len() as u64;
+            let layout = inspect(&mut source, 0, input_size).expect("valid 0xC00 NCZ section");
+            assert_eq!(layout.sections[0].start, HEADER);
+            assert_eq!(layout.sections[0].size, 0x11000);
+            assert_eq!(layout.expanded_size, original.len() as u64);
+
+            let mut restored = Vec::new();
+            assert_eq!(
+                decompress(&mut source, 0, input_size, &mut restored).unwrap(),
+                original.len() as u64
+            );
+            assert_eq!(restored, original);
+        }
+
+        // Only the established NCA 0xC00 header overlap is tolerated.
+        let mut invalid = sample_ncz(&original, &sections, true);
+        invalid[HEADER as usize + 16..HEADER as usize + 24]
+            .copy_from_slice(&0x800u64.to_le_bytes());
+        assert!(inspect(&mut Cursor::new(&invalid), 0, invalid.len() as u64).is_err());
+    }
+
+    #[test]
+    fn nczblock_unencrypted_tail_after_last_encrypted_section_roundtrips() {
+        let mut original = vec![0x5au8; HEADER as usize];
+        original.extend((0..0x35000u32).map(|value| (value % 251) as u8));
+        let sections = [Section {
+            start: HEADER,
+            size: 0x2000,
+            crypto: 3,
+            key: [0x35; 16],
+            counter: [0x46; 16],
+        }];
+        let encoded = sample_ncz(&original, &sections, true);
+        let mut source = Cursor::new(&encoded);
+        let length = encoded.len() as u64;
+        let layout = inspect(&mut source, 0, length).unwrap();
+        assert_eq!(layout.sections.len(), 1);
+        assert_eq!(layout.sections[0].size, 0x2000);
+        assert_eq!(layout.expanded_size, original.len() as u64);
+
+        let mut restored = Vec::new();
+        assert_eq!(
+            decompress(&mut source, 0, length, &mut restored).unwrap(),
+            original.len() as u64
+        );
+        assert_eq!(restored, original);
+
+        let mut sparse_source = Cursor::new(&encoded);
+        with_sparse_nca(
+            &mut sparse_source,
+            0,
+            length,
+            original.len() as u64,
+            |reader, _| {
+                let from = HEADER + 0x2000 + 31;
+                reader.seek(SeekFrom::Start(from)).unwrap();
+                let mut tail = [0u8; 128];
+                reader.read_exact(&mut tail).unwrap();
+                assert_eq!(&tail, &original[from as usize..from as usize + tail.len()]);
+                Some(())
+            },
+        )
+        .expect("plain tail must be accessible through sparse NCZ reader");
+
+        let mut undersized = encoded;
+        let unpacked_at = HEADER as usize + 16 + 64 + 8 + 4 + 4;
+        undersized[unpacked_at..unpacked_at + 8].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert!(inspect(&mut Cursor::new(&undersized), 0, length).is_err());
+    }
+
+    #[test]
+    fn ncz_section_tables_above_4096_are_accepted_with_a_bounded_limit() {
+        // Valid NCZ encryption metadata can contain thousands of tiny ranges.
+        // This tests the index only, not decoding a synthetic zstd payload.
+        let count = 4097u64;
+        let mut encoded = vec![0u8; HEADER as usize];
+        encoded.extend_from_slice(b"NCZSECTN");
+        encoded.extend_from_slice(&count.to_le_bytes());
+        for i in 0..count {
+            encoded.extend_from_slice(&(HEADER + i).to_le_bytes());
+            encoded.extend_from_slice(&1u64.to_le_bytes());
+            encoded.extend_from_slice(&0u64.to_le_bytes());
+            encoded.extend_from_slice(&0u64.to_le_bytes());
+            encoded.extend_from_slice(&[0u8; 32]);
+        }
+        encoded.extend_from_slice(b"synthetic-zstd-placeholder");
+        let length = encoded.len() as u64;
+        let layout = inspect(&mut Cursor::new(&encoded), 0, length).unwrap();
+        assert_eq!(layout.sections.len(), count as usize);
+        assert_eq!(layout.expanded_size, HEADER + count);
+
+        encoded[HEADER as usize + 8..HEADER as usize + 16]
+            .copy_from_slice(&(MAX_SECTION_COUNT + 1).to_le_bytes());
+        assert!(inspect(&mut Cursor::new(&encoded), 0, length).is_err());
     }
 
     #[test]

@@ -173,16 +173,41 @@ fn is_ncz(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".ncz")
 }
 
+/// Predict the file name before inspecting or decompressing any NCZ payload.
+/// Preserve the original extension's final character case (NCZ -> NCA).
+fn restored_name(name: &str) -> String {
+    if !is_ncz(name) {
+        return name.to_owned();
+    }
+    let mut restored = name[..name.len() - 1].to_owned();
+    restored.push(if name.ends_with('Z') { 'A' } else { 'a' });
+    restored
+}
+
+/// Two distinct source names may collide after NCZ -> NCA restoration.
+/// Refuse such packages at planning time, before decoding or writing output.
+fn validate_restored_names(entries: &[Entry]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        let name = restored_name(&entry.name);
+        anyhow::ensure!(
+            seen.insert(name.to_lowercase()),
+            "NCZ 변환 후 출력 파일명이 중복됩니다: {name}"
+        );
+    }
+    Ok(())
+}
+
 fn plan(source: &mut File, start: u64, end: u64, kind: Kind, depth: usize) -> Result<Plan> {
     anyhow::ensure!(depth <= 1, "중첩 파일시스템 깊이가 잘못되었습니다");
     let mut entries = read_index(source, start, end, kind)?;
+    validate_restored_names(&entries)?;
     for item in &mut entries {
         if is_ncz(&item.name) {
             let layout = ncz::inspect(source, item.start, item.size)
                 .with_context(|| format!("{} NCZ 헤더 검증 실패", item.name))?;
             item.output_size = layout.expanded_size;
-            item.name.truncate(item.name.len() - 1);
-            item.name.push('a');
+            item.name = restored_name(&item.name);
             item.compressed = true;
         } else if kind == Kind::Hfs0
             && depth == 0
@@ -418,6 +443,43 @@ mod tests {
         data.extend_from_slice(names);
         data.extend_from_slice(b"abcdefgh");
         data
+    }
+
+    #[test]
+    fn reject_duplicate_output_names_created_by_ncz_restoration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("collision.bin");
+
+        for kind in [Kind::Pfs0, Kind::Hfs0] {
+            let mut bytes = synthetic_two_entry_index(kind);
+            let names_start = 16 + 2 * kind.entry_len();
+            // Both source names are legal, but restoration would produce
+            // two "first.nca" entries. Reject before any NCZ payload I/O.
+            bytes[names_start..names_start + 21].copy_from_slice(b"first.ncz\0first.nca\0\0");
+            std::fs::write(&path, &bytes).unwrap();
+            let mut input = File::open(&path).unwrap();
+            assert_eq!(
+                read_index(&mut input, 0, bytes.len() as u64, kind)
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let failure = plan(&mut input, 0, bytes.len() as u64, kind, 0)
+                .expect_err("must reject output collision before NCZ inspection");
+            assert!(failure.to_string().contains("출력 파일명이 중복"));
+            drop(input);
+
+            let mut upper = bytes;
+            upper[names_start..names_start + 21].copy_from_slice(b"first.NCZ\0FIRST.NCA\0\0");
+            std::fs::write(&path, &upper).unwrap();
+            let mut input = File::open(&path).unwrap();
+            assert!(plan(&mut input, 0, upper.len() as u64, kind, 0).is_err());
+        }
+
+        assert_eq!(restored_name("a.ncz"), "a.nca");
+        assert_eq!(restored_name("a.NCZ"), "a.NCA");
+        assert_eq!(restored_name("a.NcZ"), "a.NcA");
+        assert_eq!(restored_name("a.nca"), "a.nca");
     }
 
     #[test]

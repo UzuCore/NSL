@@ -2814,6 +2814,206 @@ fn escape_closes_settings_without_touching_searches_or_filters_behind_it() {
     }
 }
 
+/// Deliver a real egui keyboard event without sending global Windows input.
+fn send_escape_to_app(app: &mut NslApp, ctx: &egui::Context) {
+    ctx.begin_pass(egui::RawInput {
+        events: vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        )),
+        ..Default::default()
+    });
+    app.ui_frame(ctx);
+    let _ = ctx.end_pass();
+}
+
+#[test]
+fn escape_closes_all_dialog_kinds_before_settings_log_or_filters() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    for index in 0..17 {
+        // A popup from Settings or Downloads must close without also closing
+        // Settings or the log pane, or activating a destructive action.
+        app.settings_open = true;
+        app.log_open = true;
+        app.search = "library remains".into();
+        app.search_committed = app.search.clone();
+        app.catalog_search = "store remains".into();
+        app.catalog_search_committed = app.catalog_search.clone();
+        app.download_search = "download remains".into();
+        app.catalog_genre_filter = "Action".into();
+        match index {
+            0 => app.rename_preview = Some(("rename-from".into(), "rename-to".into())),
+            1 => {
+                app.catalog_torrent_dialog = Some(CatalogTorrentDialog {
+                    item: catalog::CatalogItem {
+                        title: "Escape selection dialog".into(),
+                        ..Default::default()
+                    },
+                    request: None,
+                    files: None,
+                    error: Some("Test preview error".into()),
+                });
+            }
+            2 => app.download_delete_confirm = Some(("t42".into(), "test download".into())),
+            3 => app.bulk_rename_preview = Some(vec![("from".into(), "to".into())]),
+            4 => app.titledb_info = Some("DB file status".into()),
+            5 => app.clear_titledb_confirm = true,
+            6 => app.clear_library_confirm = true,
+            7 => app.remove_folder_confirm = Some("E:\\NSW".into()),
+            8 => app.folder_notice = Some("Notice".into()),
+            9 => app.orphan_cleanup_confirm = true,
+            10 => app.workspace_cleanup_confirm = true,
+            11 => {
+                app.update_info = Some(updater::ReleaseInfo {
+                    current_version: "a".into(),
+                    latest_version: "b".into(),
+                    latest_commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    release_tag: "test".into(),
+                    is_newer: true,
+                    notes: "Synthetic update".into(),
+                    download_url: None,
+                });
+            }
+            12 => app.update_ready = Some(PathBuf::from("uninstalled-update")),
+            13 => app.cache_info = Some("cache status".into()),
+            14 => app.shortcuts_open = true,
+            15 => app.about_open = true,
+            16 => app.exit_confirm = true,
+            _ => unreachable!(),
+        }
+        // Render the actual popup before the Escape frame.
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        });
+        app.ui_frame(&ctx);
+        let _ = ctx.end_pass();
+        send_escape_to_app(&mut app, &ctx);
+        let closed = match index {
+            0 => app.rename_preview.is_none(),
+            1 => app.catalog_torrent_dialog.is_none(),
+            2 => app.download_delete_confirm.is_none(),
+            3 => app.bulk_rename_preview.is_none(),
+            4 => app.titledb_info.is_none(),
+            5 => !app.clear_titledb_confirm,
+            6 => !app.clear_library_confirm,
+            7 => app.remove_folder_confirm.is_none(),
+            8 => app.folder_notice.is_none(),
+            9 => !app.orphan_cleanup_confirm,
+            10 => !app.workspace_cleanup_confirm,
+            11 => app.update_info.is_none(),
+            12 => app.update_ready.is_none(),
+            13 => app.cache_info.is_none(),
+            14 => !app.shortcuts_open,
+            15 => !app.about_open,
+            16 => !app.exit_confirm,
+            _ => unreachable!(),
+        };
+        assert!(closed, "Esc failed to close popup kind {index}");
+        assert!(
+            app.settings_open,
+            "Esc also closed settings at popup kind {index}"
+        );
+        assert!(
+            app.log_open,
+            "Esc also closed the log at popup kind {index}"
+        );
+        assert!(!app.exit_confirmed, "Esc unexpectedly approved exit");
+        assert_eq!(app.search, "library remains");
+        assert_eq!(app.search_committed, "library remains");
+        assert_eq!(app.catalog_search, "store remains");
+        assert_eq!(app.catalog_search_committed, "store remains");
+        assert_eq!(app.download_search, "download remains");
+        assert_eq!(app.catalog_genre_filter, "Action");
+        app.settings_open = false;
+        app.log_open = false;
+    }
+}
+
+#[test]
+fn escape_closes_only_topmost_popup_then_settings_then_log_then_filters() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "DOWNLOADS".into();
+    app.torrent_engine = None;
+    app.search = "keep library".into();
+    app.search_committed = "keep library".into();
+    app.download_search = "keep download".into();
+    app.download_delete_confirm = Some(("t1".into(), "do not delete".into()));
+    app.about_open = true;
+    app.exit_confirm = true;
+    app.settings_open = true;
+    app.log_open = true;
+    app.log_lines = vec!["keep log contents".into()];
+
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.exit_confirm && app.about_open);
+    assert!(app.download_delete_confirm.is_some() && app.settings_open && app.log_open);
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.about_open && app.download_delete_confirm.is_some());
+    send_escape_to_app(&mut app, &ctx);
+    assert!(app.download_delete_confirm.is_none());
+    assert!(app.settings_open && app.log_open);
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.settings_open && app.log_open);
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.log_open);
+    assert_eq!(app.log_lines, ["keep log contents"]);
+    assert_eq!(app.search, "keep library");
+    assert_eq!(app.download_search, "keep download");
+    assert!(!app.exit_confirmed);
+
+    // With no overlays, Esc retains the existing search-clear behavior.
+    send_escape_to_app(&mut app, &ctx);
+    assert!(app.search.is_empty());
+    assert!(app.search_committed.is_empty());
+    assert!(app.download_search.is_empty());
+    assert_eq!(app.log_lines, ["keep log contents"]);
+}
+
+#[test]
+fn escape_closes_native_context_menu_before_dialogs_and_log() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    app.folder_filter = "DOWNLOADS".into();
+    app.download_search = "preserved query".into();
+    app.about_open = true;
+    app.settings_open = true;
+    app.log_open = true;
+    ctx.memory_mut(|memory| memory.open_popup(egui::Id::new("test_native_context_menu")));
+    assert!(ctx.memory(|memory| memory.any_popup_open()));
+
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!ctx.memory(|memory| memory.any_popup_open()));
+    assert!(app.about_open && app.settings_open && app.log_open);
+    assert_eq!(app.download_search, "preserved query");
+
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.about_open && app.settings_open && app.log_open);
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.settings_open && app.log_open);
+    send_escape_to_app(&mut app, &ctx);
+    assert!(!app.log_open);
+    assert_eq!(app.download_search, "preserved query");
+    send_escape_to_app(&mut app, &ctx);
+    assert!(app.download_search.is_empty());
+}
+
 #[test]
 fn top_library_statistics_stay_small_right_aligned_and_on_the_first_row() {
     use egui::containers::panel::PanelState;

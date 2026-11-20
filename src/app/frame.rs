@@ -3,6 +3,58 @@
 use crate::*;
 
 impl NslApp {
+    /// Close just one visible overlay per Esc press. Popup drawing order in
+    /// `ui_frame` determines which dialog is on top (last drawn wins). Never
+    /// confirm destructive actions, launch updates or cancel running jobs.
+    fn dismiss_topmost_overlay(&mut self) -> bool {
+        // Popup stack, in the reverse order of show_centered_popup calls.
+        if self.exit_confirm {
+            self.exit_confirm = false;
+        } else if self.about_open {
+            self.about_open = false;
+        } else if self.shortcuts_open {
+            self.shortcuts_open = false;
+        } else if self.cache_info.is_some() {
+            self.cache_info = None;
+        } else if self.update_ready.is_some() {
+            self.update_ready = None;
+        } else if self.update_info.is_some() {
+            self.update_info = None;
+        } else if self.workspace_cleanup_confirm {
+            self.workspace_cleanup_confirm = false;
+        } else if self.orphan_cleanup_confirm {
+            self.orphan_cleanup_confirm = false;
+        } else if self.folder_notice.is_some() {
+            self.folder_notice = None;
+        } else if self.remove_folder_confirm.is_some() {
+            self.remove_folder_confirm = None;
+        } else if self.clear_library_confirm {
+            self.clear_library_confirm = false;
+        } else if self.clear_titledb_confirm {
+            self.clear_titledb_confirm = false;
+        } else if self.titledb_info.is_some() {
+            self.titledb_info = None;
+        } else if self.bulk_rename_preview.is_some() {
+            self.bulk_rename_preview = None;
+        } else if self.download_delete_confirm.is_some() {
+            self.download_delete_confirm = None;
+        } else if self.catalog_torrent_dialog.is_some() {
+            // Dropping an outstanding preview also cancels its metadata request.
+            self.catalog_torrent_dialog = None;
+        } else if self.rename_preview.is_some() {
+            self.rename_preview = None;
+        } else if self.settings_open {
+            self.settings_open = false;
+        } else if self.log_open {
+            // The log is a docked panel, not a popup: close it only once no
+            // other dialog or settings screen is awaiting dismissal.
+            self.log_open = false;
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Display every running operation in the same footer, with a measured
     /// fraction where available. The first foreground task wins the visible
     /// slot; simultaneous tasks remain discoverable in its hover tooltip.
@@ -168,10 +220,22 @@ impl NslApp {
             self.start_scan(true);
         }
         if escape {
-            if self.settings_open {
-                // Match the settings panel's "X  닫기" button. Do not also
-                // erase the library/Store/Downloads filters behind the panel.
-                self.settings_open = false;
+            // egui menus and combo-boxes are foreground popups; close them
+            // before our centered windows or the docked log panel.
+            let native_popup_open = ctx.memory(|memory| memory.any_popup_open());
+            let dismissed = if native_popup_open {
+                ctx.memory_mut(|memory| memory.close_popup());
+                true
+            } else {
+                self.dismiss_topmost_overlay()
+            };
+            if dismissed {
+                // Prevent any widget underneath the dismissed dialog from
+                // processing this same Escape keystroke a second time.
+                ctx.input_mut(|input| {
+                    let modifiers = input.modifiers;
+                    input.consume_key(modifiers, egui::Key::Escape);
+                });
             } else {
                 // TextEdit changes its buffer during this frame, so clearing
                 // only `search` can leave the committed query filtering the
@@ -2320,7 +2384,7 @@ impl NslApp {
                     }
                 }
             }
-            let mut canceled = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+            let mut canceled = false;
             let mut confirmed = false;
             let response = show_centered_popup(
                 ctx,
@@ -2894,10 +2958,10 @@ impl NslApp {
                         );
                         ui.vertical(|ui| {
                             ui.label("빠른 스캔 F5");
-                            ui.label("설정 열기/닫기 Ctrl+O · 설정 닫기 Esc");
+                            ui.label("설정 열기/닫기 Ctrl+O · 팝업/설정/로그 닫기 Esc");
                             ui.label("검색창 포커스 Ctrl+F");
                             ui.label("종료 Alt+F4");
-                            ui.label("검색어 초기화 Esc (설정 화면 밖에서)");
+                            ui.label("검색어 초기화 Esc (열린 팝업·설정·로그가 없을 때)");
                             ui.label("게임 선택 이동 ↑ ↓ ← →");
                             ui.label("한 화면 이동 Page Up / Page Down");
                             ui.label("처음 / 마지막 Home / End (Ctrl+Home / Ctrl+End)");

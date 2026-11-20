@@ -2,6 +2,22 @@
 
 use crate::*;
 
+/// Keep the fast metadata-only cache path, but never treat a file rewritten
+/// within the same second as unchanged. SQLite preserves the f64 timestamp
+/// bits, so comparing the precise mtime we originally stored is reliable.
+/// A modified timestamp then falls through to the bounded fast-hash check.
+fn unchanged_scan_metadata(
+    stored_size: i64,
+    stored_mtime: Option<f64>,
+    current_size: i64,
+    current_mtime: Option<f64>,
+) -> bool {
+    stored_size == current_size
+        && stored_mtime
+            .zip(current_mtime)
+            .is_some_and(|(old, current)| old.is_finite() && old == current)
+}
+
 impl NslApp {
     pub(crate) fn start_reload(&mut self) {
         if self.reload_result.is_some() {
@@ -203,13 +219,12 @@ impl NslApp {
                         existing.push(path.clone());
                         if incremental && !force_reanalyze {
                             if let Some(old) = cached_records.get(&path) {
-                                if old.size == meta.len() as i64
-                                    && old
-                                        .mtime
-                                        .zip(mtime)
-                                        .map(|(a, b)| (a - b).abs() < 1.0)
-                                        .unwrap_or(false)
-                                {
+                                if unchanged_scan_metadata(
+                                    old.size,
+                                    old.mtime,
+                                    meta.len() as i64,
+                                    mtime,
+                                ) {
                                     skipped += 1;
                                     continue;
                                 }
@@ -259,14 +274,9 @@ impl NslApp {
                             .par_iter()
                             .map(|(source, path, filename, size, mtime, ext, folder)| {
                                 let cached_record = cached_record_for_path(&cached_records, path);
-                                let same_metadata = cached_records.get(path).map(|old| {
-                                    old.size == *size
-                                        && old
-                                            .mtime
-                                            .zip(*mtime)
-                                            .map(|(old, current)| (old - current).abs() < 1.0)
-                                            .unwrap_or(false)
-                                }) == Some(true);
+                                let same_metadata = cached_records.get(path).is_some_and(|old| {
+                                    unchanged_scan_metadata(old.size, old.mtime, *size, *mtime)
+                                });
                                 // A record written before the NACP version column
                                 // existed has an empty version that a plain cache
                                 // hit would keep forever, so re-read those once.
@@ -408,5 +418,40 @@ impl NslApp {
             }
             let _ = tx.send(result);
         });
+    }
+}
+
+#[cfg(test)]
+mod metadata_cache_tests {
+    use super::unchanged_scan_metadata;
+
+    #[test]
+    fn subsecond_timestamp_changes_require_fast_hash_verification() {
+        let original = 1_800_000_000.125;
+        assert!(unchanged_scan_metadata(
+            4096,
+            Some(original),
+            4096,
+            Some(original)
+        ));
+        assert!(!unchanged_scan_metadata(
+            4096,
+            Some(original),
+            4096,
+            Some(original + 0.125)
+        ));
+        assert!(!unchanged_scan_metadata(
+            4096,
+            Some(original),
+            8192,
+            Some(original)
+        ));
+        assert!(!unchanged_scan_metadata(4096, None, 4096, None));
+        assert!(!unchanged_scan_metadata(
+            4096,
+            Some(f64::NAN),
+            4096,
+            Some(f64::NAN)
+        ));
     }
 }

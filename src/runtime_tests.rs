@@ -452,6 +452,92 @@ fn incremental_scan_reanalyzes_unchanged_files_on_schema_change() {
 }
 
 #[test]
+fn incremental_scan_detects_same_size_rom_rewrite_within_one_second() {
+    // Replacing a ROM without changing its size, less than one second after
+    // its previous mtime, used to bypass both the metadata scan and fast hash.
+    // Everything here lives in the seeded app's private temporary folder.
+    let (mut app, dir) = seeded_app();
+    let folder = dir.path().join("rapid-rewrite-games");
+    std::fs::create_dir_all(&folder).unwrap();
+    let path = folder.join("rapid-rewrite.nsp");
+    let normalized = normalize_scan_path(&path);
+    let named = normalize_scan_path(&folder);
+    let fixture = |id: &str| {
+        let entry_name = b"test.cnmt.xml\0";
+        let xml = format!("<TitleId>{id}</TitleId>");
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PFS0");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&(entry_name.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&(xml.len() as u64).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(entry_name);
+        data.extend_from_slice(xml.as_bytes());
+        data
+    };
+    let initial = fixture("0100D2C0115B6000");
+    let replacement = fixture("0100D2C0115B9000");
+    assert_eq!(initial.len(), replacement.len());
+    std::fs::write(&path, &initial).unwrap();
+    let initial_time = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(1_750_000_000)
+        + std::time::Duration::from_millis(125);
+    let later_time = initial_time + std::time::Duration::from_millis(250);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(initial_time))
+        .unwrap();
+
+    app.db.clear_library_data().unwrap();
+    app.folders = vec![named.clone()];
+    app.config.scan_folders = app.folders.clone();
+    app.config.settings.insert(
+        "scan_schema".into(),
+        serde_json::Value::String(SCAN_SCHEMA_VERSION.into()),
+    );
+    app.headless_mode = true;
+    let ctx = egui::Context::default();
+    app.start_scan(false);
+    assert!(run_until_idle(&mut app, &ctx));
+    let before = app.db.file_contents(&normalized).unwrap();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].title_id.as_deref(), Some("0100D2C0115B6000"));
+    let before_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    std::fs::write(&path, &replacement).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(later_time))
+        .unwrap();
+    let after_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let difference = after_mtime.duration_since(before_mtime).unwrap();
+    assert!(difference > std::time::Duration::ZERO);
+    assert!(difference < std::time::Duration::from_secs(1));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        initial.len() as u64
+    );
+
+    app.start_scan(true);
+    assert!(run_until_idle(&mut app, &ctx));
+    let after = app.db.file_contents(&normalized).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].title_id.as_deref(),
+        Some("0100D2C0115B9000"),
+        "incremental scan must re-read ROM content after a subsecond mtime change"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), replacement);
+}
+
+#[test]
 fn missing_dlc_exclusion_invalidates_stats_and_list_cache() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);

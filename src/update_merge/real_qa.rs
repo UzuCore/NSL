@@ -2,6 +2,156 @@
 use super::*;
 use sha2::Digest;
 
+/// Fast NSZ composition against read-only, explicitly isolated game copies.
+/// A reference from the previous fully SHA-256 verified Stage 3 output can
+/// additionally prove every decompressed NCA is byte-identical. For very
+/// large input, STRUCTURAL_ONLY skips the expensive double-decompression.
+#[test]
+#[ignore = "requires NSL_QA_ROOT, NSL_QA_BASE (.nsz), NSL_QA_PATCH (.nsp), NSL_QA_BASE_ID, NSL_QA_VERSION"]
+fn real_package_fast_nsz_equivalence() {
+    use std::time::Instant;
+
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let base = std::fs::canonicalize(std::env::var("NSL_QA_BASE").unwrap()).unwrap();
+    let patch = std::fs::canonicalize(std::env::var("NSL_QA_PATCH").unwrap()).unwrap();
+    let base_id = std::env::var("NSL_QA_BASE_ID").unwrap();
+    let version: i64 = std::env::var("NSL_QA_VERSION").unwrap().parse().unwrap();
+    assert!(base.starts_with(&root) && patch.starts_with(&root));
+    assert!(base
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")));
+    assert!(patch
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsp")));
+    let temp = tempfile::Builder::new()
+        .prefix("stage4-nsz-qa-")
+        .tempdir_in(&root)
+        .unwrap();
+    let prod_keys = scanner::prod_keys().unwrap();
+    let mut keys = KeySet::load_with_local_title_keys(&prod_keys).unwrap();
+    let tool = temp.path().join("_external_tools_disabled.exe");
+    let cancel = AtomicBool::new(false);
+    let started = Instant::now();
+    let output = fast_nsz::try_merge_nsz_fast(
+        fast_nsz::FastNszRequest {
+            original: &base,
+            patch: &patch,
+            base_id: &base_id,
+            version,
+            work: temp.path(),
+            disabled_tool: &tool,
+            prod_keys: &prod_keys,
+        },
+        &mut keys,
+        &cancel,
+    )
+    .unwrap()
+    .expect("isolated NSZ + NSP samples should use the fast path");
+    let elapsed = started.elapsed();
+    let index = nsrp_core::formats::pfs0::Pfs0Index::parse(&output).unwrap();
+    let compressed = index
+        .entries
+        .iter()
+        .filter(|entry| entry.name.to_ascii_lowercase().ends_with(".ncz"))
+        .count();
+    assert!(compressed > 0);
+    let (_, cnmts, _) = cnmt::discover_game_metadata(
+        &output,
+        &temp.path().join("verify"),
+        &tool,
+        &prod_keys,
+        &cancel,
+    )
+    .unwrap();
+    validate_selected_cnmts(&cnmts, &base_id, version).unwrap();
+    println!(
+        "NSL_STAGE4_FAST_NSZ seconds={:.3} output_bytes={} entries={} ncz={}",
+        elapsed.as_secs_f64(),
+        std::fs::metadata(&output).unwrap().len(),
+        index.entries.len(),
+        compressed,
+    );
+    if std::env::var("NSL_QA_STRUCTURAL_ONLY").ok().as_deref() == Some("1") {
+        return;
+    }
+    let reference = std::fs::canonicalize(std::env::var("NSL_QA_EXPECTED").unwrap()).unwrap();
+    assert!(reference.starts_with(&root));
+    let decoded_new = temp.path().join("fast_decoded.nsp");
+    let decoded_reference = temp.path().join("reference_decoded.nsp");
+    compress::decompress_nsz(&output, &decoded_new, &cancel, &mut |_| {}, &mut |_| {}).unwrap();
+    compress::decompress_nsz(
+        &reference,
+        &decoded_reference,
+        &cancel,
+        &mut |_| {},
+        &mut |_| {},
+    )
+    .unwrap();
+    let new_hashes = qa_nca_hashes(&decoded_new);
+    let reference_hashes = qa_nca_hashes(&decoded_reference);
+    assert_eq!(new_hashes, reference_hashes, "every merged NCA must match");
+    println!("NSL_STAGE4_SHA256_ALL_NCA_PASS count={}", new_hashes.len());
+}
+
+/// Opt-in, end-to-end backend test on private copies. Exercises atomic
+/// publication, journal recovery and output collision checks.
+#[test]
+#[ignore = "requires NSL_QA_ROOT, NSL_QA_BASE (.nsz), NSL_QA_PATCH (.nsp), NSL_QA_BASE_ID, NSL_QA_VERSION; use a sub-1GiB sample"]
+fn real_package_fast_nsz_end_to_end_publish() {
+    use std::io::Read;
+
+    fn file_sha256(path: &Path) -> [u8; 32] {
+        let mut file = File::open(path).unwrap();
+        let mut digest = sha2::Sha256::new();
+        let mut buffer = vec![0u8; 2 * 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        digest.finalize().into()
+    }
+
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let original = std::fs::canonicalize(std::env::var("NSL_QA_BASE").unwrap()).unwrap();
+    let patch = std::fs::canonicalize(std::env::var("NSL_QA_PATCH").unwrap()).unwrap();
+    let base_id = std::env::var("NSL_QA_BASE_ID").unwrap();
+    let version: i64 = std::env::var("NSL_QA_VERSION").unwrap().parse().unwrap();
+    assert!(original.starts_with(&root) && patch.starts_with(&root));
+    assert!(std::fs::metadata(&original).unwrap().len() < (1 << 30));
+    assert!(std::fs::metadata(&patch).unwrap().len() < (1 << 30));
+    let temp = tempfile::Builder::new()
+        .prefix("stage4-publish-qa-")
+        .tempdir_in(&root)
+        .unwrap();
+    let base_copy = temp.path().join("base.nsz");
+    let patch_copy = temp.path().join("patch.nsp");
+    // Unlike hard links, disposable copies can never modify original QA
+    // files even if a future regression accidentally opens inputs for write.
+    std::fs::copy(&original, &base_copy).unwrap();
+    std::fs::copy(&patch, &patch_copy).unwrap();
+    let base_hash = file_sha256(&base_copy);
+    let patch_hash = file_sha256(&patch_copy);
+    let output = merge_verified_package(&base_copy, &patch_copy, &base_id, version).unwrap();
+    assert!(output.starts_with(temp.path()) && output.is_file());
+    assert_eq!(output.extension().and_then(|ext| ext.to_str()), Some("nsz"));
+    let output_size = std::fs::metadata(&output).unwrap().len();
+    assert!(output_size > 0);
+    assert_eq!(
+        merge_or_recover_existing(&base_copy, &patch_copy, &base_id, version).unwrap(),
+        output
+    );
+    assert!(merge_verified_package(&base_copy, &patch_copy, &base_id, version).is_err());
+    assert_eq!(std::fs::metadata(&output).unwrap().len(), output_size);
+    assert_eq!(file_sha256(&base_copy), base_hash);
+    assert_eq!(file_sha256(&patch_copy), patch_hash);
+    println!("NSL_STAGE4_PUBLISH_RECOVERY_INPUT_IMMUTABILITY_PASS output_bytes={output_size}");
+}
+
 #[test]
 #[ignore = "requires NSL_QA_ROOT and NSL_QA_BASE pointing to an isolated plain NSP"]
 fn real_package_pfs0_repack_without_updates() {

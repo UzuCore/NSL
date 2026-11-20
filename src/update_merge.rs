@@ -26,6 +26,8 @@ use std::{
 const MAX_COMPRESSION_WORKERS: usize = 4;
 const DEFAULT_ZSTD_LEVEL: i32 = 6;
 
+mod fast_nsz;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputKind {
     Nsp,
@@ -162,6 +164,28 @@ fn check_space(parent: &Path, original: &Path, patch: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Fast NSZ assembly reuses the compressed base: only the patch is
+/// recompressed, so no giant plaintext NSP is staged on LOCALAPPDATA.
+fn check_fast_nsz_space(parent: &Path, original: &Path, patch: &Path) -> Result<()> {
+    let base = fs::metadata(original)?.len();
+    let update = fs::metadata(patch)?.len();
+    // Two copies of the final output cover filesystems without hardlink
+    // support. The extra patch allocation and fixed headroom cover temporary
+    // compression, metadata and NCZ framing overhead.
+    let needed = base
+        .saturating_mul(2)
+        .saturating_add(update.saturating_mul(3))
+        .saturating_add(512 * 1024 * 1024);
+    let free = fs2::available_space(parent)?;
+    anyhow::ensure!(
+        free >= needed,
+        "NSZ 고속 병합에 필요한 여유 공간이 부족합니다: 최소 {} GiB 필요, {} GiB 사용 가능",
+        needed.div_ceil(1 << 30),
+        free >> 30
+    );
+    Ok(())
+}
+
 fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
     anyhow::ensure!(
         !destination.exists(),
@@ -220,7 +244,17 @@ pub(crate) fn merge_verified_package(
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
-    check_space(parent, original, patch)?;
+    let fast_candidate = format == OutputKind::Nsz
+        && original
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz"))
+        && ext.eq_ignore_ascii_case("nsp");
+    if fast_candidate {
+        check_fast_nsz_space(parent, original, patch)?;
+    } else {
+        check_space(parent, original, patch)?;
+    }
 
     let prod_keys = scanner::prod_keys().context("NSZ/XCZ 병합에 필요한 prod.keys가 없습니다")?;
     let mut keys = KeySet::load_with_local_title_keys(&prod_keys)
@@ -230,98 +264,125 @@ pub(crate) fn merge_verified_package(
         .tempdir_in(parent)?;
     let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
     let cancelled = AtomicBool::new(false);
-    let options = MergeOptions {
-        output_format: MergeFormat::Nsp,
-        compress_after: false,
-        use_game_title: false,
-        decompression_threads: 2,
-        compression: compression_options(),
+    let optimized = if fast_candidate {
+        fast_nsz::try_merge_nsz_fast(
+            fast_nsz::FastNszRequest {
+                original,
+                patch,
+                base_id,
+                version: wanted_version,
+                work: work.path(),
+                disabled_tool: &disabled_tool,
+                prod_keys: &prod_keys,
+            },
+            &mut keys,
+            &cancelled,
+        )?
+    } else {
+        None
     };
-    let sources = [original.to_path_buf(), patch.to_path_buf()];
-    let mut logs = Vec::new();
-    let merged_outputs = merge::merge_packages(
-        &sources,
-        work.path(),
-        true,
-        work.path(),
-        &disabled_tool,
-        &prod_keys,
-        &mut keys,
-        &options,
-        &cancelled,
-        &mut |_| {},
-        &mut |line| {
-            if logs.len() < 100 {
-                logs.push(line);
-            }
-        },
-    )
-    .with_context(|| format!("NSRP CNMT 병합 실패: {}", logs.join(" | ")))?;
-    anyhow::ensure!(
-        merged_outputs.len() == 1,
-        "병합 출력이 게임별 단일 결과물이 아닙니다"
-    );
-    let merged_nsp = &merged_outputs[0];
-    let produced = match format {
-        OutputKind::Nsp => merged_nsp.clone(),
-        OutputKind::Nsz => {
-            let target = work.path().join("compressed.nsz");
-            let stats = compress::compress_nsp(
-                merged_nsp,
-                &target,
-                &mut keys,
-                &compression_options(),
-                &cancelled,
-                &mut |_| {},
-                &mut |_| {},
-            )?;
-            anyhow::ensure!(
-                stats.ncz_count > 0,
-                "압축된 NCA가 없어 NSZ 출력을 게시할 수 없습니다"
-            );
-            target
+    let produced = if let Some(optimized) = optimized {
+        optimized
+    } else {
+        if fast_candidate {
+            // An uncommon compressed-CNMT layout may need the legacy path.
+            // Apply its larger disk-space preflight before any fallback I/O.
+            check_space(parent, original, patch)?;
         }
-        OutputKind::Xci | OutputKind::Xcz => {
-            let template = if format == OutputKind::Xcz {
-                let template = work.path().join("original.xci");
-                xcz::decompress_xcz(original, &template, &cancelled, &mut |_| {}, &mut |_| {})?;
-                template
-            } else {
-                original.to_path_buf()
-            };
-            let xci_output = work.path().join("merged.xci");
-            xci_merge::build_merged_xci_from_template(
-                &template,
-                merged_nsp,
-                &xci_output,
-                &cancelled,
-            )?;
-            if format == OutputKind::Xci {
-                xci_output
-            } else {
-                let target = work.path().join("compressed.xcz");
-                let opts = compression_options();
-                let stats = xcz::compress_xci(
-                    &xci_output,
+        let options = MergeOptions {
+            output_format: MergeFormat::Nsp,
+            compress_after: false,
+            use_game_title: false,
+            decompression_threads: 2,
+            compression: compression_options(),
+        };
+        let sources = [original.to_path_buf(), patch.to_path_buf()];
+        let mut logs = Vec::new();
+        let merged_outputs = merge::merge_packages(
+            &sources,
+            work.path(),
+            true,
+            work.path(),
+            &disabled_tool,
+            &prod_keys,
+            &mut keys,
+            &options,
+            &cancelled,
+            &mut |_| {},
+            &mut |line| {
+                if logs.len() < 100 {
+                    logs.push(line);
+                }
+            },
+        )
+        .with_context(|| format!("NSRP CNMT 병합 실패: {}", logs.join(" | ")))?;
+        anyhow::ensure!(
+            merged_outputs.len() == 1,
+            "병합 출력이 게임별 단일 결과물이 아닙니다"
+        );
+        let merged_nsp = &merged_outputs[0];
+        let produced = match format {
+            OutputKind::Nsp => merged_nsp.clone(),
+            OutputKind::Nsz => {
+                let target = work.path().join("compressed.nsz");
+                let stats = compress::compress_nsp(
+                    merged_nsp,
                     &target,
                     &mut keys,
-                    &XczOptions {
-                        level: opts.level,
-                        threads: opts.threads,
-                        block_mode: opts.block_mode,
-                        long_mode: opts.long_mode,
-                    },
+                    &compression_options(),
                     &cancelled,
                     &mut |_| {},
                     &mut |_| {},
                 )?;
                 anyhow::ensure!(
                     stats.ncz_count > 0,
-                    "압축된 NCA가 없어 XCZ 출력을 게시할 수 없습니다"
+                    "압축된 NCA가 없어 NSZ 출력을 게시할 수 없습니다"
                 );
                 target
             }
-        }
+            OutputKind::Xci | OutputKind::Xcz => {
+                let template = if format == OutputKind::Xcz {
+                    let template = work.path().join("original.xci");
+                    xcz::decompress_xcz(original, &template, &cancelled, &mut |_| {}, &mut |_| {})?;
+                    template
+                } else {
+                    original.to_path_buf()
+                };
+                let xci_output = work.path().join("merged.xci");
+                xci_merge::build_merged_xci_from_template(
+                    &template,
+                    merged_nsp,
+                    &xci_output,
+                    &cancelled,
+                )?;
+                if format == OutputKind::Xci {
+                    xci_output
+                } else {
+                    let target = work.path().join("compressed.xcz");
+                    let opts = compression_options();
+                    let stats = xcz::compress_xci(
+                        &xci_output,
+                        &target,
+                        &mut keys,
+                        &XczOptions {
+                            level: opts.level,
+                            threads: opts.threads,
+                            block_mode: opts.block_mode,
+                            long_mode: opts.long_mode,
+                        },
+                        &cancelled,
+                        &mut |_| {},
+                        &mut |_| {},
+                    )?;
+                    anyhow::ensure!(
+                        stats.ncz_count > 0,
+                        "압축된 NCA가 없어 XCZ 출력을 게시할 수 없습니다"
+                    );
+                    target
+                }
+            }
+        };
+        produced
     };
     anyhow::ensure!(
         produced.is_file() && fs::metadata(&produced)?.len() > 0,

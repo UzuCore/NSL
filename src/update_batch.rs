@@ -5,13 +5,13 @@
 //! an explicit numeric version can be offered for a bulk queue. This is still
 //! only a candidate; the downloaded package must be scanned before merging.
 
-use crate::{catalog, library, scanner, torrent};
+use crate::{catalog, library, scanner, torrent, update_merge};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{mpsc, OnceLock},
+    sync::{mpsc, Arc, OnceLock},
 };
 
 const MAX_RELEASES_PER_GAME: usize = 3;
@@ -61,6 +61,8 @@ pub(crate) struct UpdateBatchJob {
     pub(crate) recovering_since: Option<std::time::Instant>,
     pub(crate) status: UpdateBatchJobStatus,
     pub(crate) verifying: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
+    /// Runtime-only merge control. Never serialized into batch-updates.json.
+    pub(crate) merge_control: Option<Arc<update_merge::MergeControl>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

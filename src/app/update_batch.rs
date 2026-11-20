@@ -25,10 +25,14 @@ fn spawn_batch_merge(base_dir: PathBuf, row: &mut update_batch::UpdateBatchRow) 
     let original_size = job.original_size;
     let expected_file_size = job.expected_file_size;
     let (sender, receiver) = mpsc::channel();
+    let control = Arc::new(update_merge::MergeControl::default());
+    control.stage("다운로드 파일 무결성 검증");
     job.verifying = Some(receiver);
+    job.merge_control = Some(Arc::clone(&control));
     job.status = update_batch::UpdateBatchJobStatus::Verifying;
     std::thread::spawn(move || {
         let result = (|| -> anyhow::Result<Option<PathBuf>> {
+            control.ensure_running()?;
             anyhow::ensure!(original_size > 0, "원본 게임 파일 크기 정보가 없습니다");
             anyhow::ensure!(
                 std::fs::metadata(&original)?.len() == original_size,
@@ -39,8 +43,10 @@ fn spawn_batch_merge(base_dir: PathBuf, row: &mut update_batch::UpdateBatchRow) 
                 "다운로드 파일 크기가 검증된 토렌트 목록과 일치하지 않습니다"
             );
             update_batch::verify_downloaded_patch(&base_dir, &path, &title_id, wanted, installed)?;
-            let merged =
-                update_merge::merge_or_recover_existing(&original, &path, &title_id, wanted)?;
+            control.ensure_running()?;
+            let merged = update_merge::merge_or_recover_existing_controlled(
+                &original, &path, &title_id, wanted, &control,
+            )?;
             Ok(Some(merged))
         })()
         .map_err(|error| error.to_string());
@@ -197,6 +203,7 @@ impl NslApp {
                 match receiver.try_recv() {
                     Ok(Ok(output)) => {
                         job.verifying = None;
+                        job.merge_control = None;
                         changed = true;
                         if let Some(output) = output {
                             job.status = update_batch::UpdateBatchJobStatus::Merged(output);
@@ -211,11 +218,13 @@ impl NslApp {
                     }
                     Ok(Err(error)) => {
                         job.verifying = None;
+                        job.merge_control = None;
                         job.status = update_batch::UpdateBatchJobStatus::Failed(error);
                         changed = true;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
                         job.verifying = None;
+                        job.merge_control = None;
                         job.status = update_batch::UpdateBatchJobStatus::Failed(
                             "패키지 검증 작업이 예기치 않게 종료됨".into(),
                         );
@@ -362,6 +371,7 @@ impl NslApp {
                         recovering_since: None,
                         status: update_batch::UpdateBatchJobStatus::Queued,
                         verifying: None,
+                        merge_control: None,
                     });
                     queued += 1;
                 }
@@ -397,6 +407,7 @@ impl NslApp {
         let mut queue = false;
         let mut stop = false;
         let mut retry = false;
+        let mut cancel_merge = false;
         ui.horizontal_wrapped(|ui| {
             scan = ui
                 .add_enabled(
@@ -448,6 +459,26 @@ impl NslApp {
                         .button(format!("실패한 병합 재시도 {retryable}개"))
                         .clicked();
                 }
+                if let Some(control) = batch
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.job.as_ref())
+                    .find_map(|job| {
+                        job.verifying.as_ref()?;
+                        job.merge_control.as_ref()
+                    })
+                {
+                    cancel_merge = ui
+                        .add_enabled(
+                            !control.is_cancel_requested(),
+                            egui::Button::new(if control.is_cancel_requested() {
+                                "병합 중단 처리 중"
+                            } else {
+                                "병합 중단"
+                            }),
+                        )
+                        .clicked();
+                }
                 if batch.running {
                     stop = ui.button("대조 중단").clicked();
                 } else {
@@ -483,6 +514,18 @@ impl NslApp {
         }
         if retry {
             self.retry_failed_batch_merges();
+        }
+        if cancel_merge {
+            if let Some(batch) = self.update_batch.as_ref() {
+                for job in batch.rows.iter().filter_map(|row| row.job.as_ref()) {
+                    if job.verifying.is_some() {
+                        if let Some(control) = &job.merge_control {
+                            control.request_cancel();
+                        }
+                    }
+                }
+            }
+            self.status = "병합 중단 요청 · 안전하게 작업을 끝내고 임시 파일을 정리하는 중".into();
         }
         if queue {
             if let Some(batch) = self.update_batch.as_mut() {
@@ -553,7 +596,25 @@ impl NslApp {
                                         "다운로드 중".into()
                                     }
                                     update_batch::UpdateBatchJobStatus::Verifying => {
-                                        "패키지 검증 중".into()
+                                        job.merge_control.as_ref().map_or_else(
+                                            || "패키지 검증 중".into(),
+                                            |control| {
+                                                if control.is_cancel_requested() {
+                                                    "병합 중단 요청 중".into()
+                                                } else {
+                                                    let progress = control.progress.snapshot();
+                                                    match progress.total {
+                                                        Some(total) => format!(
+                                                            "{} · {}%",
+                                                            progress.label,
+                                                            progress.completed.min(total) * 100
+                                                                / total.max(1)
+                                                        ),
+                                                        None => progress.label,
+                                                    }
+                                                }
+                                            },
+                                        )
                                     }
                                     update_batch::UpdateBatchJobStatus::Verified => {
                                         "패키지 검증 완료 · 병합 대기".into()

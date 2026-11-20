@@ -140,12 +140,22 @@ impl NslApp {
                     total as u64,
                 ));
             }
-            if batch
+            if let Some(job) = batch
                 .rows
                 .iter()
-                .any(|row| row.job.as_ref().is_some_and(|job| job.verifying.is_some()))
+                .filter_map(|row| row.job.as_ref())
+                .find(|job| job.verifying.is_some())
             {
-                views.push(ProgressView::busy("업데이트 병합·재압축"));
+                views.push(job.merge_control.as_ref().map_or_else(
+                    || ProgressView::busy("업데이트 병합·재압축"),
+                    |control| {
+                        if control.is_cancel_requested() {
+                            ProgressView::busy("업데이트 병합 중단 처리 중")
+                        } else {
+                            ProgressView::from_task(control.progress.snapshot())
+                        }
+                    },
+                ));
             }
         }
         if self

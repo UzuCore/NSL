@@ -100,6 +100,7 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
                 recovering_since: None,
                 status: update_batch::UpdateBatchJobStatus::Queued,
                 verifying: None,
+                merge_control: None,
             }),
         }],
         running: false,
@@ -135,6 +136,30 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
     );
     let saved = update_manifest::load(&app.base_dir).unwrap().unwrap();
     assert_eq!(saved.rows[0].job.as_ref().unwrap().key, "r42");
+
+    // Simulate an active merge without touching any user packages. The
+    // footer must reflect native worker state rather than a stuck spinner.
+    let (sender, receiver) = mpsc::channel::<std::result::Result<Option<PathBuf>, String>>();
+    let control = Arc::new(update_merge::MergeControl::default());
+    control.stage("업데이트 병합 검증");
+    let job = app.update_batch.as_mut().unwrap().rows[0]
+        .job
+        .as_mut()
+        .unwrap();
+    job.status = update_batch::UpdateBatchJobStatus::Verifying;
+    job.verifying = Some(receiver);
+    job.merge_control = Some(Arc::clone(&control));
+    let views = app.active_progress_views();
+    let active = views
+        .iter()
+        .find(|view| view.label == "업데이트 병합 검증")
+        .unwrap();
+    assert!(active.fraction.is_none());
+    control.request_cancel();
+    assert!(app.active_progress_views().iter().any(|view| {
+        view.label == "업데이트 병합 중단 처리 중" && view.fraction.is_none()
+    }));
+    drop(sender);
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //! a redundant merged NSP (and reuses prepared XCZ inputs). Nothing is
 //! published beside the original before the result passes CNMT validation.
 
-use crate::{scanner, xci_merge};
+use crate::{progress::TaskProgress, scanner, xci_merge};
 use anyhow::{Context, Result};
 use nsrp_core::{
     keys::KeySet,
@@ -21,13 +21,53 @@ use std::{
     fs::{self, File},
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_COMPRESSION_WORKERS: usize = 4;
 const DEFAULT_ZSTD_LEVEL: i32 = 6;
 
 mod fast_nsz;
+
+/// Per-worker cancellation and measured per-stage progress. Unknown totals
+/// remain indeterminate instead of displaying a fabricated overall percent.
+#[derive(Default)]
+pub(crate) struct MergeControl {
+    cancelled: AtomicBool,
+    pub(crate) progress: TaskProgress,
+}
+
+impl MergeControl {
+    pub(crate) fn request_cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_cancel_requested(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn ensure_running(&self) -> Result<()> {
+        anyhow::ensure!(
+            !self.is_cancel_requested(),
+            "사용자가 업데이트 병합을 중단했습니다"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn stage(&self, label: &str) {
+        self.progress.begin(label, None, false);
+    }
+
+    fn measured_stage(&self, label: &str) {
+        self.progress.begin(label, Some(100), false);
+    }
+
+    fn fraction(&self, fraction: f32) {
+        if fraction.is_finite() {
+            self.progress.set((fraction.clamp(0.0, 1.0) * 100.0) as u64);
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputKind {
@@ -207,7 +247,11 @@ fn is_fast_nsz_candidate(original: &Path, patch: &Path, format: OutputKind) -> b
             })
 }
 
-fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
+fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
+    anyhow::ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "병합 작업이 중단되었습니다"
+    );
     anyhow::ensure!(
         !destination.exists(),
         "이미 병합 결과물이 있습니다: {}",
@@ -219,6 +263,10 @@ fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
         .write(true)
         .open(staged)?
         .sync_all()?;
+    anyhow::ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "병합 작업이 중단되었습니다"
+    );
     if fs::hard_link(staged, destination).is_ok() {
         return Ok(());
     }
@@ -228,9 +276,24 @@ fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
         .prefix(".nsl-publish-")
         .tempfile_in(parent)?;
     let mut source = File::open(staged)?;
-    std::io::copy(&mut source, temp.as_file_mut())?;
+    let mut buffer = vec![0u8; 2 * 1024 * 1024];
+    loop {
+        anyhow::ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "병합 작업이 중단되었습니다"
+        );
+        let count = std::io::Read::read(&mut source, &mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        temp.as_file_mut().write_all(&buffer[..count])?;
+    }
     temp.as_file_mut().flush()?;
     temp.as_file_mut().sync_all()?;
+    anyhow::ensure!(
+        !cancel.load(Ordering::Relaxed),
+        "병합 작업이 중단되었습니다"
+    );
     temp.persist_noclobber(destination).map_err(|error| {
         anyhow::anyhow!("기존 병합 파일을 덮어쓰지 않았습니다: {}", error.error)
     })?;
@@ -240,12 +303,31 @@ fn publish_without_overwrite(staged: &Path, destination: &Path) -> Result<()> {
 /// User-visible merge: preserve the original's format, including native
 /// NSZ/XCZ recompression of the merged package (not a renamed NSP/XCI).
 /// Unsupported NCAs and missing keys fail without publishing any output.
+#[cfg(test)]
 pub(crate) fn merge_verified_package(
     original: &Path,
     patch: &Path,
     base_id: &str,
     wanted_version: i64,
 ) -> Result<PathBuf> {
+    merge_verified_package_controlled(
+        original,
+        patch,
+        base_id,
+        wanted_version,
+        &MergeControl::default(),
+    )
+}
+
+fn merge_verified_package_controlled(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    wanted_version: i64,
+    control: &MergeControl,
+) -> Result<PathBuf> {
+    control.ensure_running()?;
+    control.stage("업데이트 병합 사전 검증");
     let (destination, format) = output_for_game(original, base_id, wanted_version)?;
     let ext = patch.extension().and_then(|e| e.to_str()).unwrap_or("");
     anyhow::ensure!(
@@ -279,8 +361,10 @@ pub(crate) fn merge_verified_package(
         .prefix(".nsl-merge-")
         .tempdir_in(parent)?;
     let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
-    let cancelled = AtomicBool::new(false);
+    let cancelled = &control.cancelled;
+    control.ensure_running()?;
     let optimized = if fast_candidate {
+        control.stage("NSZ 고속 병합");
         fast_nsz::try_merge_nsz_fast(
             fast_nsz::FastNszRequest {
                 original,
@@ -292,7 +376,7 @@ pub(crate) fn merge_verified_package(
                 prod_keys: &prod_keys,
             },
             &mut keys,
-            &cancelled,
+            cancelled,
         )?
     } else {
         None
@@ -300,6 +384,7 @@ pub(crate) fn merge_verified_package(
     let produced = if let Some(optimized) = optimized {
         optimized
     } else {
+        control.ensure_running()?;
         if fast_candidate {
             // An uncommon compressed-CNMT layout may need the legacy path.
             // Apply its larger disk-space preflight before any fallback I/O.
@@ -320,6 +405,7 @@ pub(crate) fn merge_verified_package(
             // writer while its workspace is alive: do not also assemble a
             // full-size NSP and do not decode the XCZ template a second time.
             let xci_output = work.path().join("merged.xci");
+            control.measured_stage("XCI 콘텐츠 선택·병합");
             merge::merge_packages_selected(
                 &sources,
                 work.path(),
@@ -329,8 +415,8 @@ pub(crate) fn merge_verified_package(
                 &prod_keys,
                 &mut keys,
                 &options,
-                &cancelled,
-                &mut |_| {},
+                cancelled,
+                &mut |fraction| control.fraction(fraction),
                 &mut |line| {
                     if logs.len() < 100 {
                         logs.push(line);
@@ -347,6 +433,7 @@ pub(crate) fn merge_verified_package(
                 },
             )
         } else {
+            control.measured_stage("NSP 콘텐츠 선택·병합");
             merge::merge_packages(
                 &sources,
                 work.path(),
@@ -356,8 +443,8 @@ pub(crate) fn merge_verified_package(
                 &prod_keys,
                 &mut keys,
                 &options,
-                &cancelled,
-                &mut |_| {},
+                cancelled,
+                &mut |fraction| control.fraction(fraction),
                 &mut |line| {
                     if logs.len() < 100 {
                         logs.push(line);
@@ -374,14 +461,15 @@ pub(crate) fn merge_verified_package(
         let produced = match format {
             OutputKind::Nsp => merged_nsp.clone(),
             OutputKind::Nsz => {
+                control.measured_stage("NSZ 압축");
                 let target = work.path().join("compressed.nsz");
                 let stats = compress::compress_nsp(
                     merged_nsp,
                     &target,
                     &mut keys,
                     &compression_options(),
-                    &cancelled,
-                    &mut |_| {},
+                    cancelled,
+                    &mut |fraction| control.fraction(fraction),
                     &mut |_| {},
                 )?;
                 anyhow::ensure!(
@@ -397,6 +485,7 @@ pub(crate) fn merge_verified_package(
                 if format == OutputKind::Xci {
                     xci_output
                 } else {
+                    control.measured_stage("XCZ 압축");
                     let target = work.path().join("compressed.xcz");
                     let opts = compression_options();
                     let stats = xcz::compress_xci(
@@ -409,8 +498,8 @@ pub(crate) fn merge_verified_package(
                             block_mode: opts.block_mode,
                             long_mode: opts.long_mode,
                         },
-                        &cancelled,
-                        &mut |_| {},
+                        cancelled,
+                        &mut |fraction| control.fraction(fraction),
                         &mut |_| {},
                     )?;
                     anyhow::ensure!(
@@ -423,6 +512,7 @@ pub(crate) fn merge_verified_package(
         };
         produced
     };
+    control.ensure_running()?;
     anyhow::ensure!(
         produced.is_file() && fs::metadata(&produced)?.len() > 0,
         "병합 출력 파일이 비어 있습니다"
@@ -430,32 +520,52 @@ pub(crate) fn merge_verified_package(
     // The output must contain a verified base *and* one CNMT update at least
     // as new as the requested version. Unsupported crypto/rights layouts
     // fail closed, never fall back to filename inference.
+    control.stage("완성된 병합 파일 CNMT 검증");
     let (_, verified, _) = cnmt::discover_game_metadata(
         &produced,
         &work.path().join("verify"),
         &disabled_tool,
         &prod_keys,
-        &cancelled,
+        cancelled,
     )
     .context("병합 출력 CNMT 검증 실패")?;
     validate_selected_cnmts(&verified, base_id, wanted_version)?;
-
-    publish_without_overwrite(&produced, &destination)?;
+    control.ensure_running()?;
+    control.stage("병합 파일 안전 게시");
+    publish_without_overwrite(&produced, &destination, cancelled)?;
     Ok(destination)
 }
 
 /// Recover an already published, independently verified package after a
 /// crash between final file creation and journal update. Never overwrite it.
+#[cfg(test)]
 pub(crate) fn merge_or_recover_existing(
     original: &Path,
     patch: &Path,
     base_id: &str,
     version: i64,
 ) -> Result<PathBuf> {
+    merge_or_recover_existing_controlled(
+        original,
+        patch,
+        base_id,
+        version,
+        &MergeControl::default(),
+    )
+}
+
+pub(crate) fn merge_or_recover_existing_controlled(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    version: i64,
+    control: &MergeControl,
+) -> Result<PathBuf> {
+    control.ensure_running()?;
     let (destination, format) = output_for_game(original, base_id, version)?;
     if destination.is_file() {
+        control.stage("기존 병합 결과 CNMT 재검증");
         let keys = scanner::prod_keys().context("병합 결과 검증을 위한 prod.keys 없음")?;
-        let cancelled = AtomicBool::new(false);
         let work = tempfile::tempdir()?;
         let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
         let (_, cnmts, _) = cnmt::discover_game_metadata(
@@ -463,8 +573,9 @@ pub(crate) fn merge_or_recover_existing(
             &work.path().join("verify"),
             &disabled_tool,
             &keys,
-            &cancelled,
+            &control.cancelled,
         )?;
+        control.ensure_running()?;
         validate_selected_cnmts(&cnmts, base_id, version)
             .context("동일 이름의 기존 파일이 요청한 병합 결과와 일치하지 않습니다")?;
         match format {
@@ -489,9 +600,10 @@ pub(crate) fn merge_or_recover_existing(
             }
             OutputKind::Nsp | OutputKind::Xci => {}
         }
+        control.ensure_running()?;
         return Ok(destination);
     }
-    merge_verified_package(original, patch, base_id, version)
+    merge_verified_package_controlled(original, patch, base_id, version, control)
 }
 
 #[cfg(test)]
@@ -556,12 +668,33 @@ mod tests {
         let dest = folder.path().join("merged.nsz");
         fs::write(&from, b"new result").unwrap();
         fs::write(&dest, b"previous user result").unwrap();
-        assert!(publish_without_overwrite(&from, &dest).is_err());
+        let cancel = AtomicBool::new(false);
+        assert!(publish_without_overwrite(&from, &dest, &cancel).is_err());
         assert_eq!(fs::read(&dest).unwrap(), b"previous user result");
         fs::remove_file(&dest).unwrap();
-        publish_without_overwrite(&from, &dest).unwrap();
+        publish_without_overwrite(&from, &dest, &cancel).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"new result");
         assert_eq!(fs::read(&from).unwrap(), b"new result");
+    }
+
+    #[test]
+    fn cancelled_publication_keeps_source_and_never_creates_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("staged.nsp");
+        let output = dir.path().join("merged.nsp");
+        fs::write(&source, b"complete staging").unwrap();
+        let control = MergeControl::default();
+        control.stage("입력 검증");
+        assert_eq!(control.progress.snapshot().total, None);
+        control.measured_stage("재압축");
+        control.fraction(0.46);
+        assert_eq!(control.progress.snapshot().completed, 46);
+        assert_eq!(control.progress.snapshot().total, Some(100));
+        control.request_cancel();
+        assert!(control.ensure_running().is_err());
+        assert!(publish_without_overwrite(&source, &output, &control.cancelled).is_err());
+        assert!(!output.exists());
+        assert_eq!(fs::read(source).unwrap(), b"complete staging");
     }
 
     #[test]

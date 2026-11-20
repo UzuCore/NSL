@@ -184,6 +184,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
             recovering_since: Some(std::time::Instant::now()),
             status,
             verifying: None,
+            merge_control: None,
         };
         rows.push(UpdateBatchRow {
             library_id: saved.library_id,
@@ -243,6 +244,7 @@ mod tests {
                     recovering_since: None,
                     status: UpdateBatchJobStatus::Verifying,
                     verifying: None,
+                    merge_control: None,
                 }),
             }],
             running: false,
@@ -255,7 +257,10 @@ mod tests {
     #[test]
     fn journal_round_trip_restores_metadata_without_resuming_stale_worker() {
         let dir = tempfile::tempdir().unwrap();
-        let example = example_batch(dir.path());
+        let mut example = example_batch(dir.path());
+        let control = std::sync::Arc::new(crate::update_merge::MergeControl::default());
+        control.request_cancel();
+        example.rows[0].job.as_mut().unwrap().merge_control = Some(control);
         save(dir.path(), &example).unwrap();
         let recovered = load(dir.path()).unwrap().unwrap();
         let row = &recovered.rows[0];
@@ -264,6 +269,10 @@ mod tests {
         assert_eq!(job.expected_version, 196608);
         assert!(job.transfer_finished);
         assert_eq!(job.status, UpdateBatchJobStatus::Queued);
+        assert!(
+            job.merge_control.is_none(),
+            "stale cancellation must not survive restart"
+        );
         assert!(job.recovering_since.is_some());
         assert!(job.output.ends_with("nested/update.nsz"));
         assert!(!recovered.running);

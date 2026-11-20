@@ -259,3 +259,67 @@ fn isolated_native_xcz_update_wrapper_end_to_end() -> Result<()> {
     );
     Ok(())
 }
+
+/// Stage 11: request cancellation during real CNMT/NCA selection rather
+/// than before the worker starts. All outputs are RAII-cleaned QA fixtures.
+#[test]
+#[ignore = "requires NSL_QA_ROOT, NSL_QA_BASE (.nsz), NSL_QA_PATCH (.nsp), and read-only prod.keys"]
+fn isolated_native_xci_update_cancel_during_merge() -> Result<()> {
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT")?)?;
+    let base = std::fs::canonicalize(std::env::var("NSL_QA_BASE")?)?;
+    let patch = std::fs::canonicalize(std::env::var("NSL_QA_PATCH")?)?;
+    anyhow::ensure!(base.starts_with(&root) && patch.starts_with(&root));
+    anyhow::ensure!(base
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("nsz")));
+    anyhow::ensure!(patch
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("nsp")));
+    anyhow::ensure!(std::fs::metadata(&base)?.len() < (1u64 << 30));
+    anyhow::ensure!(std::fs::metadata(&patch)?.len() < (1u64 << 30));
+    anyhow::ensure!(fs2::available_space(&root)? >= 5 * (1u64 << 30));
+    let private = tempfile::Builder::new()
+        .prefix("stage11-cancel-xci-")
+        .tempdir_in(&root)?;
+    let cancel = AtomicBool::new(false);
+    let decoded = private.path().join("decoded_base.nsp");
+    compress::decompress_nsz(&base, &decoded, &cancel, &mut |_| {}, &mut |_| {})?;
+    let original = private.path().join("unsigned_original.xci");
+    synthetic_gamecard_with_original_cnmts(&decoded, &original, &cancel)?;
+    let source_hash = digest_file(&original)?;
+    let patch_hash = digest_file(&patch)?;
+    let result_path = output_for_game(&original, "0100F7301AAB6000", 65536)?.0;
+    let source_for_check = original.clone();
+    let patch_for_check = patch.clone();
+    let control = std::sync::Arc::new(MergeControl::default());
+    let worker_control = std::sync::Arc::clone(&control);
+    let worker = std::thread::spawn(move || {
+        merge_verified_package_controlled(
+            &original,
+            &patch,
+            "0100F7301AAB6000",
+            65536,
+            &worker_control,
+        )
+    });
+    let deadline = Instant::now() + std::time::Duration::from_secs(90);
+    let mut reached = false;
+    while Instant::now() < deadline && !worker.is_finished() {
+        if control.progress.snapshot().label == "XCI 콘텐츠 선택·병합" {
+            reached = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    control.request_cancel();
+    let outcome = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("Stage 11 worker panicked"))?;
+    anyhow::ensure!(reached, "merge did not enter cancellable selection stage");
+    anyhow::ensure!(outcome.is_err(), "cancelled merge unexpectedly succeeded");
+    anyhow::ensure!(!result_path.exists(), "cancelled merge published an output");
+    anyhow::ensure!(source_hash == digest_file(&source_for_check)?);
+    anyhow::ensure!(patch_hash == digest_file(&patch_for_check)?);
+    println!("STAGE11_REAL_XCI_CANCEL_DURING_SELECTION_PASS no_output=true inputs_unchanged=true");
+    Ok(())
+}

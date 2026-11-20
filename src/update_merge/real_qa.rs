@@ -2,6 +2,22 @@
 use super::*;
 use sha2::Digest;
 
+fn qa_streamed_sha256(path: &Path) -> [u8; 32] {
+    use std::io::Read;
+
+    let mut input = File::open(path).unwrap();
+    let mut bytes = vec![0u8; 1 << 20];
+    let mut sha = sha2::Sha256::new();
+    loop {
+        let count = input.read(&mut bytes).unwrap();
+        if count == 0 {
+            break;
+        }
+        sha.update(&bytes[..count]);
+    }
+    sha.finalize().into()
+}
+
 fn qa_pfs0_region_sha256(
     path: &Path,
     index: &nsrp_core::formats::pfs0::Pfs0Index,
@@ -23,6 +39,165 @@ fn qa_pfs0_region_sha256(
         remaining -= amount as u64;
     }
     digest.finalize().into()
+}
+
+/// Read-only actual NSZ repack of the original PFS0 regions. This exercises
+/// the exact writer used by fast merges, without decrypting game content.
+#[test]
+#[ignore = "requires NSL_QA_ROOT and NSL_QA_BASE pointing to an isolated, sub-1GiB NSZ"]
+fn real_package_pfs0_atomic_repack_and_no_clobber() {
+    use nsrp_core::formats::pfs0::{build_from_sources, Pfs0Index, Pfs0Source};
+    use std::time::Instant;
+
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let source = std::fs::canonicalize(std::env::var("NSL_QA_BASE").unwrap()).unwrap();
+    assert!(source.starts_with(&root));
+    assert_eq!(source.extension().unwrap().to_ascii_lowercase(), "nsz");
+    assert!(std::fs::metadata(&source).unwrap().len() < (1 << 30));
+    let workspace = tempfile::Builder::new()
+        .prefix("stage7-atomic-pfs0-")
+        .tempdir_in(&root)
+        .unwrap();
+    let original_index = Pfs0Index::parse(&source).unwrap();
+    let sources = original_index
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.name.clone(),
+                Pfs0Source::Region {
+                    container: source.clone(),
+                    offset: original_index.data_start + entry.offset,
+                    size: entry.size,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let output = workspace.path().join("repacked.nsz");
+    let started = Instant::now();
+    build_from_sources(&sources, &output, &AtomicBool::new(false)).unwrap();
+    let seconds = started.elapsed().as_secs_f64();
+    let repacked = Pfs0Index::parse(&output).unwrap();
+    assert_eq!(original_index.entries.len(), repacked.entries.len());
+    for (source_entry, output_entry) in original_index.entries.iter().zip(&repacked.entries) {
+        assert_eq!(source_entry.name, output_entry.name);
+        assert_eq!(source_entry.size, output_entry.size);
+        assert_eq!(
+            qa_pfs0_region_sha256(&source, &original_index, source_entry),
+            qa_pfs0_region_sha256(&output, &repacked, output_entry),
+            "repacked NCZ/NCA/ticket bytes differ: {}",
+            source_entry.name
+        );
+    }
+    let before = qa_streamed_sha256(&output);
+    assert!(build_from_sources(&sources, &output, &AtomicBool::new(false)).is_err());
+    let after = qa_streamed_sha256(&output);
+    assert_eq!(
+        before, after,
+        "refused output overwrite changed the package"
+    );
+    let canceled_path = workspace.path().join("canceled.nsz");
+    assert!(build_from_sources(&sources, &canceled_path, &AtomicBool::new(true)).is_err());
+    assert!(!canceled_path.exists());
+    assert!(std::fs::read_dir(workspace.path())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".partial")));
+    println!(
+        "NSL_STAGE7_REAL_PFS0_ATOMIC_PASS output_bytes={} entries={} copy_seconds={seconds:.3}",
+        std::fs::metadata(&output).unwrap().len(),
+        repacked.entries.len()
+    );
+}
+
+/// Exercise >4GiB logical PFS0 offsets with a virtual seekable reader.
+/// Never allocates a multi-gigabyte input on filesystems without sparse files.
+#[test]
+#[ignore = "requires NSL_QA_ROOT for a small temporary virtual-offset fixture"]
+fn real_package_pfs0_atomic_4gib_logical_region() {
+    use nsrp_core::formats::pfs0::{build_from_paths, build_from_sources, Pfs0Index, Pfs0Source};
+    use std::io::{self, Read, Seek, SeekFrom};
+
+    struct HighBaseReader {
+        inner: io::Cursor<Vec<u8>>,
+        base: u64,
+    }
+
+    impl Read for HighBaseReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for HighBaseReader {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            let shifted = match from {
+                SeekFrom::Start(absolute) => {
+                    SeekFrom::Start(absolute.checked_sub(self.base).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "before virtual base")
+                    })?)
+                }
+                SeekFrom::Current(offset) => SeekFrom::Current(offset),
+                SeekFrom::End(offset) => SeekFrom::End(offset),
+            };
+            self.inner
+                .seek(shifted)?
+                .checked_add(self.base)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))
+        }
+    }
+
+    let root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let workspace = tempfile::Builder::new()
+        .prefix("stage7-4gib-virtual-")
+        .tempdir_in(root)
+        .unwrap();
+    let source = workspace.path().join("tiny_source.bin");
+    let high_base = (4u64 << 30) + 4096;
+    let payload = b"stage7-64-bit-range-over-4GiB";
+    std::fs::write(&source, payload).unwrap();
+    let archive = workspace.path().join("tiny_archive.nsp");
+    build_from_paths(&[("content.nca".to_owned(), source.clone())], &archive).unwrap();
+    let bytes = std::fs::read(&archive).unwrap();
+    assert!(bytes.len() < 4096);
+    let mut virtual_reader = HighBaseReader {
+        inner: io::Cursor::new(bytes.clone()),
+        base: high_base,
+    };
+    let indexed =
+        Pfs0Index::parse_reader(&mut virtual_reader, high_base, bytes.len() as u64).unwrap();
+    assert!(indexed.data_start > 4u64 << 30);
+    assert_eq!(indexed.entries.len(), 1);
+    assert_eq!(indexed.entries[0].size, payload.len() as u64);
+
+    // A truncated virtual container must still fail the normal PFS0 bounds.
+    let mut shorter = HighBaseReader {
+        inner: io::Cursor::new(bytes.clone()),
+        base: high_base,
+    };
+    assert!(Pfs0Index::parse_reader(&mut shorter, high_base, bytes.len() as u64 - 1).is_err());
+
+    // No physical 4GiB source exists, so the direct-region packager must
+    // refuse that range before creating any output or staging allocation.
+    let invalid = workspace.path().join("must_not_exist.nsp");
+    assert!(build_from_sources(
+        &[(
+            "content.nca".to_owned(),
+            Pfs0Source::Region {
+                container: source,
+                offset: high_base,
+                size: payload.len() as u64,
+            },
+        )],
+        &invalid,
+        &AtomicBool::new(false),
+    )
+    .is_err());
+    assert!(!invalid.exists());
+    println!("NSL_STAGE7_VIRTUAL_OFFSET_ABOVE_4GIB_PASS output_allocation_below_4KiB");
 }
 
 /// No decompression, re-encoding, or modification of source NSZ. Validates

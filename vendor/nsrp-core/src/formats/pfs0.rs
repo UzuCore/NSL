@@ -7,9 +7,42 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
+use tempfile::NamedTempFile;
 
 const MAX_FILES: u32 = 16_384;
 const MAX_STRING_TABLE: u32 = 64 * 1024 * 1024;
+
+/// A unique sibling staging file prevents simultaneous packagers from
+/// truncating each other's partial output. Publication never replaces an
+/// existing result, even if that result appears during the copy.
+fn begin_atomic_package(out_path: &Path) -> Result<NamedTempFile> {
+    let parent = out_path
+        .parent()
+        .context("PFS0 출력 상위 폴더가 없습니다")?;
+    fs::create_dir_all(parent)?;
+    if out_path.exists() {
+        bail!("PFS0 출력 파일을 덮어쓰지 않습니다: {}", out_path.display());
+    }
+    Ok(tempfile::Builder::new()
+        .prefix(".nsrp-pfs0-")
+        .suffix(".partial")
+        .tempfile_in(parent)?)
+}
+
+fn commit_atomic_package(mut staged: NamedTempFile, out_path: &Path) -> Result<()> {
+    staged.as_file_mut().sync_all()?;
+    if let Err(error) = staged.persist_noclobber(out_path) {
+        // PersistError would keep the temporary file alive in the error
+        // chain. Delete it now instead of leaving a huge hidden partial.
+        let reason = error.error.to_string();
+        drop(error.file);
+        bail!(
+            "기존 PFS0 결과물을 덮어쓰지 않았습니다: {} ({reason})",
+            out_path.display()
+        );
+    }
+    Ok(())
+}
 
 /// A transformed NCA is stored in a temporary file, while an unchanged
 /// container entry can be read directly from its original package. Avoid
@@ -226,18 +259,9 @@ where
     let aligned_header = (header_size + 1 + 0x1f) & !0x1f;
     strings.resize(strings.len() + aligned_header - header_size, 0);
 
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let partial = out_path.with_extension(format!(
-        "{}.partial",
-        out_path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("pfs0")
-    ));
+    let staged = begin_atomic_package(out_path)?;
     let result = (|| -> Result<()> {
-        let mut out = BufWriter::with_capacity(4 * 1024 * 1024, File::create(&partial)?);
+        let mut out = BufWriter::with_capacity(4 * 1024 * 1024, staged.reopen()?);
         out.write_all(b"PFS0")?;
         out.write_u32::<LittleEndian>(names.len() as u32)?;
         out.write_u32::<LittleEndian>(strings.len() as u32)?;
@@ -277,21 +301,14 @@ where
         }
         out.flush()?;
         drop(out);
-        let actual = fs::metadata(&partial)?.len();
+        let actual = fs::metadata(staged.path())?.len();
         if actual != end || actual != aligned_header as u64 + total_data {
             bail!("PFS0 패키지 길이 검증 실패");
         }
         Ok(())
     })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&partial);
-        return Err(error);
-    }
-    if out_path.exists() {
-        fs::remove_file(out_path)?;
-    }
-    fs::rename(&partial, out_path)?;
-    Ok(())
+    result?;
+    commit_atomic_package(staged, out_path)
 }
 
 /// Mixed direct-region and generated-file PFS0 assembly. All source ranges
@@ -317,27 +334,29 @@ pub fn build_from_sources(
         if !seen.insert(name.to_lowercase()) {
             bail!("중복 PFS0 파일명: {name}");
         }
+        if strings.len().saturating_add(name.len()).saturating_add(1) > MAX_STRING_TABLE as usize {
+            bail!("PFS0 문자열 테이블이 너무 큽니다");
+        }
         string_offsets.push(strings.len() as u32);
         strings.extend_from_slice(name.as_bytes());
         strings.push(0);
         sizes.push(source.size()?);
     }
+    let data_size = sizes.iter().try_fold(0u64, |total, size| {
+        total
+            .checked_add(*size)
+            .context("PFS0 엔트리 크기 합계 오버플로")
+    })?;
     let full_header = 16usize + entries.len() * 24 + strings.len();
     let aligned_header = (full_header + 1 + 0x1f) & !0x1f;
     strings.resize(strings.len() + (aligned_header - full_header), 0);
+    let expected = (aligned_header as u64)
+        .checked_add(data_size)
+        .context("PFS0 출력 크기 오버플로")?;
 
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let partial = out_path.with_extension(format!(
-        "{}.partial",
-        out_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("pfs0")
-    ));
+    let staged = begin_atomic_package(out_path)?;
     let result = (|| -> Result<()> {
-        let mut out = BufWriter::with_capacity(4 * 1024 * 1024, File::create(&partial)?);
+        let mut out = BufWriter::with_capacity(4 * 1024 * 1024, staged.reopen()?);
         out.write_all(b"PFS0")?;
         out.write_u32::<LittleEndian>(entries.len() as u32)?;
         out.write_u32::<LittleEndian>(strings.len() as u32)?;
@@ -354,26 +373,21 @@ pub fn build_from_sources(
         }
         out.write_all(&strings)?;
         let mut buf = vec![0u8; 2 * 1024 * 1024];
-        let mut current_region: Option<(PathBuf, BufReader<File>)> = None;
+        // Preserve up to four source handles across interleaved package
+        // entries. Base/patch NCAs often alternate after name sorting;
+        // opening the same multi-GiB source repeatedly defeats read-ahead.
+        let mut readers = Vec::<(PathBuf, BufReader<File>)>::new();
         for ((_, source), &size) in entries.iter().zip(&sizes) {
             match source {
                 Pfs0Source::File(path) => {
-                    let mut src = BufReader::with_capacity(buf.len(), File::open(path)?);
-                    copy_bounded(&mut src, &mut out, size, &mut buf, cancel)?;
+                    let src = cached_source_reader(&mut readers, path, buf.len())?;
+                    src.seek(SeekFrom::Start(0))?;
+                    copy_bounded(src, &mut out, size, &mut buf, cancel)?;
                 }
                 Pfs0Source::Region {
                     container, offset, ..
                 } => {
-                    if current_region
-                        .as_ref()
-                        .is_none_or(|(path, _)| path != container)
-                    {
-                        current_region = Some((
-                            container.clone(),
-                            BufReader::with_capacity(buf.len(), File::open(container)?),
-                        ));
-                    }
-                    let (_, reader) = current_region.as_mut().expect("region file available");
+                    let reader = cached_source_reader(&mut readers, container, buf.len())?;
                     reader.seek(SeekFrom::Start(*offset))?;
                     copy_bounded(reader, &mut out, size, &mut buf, cancel)?;
                 }
@@ -381,22 +395,37 @@ pub fn build_from_sources(
         }
         out.flush()?;
         drop(out);
-        let expected = aligned_header as u64 + sizes.iter().sum::<u64>();
-        let actual = fs::metadata(&partial)?.len();
+        let actual = fs::metadata(staged.path())?.len();
         if actual != expected {
             bail!("PFS0 결과 크기 검증 실패: {actual} != {expected}");
         }
         Ok(())
     })();
-    if let Err(e) = result {
-        let _ = fs::remove_file(&partial);
-        return Err(e);
+    result?;
+    commit_atomic_package(staged, out_path)
+}
+
+/// Keep at most four buffered source handles across interleaved entries.
+/// This avoids repeatedly opening large source archives while limiting the
+/// total source read-ahead buffers to 8 MiB.
+fn cached_source_reader<'a>(
+    readers: &'a mut Vec<(PathBuf, BufReader<File>)>,
+    path: &Path,
+    capacity: usize,
+) -> Result<&'a mut BufReader<File>> {
+    if let Some(index) = readers.iter().position(|(known, _)| known == path) {
+        let recent = readers.remove(index);
+        readers.push(recent);
+    } else {
+        if readers.len() == 4 {
+            readers.remove(0);
+        }
+        readers.push((
+            path.to_path_buf(),
+            BufReader::with_capacity(capacity, File::open(path)?),
+        ));
     }
-    if out_path.exists() {
-        fs::remove_file(out_path)?;
-    }
-    fs::rename(&partial, out_path)?;
-    Ok(())
+    Ok(&mut readers.last_mut().expect("source reader cached").1)
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -488,6 +517,81 @@ mod tests {
     }
 
     #[test]
+    fn publisher_refuses_file_created_while_streaming() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let dest = temp.path().join("raced.nsp");
+        let names = vec!["content.nca".to_string()];
+        let attempted = build_from_streams(&names, &dest, &AtomicBool::new(false), |_, output| {
+            output.write_all(b"new package bytes")?;
+            // Simulate a second process finishing while this output streams.
+            fs::write(&dest, b"existing concurrent result")?;
+            Ok(())
+        });
+        assert!(attempted.is_err(), "concurrent output was overwritten");
+        assert_eq!(fs::read(&dest)?, b"existing concurrent result");
+        assert!(
+            fs::read_dir(temp.path())?.all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".partial")),
+            "staged file survived the publication conflict"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_file_source_does_not_overwrite_itself_or_previous_results() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let existing = temp.path().join("existing.nsp");
+        fs::write(&existing, b"precious previous data")?;
+        let sources = [("data.nca".to_owned(), Pfs0Source::File(existing.clone()))];
+        assert!(build_from_sources(&sources, &existing, &AtomicBool::new(false)).is_err());
+        assert_eq!(fs::read(existing)?, b"precious previous data");
+        assert_eq!(fs::read_dir(temp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn two_simultaneous_builds_publish_exactly_once() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("data.bin");
+        let destination = temp.path().join("merged.nsp");
+        fs::write(&source, vec![0xa5u8; 2 * 1024 * 1024 + 19])?;
+        let barrier = Arc::new(Barrier::new(2));
+        let mut jobs = Vec::new();
+        for _ in 0..2 {
+            let source = source.clone();
+            let destination = destination.clone();
+            let start = Arc::clone(&barrier);
+            jobs.push(std::thread::spawn(move || {
+                start.wait();
+                build_from_sources(
+                    &[("payload.nca".to_owned(), Pfs0Source::File(source))],
+                    &destination,
+                    &AtomicBool::new(false),
+                )
+                .is_ok()
+            }));
+        }
+        let successes = jobs
+            .into_iter()
+            .map(|job| job.join().expect("PFS0 build thread panicked") as usize)
+            .sum::<usize>();
+        assert_eq!(successes, 1, "both builds published the same output");
+        let index = Pfs0Index::parse(&destination)?;
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(
+            index.read_entry(&destination, &index.entries[0])?,
+            vec![0xa5u8; 2 * 1024 * 1024 + 19]
+        );
+        assert_eq!(fs::read_dir(temp.path())?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn direct_regions_match_staged_package_byte_for_byte() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let paths = [
@@ -526,6 +630,40 @@ mod tests {
         ];
         build_from_sources(&mixed_sources, &mixed, &AtomicBool::new(false))?;
         assert_eq!(fs::read(&original)?, fs::read(&mixed)?);
+        Ok(())
+    }
+
+    #[test]
+    fn source_cache_handles_interleaved_containers_and_eviction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for index in 0..6u8 {
+            let path = temp.path().join(format!("source_{index}.bin"));
+            fs::write(&path, vec![index + 1; 8192])?;
+            paths.push(path);
+        }
+        let mut sources = Vec::new();
+        for round in 0..2u64 {
+            for (index, path) in paths.iter().enumerate() {
+                sources.push((
+                    format!("{round}_{index}.nca"),
+                    Pfs0Source::Region {
+                        container: path.clone(),
+                        offset: round * 4096,
+                        size: 4096,
+                    },
+                ));
+            }
+        }
+        let output = temp.path().join("interleaved.nsp");
+        build_from_sources(&sources, &output, &AtomicBool::new(false))?;
+        let index = Pfs0Index::parse(&output)?;
+        assert_eq!(index.entries.len(), 12);
+        for entry in &index.entries {
+            let filename = entry.name.trim_end_matches(".nca");
+            let i: usize = filename.split('_').nth(1).expect("source index").parse()?;
+            assert_eq!(index.read_entry(&output, entry)?, vec![i as u8 + 1; 4096]);
+        }
         Ok(())
     }
 

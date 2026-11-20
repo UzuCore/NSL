@@ -622,6 +622,194 @@ mod tests {
         }
     }
 
+    /// Compare native ROM output at every rebuilt directory entry. A full
+    /// file SHA-256 is recorded separately for cross-build reproducibility.
+    fn check_large_restored_entries(
+        source: &mut File,
+        restored: &mut File,
+        before: &[Entry],
+        after: &[Entry],
+        kind: Kind,
+        depth: usize,
+    ) -> Result<(usize, usize)> {
+        anyhow::ensure!(before.len() == after.len(), "복원 후 엔트리 개수 불일치");
+        let mut checked = 0usize;
+        let mut compressed = 0usize;
+        for (original, rebuilt) in before.iter().zip(after) {
+            anyhow::ensure!(
+                restored_name(&original.name) == rebuilt.name,
+                "변환 후 출력 파일명이 변경되었습니다"
+            );
+            if kind == Kind::Hfs0 && rebuilt.hash_size > 0 {
+                let hash = hash_file_region(restored, rebuilt.start, rebuilt.hash_size)?;
+                anyhow::ensure!(hash == rebuilt.hash, "복원된 HFS0 해시 불일치");
+            }
+            let partition = kind == Kind::Hfs0
+                && depth == 0
+                && ["secure", "update", "normal", "logo"]
+                    .iter()
+                    .any(|name| original.name.eq_ignore_ascii_case(name))
+                && original.size >= 16;
+            if partition {
+                source.seek(SeekFrom::Start(original.start))?;
+                let mut magic = [0u8; 4];
+                source.read_exact(&mut magic)?;
+                if &magic == b"HFS0" {
+                    let children = read_index(
+                        source,
+                        original.start,
+                        original.start + original.size,
+                        Kind::Hfs0,
+                    )?;
+                    let rebuilt_children = read_index(
+                        restored,
+                        rebuilt.start,
+                        rebuilt.start + rebuilt.size,
+                        Kind::Hfs0,
+                    )?;
+                    let (visited, ncz_count) = check_large_restored_entries(
+                        source,
+                        restored,
+                        &children,
+                        &rebuilt_children,
+                        Kind::Hfs0,
+                        depth + 1,
+                    )?;
+                    checked += visited + 1;
+                    compressed += ncz_count;
+                    continue;
+                }
+            }
+            let expected_size = if is_ncz(&original.name) {
+                compressed += 1;
+                ncz::inspect(source, original.start, original.size)?.expanded_size
+            } else {
+                original.size
+            };
+            anyhow::ensure!(rebuilt.size == expected_size, "복원 엔트리 크기 불일치");
+            let check_size = if is_ncz(&original.name) {
+                original.size.min(0x4000) as usize
+            } else {
+                original.size.min(4096) as usize
+            };
+            if check_size > 0 {
+                let mut source_bytes = vec![0u8; check_size];
+                let mut restored_bytes = vec![0u8; check_size];
+                source.seek(SeekFrom::Start(original.start))?;
+                source.read_exact(&mut source_bytes)?;
+                restored.seek(SeekFrom::Start(rebuilt.start))?;
+                restored.read_exact(&mut restored_bytes)?;
+                anyhow::ensure!(
+                    source_bytes == restored_bytes,
+                    "원본 NCA 헤더 또는 일반 파일 데이터 불일치"
+                );
+                if !is_ncz(&original.name) && original.size > check_size as u64 {
+                    source.seek(SeekFrom::Start(
+                        original.start + original.size - check_size as u64,
+                    ))?;
+                    source.read_exact(&mut source_bytes)?;
+                    restored.seek(SeekFrom::Start(
+                        rebuilt.start + rebuilt.size - check_size as u64,
+                    ))?;
+                    restored.read_exact(&mut restored_bytes)?;
+                    anyhow::ensure!(source_bytes == restored_bytes, "복원 파일 끝부분 불일치");
+                }
+            }
+            checked += 1;
+        }
+        Ok((checked, compressed))
+    }
+
+    fn hash_entire_large_output(restored: &mut File, bytes: u64) -> Result<String> {
+        restored.seek(SeekFrom::Start(0))?;
+        let mut limited = restored.take(bytes);
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        let mut read_total = 0u64;
+        loop {
+            let read = limited.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+            read_total += read as u64;
+        }
+        anyhow::ensure!(read_total == bytes, "전체 복원 파일 해시 중 EOF");
+        Ok(format!("{:x}", digest.finalize()))
+    }
+
+    #[test]
+    #[ignore = "requires local >4GiB NSZ/XCZ game corpus and temporary disk space"]
+    fn restore_large_real_nsz_and_xcz_with_entry_checks_and_full_output_sha256() -> Result<()> {
+        use rusqlite::{params, Connection, OpenFlags};
+        let db = Connection::open_with_flags(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("library.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        // For NSZ choose the second smallest sample: 4.4GiB of source data
+        // with a small number of NCZ entries, keeping validation practical.
+        for (extension, candidate) in [("nsz", 1_i64), ("xcz", 0_i64)] {
+            let path: String = db.query_row(
+                "SELECT path FROM game_files WHERE LOWER(file_type)=?1 AND size>=4294967296 ORDER BY size LIMIT 1 OFFSET ?2",
+                params![extension, candidate],
+                |row| row.get(0),
+            )?;
+            let input_path = Path::new(&path);
+            let before_metadata = input_path.metadata()?;
+            anyhow::ensure!(
+                before_metadata.len() >= 4 * 1024 * 1024 * 1024,
+                "대용량 표본이 아닙니다"
+            );
+            let mut input = File::open(input_path)?;
+            let (base, kind) = if extension == "nsz" {
+                (0, Kind::Pfs0)
+            } else {
+                input.seek(SeekFrom::Start(0x130))?;
+                let mut bytes = [0u8; 8];
+                input.read_exact(&mut bytes)?;
+                (u64::from_le_bytes(bytes), Kind::Hfs0)
+            };
+            let original_entries = read_index(&mut input, base, before_metadata.len(), kind)?;
+            // An unnamed Windows temporary file is removed automatically.
+            // Neither the project release directory nor the source is written.
+            let mut output = tempfile::tempfile()?;
+            let started = std::time::Instant::now();
+            if extension == "nsz" {
+                unpack_nsz(input_path, &mut output)?;
+            } else {
+                unpack_xcz(input_path, &mut output)?;
+            }
+            let output_bytes = output.metadata()?.len();
+            anyhow::ensure!(
+                output_bytes >= 4 * 1024 * 1024 * 1024,
+                "대용량 변환 결과가 너무 작습니다"
+            );
+            let output_entries = read_index(&mut output, base, output_bytes, kind)?;
+            let (checked, compressed) = check_large_restored_entries(
+                &mut input,
+                &mut output,
+                &original_entries,
+                &output_entries,
+                kind,
+                0,
+            )?;
+            anyhow::ensure!(compressed > 0, "대용량 게임에서 NCZ 복원 항목이 없습니다");
+            let hash = hash_entire_large_output(&mut output, output_bytes)?;
+            let after_metadata = input_path.metadata()?;
+            anyhow::ensure!(
+                before_metadata.len() == after_metadata.len()
+                    && before_metadata.modified()? == after_metadata.modified()?,
+                "원본 게임 파일 크기 또는 수정일이 바뀌었습니다"
+            );
+            eprintln!(
+                "NATIVE_LARGE_RESTORE_PASS extension={extension} source_bytes={} output_bytes={output_bytes} entries_checked={checked} ncz_restored={compressed} sha256={hash} elapsed_s={:.2}",
+                before_metadata.len(),
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn reject_malformed_package_indexes_and_traversal_names() {
         let dir = tempfile::tempdir().unwrap();

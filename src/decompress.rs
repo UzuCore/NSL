@@ -73,20 +73,71 @@ pub fn decompress(src: &Path, work_root: &Path) -> Result<PathBuf> {
         .context("압축 파일 이름을 찾을 수 없습니다")?
         .to_string_lossy();
     let destination = workspace.join(format!("{name}.{extension}"));
-    let mut staging = tempfile::NamedTempFile::new_in(&workspace)?;
-    if kind == "nsz" {
-        crate::native_package::unpack_nsz(src, staging.as_file_mut())?;
-    } else {
-        crate::native_package::unpack_xcz(src, staging.as_file_mut())?;
+    // The private staging file is automatically deleted on conversion error.
+    // Drop it before removing the *empty* workspace, so corrupt inputs and
+    // disk errors do not accumulate abandoned NSL_Workspace_* directories.
+    let result = (|| -> Result<PathBuf> {
+        let mut staging = tempfile::NamedTempFile::new_in(&workspace)?;
+        if kind == "nsz" {
+            crate::native_package::unpack_nsz(src, staging.as_file_mut())?;
+        } else {
+            crate::native_package::unpack_xcz(src, staging.as_file_mut())?;
+        }
+        staging.as_file_mut().sync_all()?;
+        staging.persist(&destination).map_err(|error| error.error)?;
+        Ok(destination)
+    })();
+    if result.is_err() {
+        // Never recursively remove a directory that might now contain files
+        // created by a different process; remove_dir succeeds only if empty.
+        let _ = std::fs::remove_dir(&workspace);
     }
-    staging.as_file_mut().sync_all()?;
-    staging.persist(&destination).map_err(|error| error.error)?;
-    Ok(destination)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Write;
+
+    #[test]
+    fn failed_nsz_rebuild_removes_empty_workspace_and_preserves_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("corrupt.nsz");
+        let work_root = dir.path().join("outputs");
+        let names = b"plain.nca\0bad.ncz\0";
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PFS0");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        let mut invalid_ncz = vec![0u8; 0x4000];
+        invalid_ncz.extend_from_slice(b"NCZSECTN");
+        invalid_ncz.extend_from_slice(&1u64.to_le_bytes());
+        invalid_ncz.extend_from_slice(&0x4000u64.to_le_bytes());
+        invalid_ncz.extend_from_slice(&0x100u64.to_le_bytes());
+        invalid_ncz.extend_from_slice(&[0u8; 48]);
+        invalid_ncz.extend_from_slice(b"bad-zstd");
+        for (at, length, name_at) in [(0u64, 5u64, 0u32), (5, invalid_ncz.len() as u64, 10)] {
+            data.extend_from_slice(&at.to_le_bytes());
+            data.extend_from_slice(&length.to_le_bytes());
+            data.extend_from_slice(&name_at.to_le_bytes());
+            data.extend_from_slice(&0u32.to_le_bytes());
+        }
+        data.extend_from_slice(names);
+        data.extend_from_slice(b"hello");
+        data.write_all(&invalid_ncz).unwrap();
+        std::fs::write(&source, &data).unwrap();
+
+        assert!(decompress(&source, &work_root).is_err());
+        assert!(work_root.is_dir());
+        assert!(
+            std::fs::read_dir(&work_root).unwrap().next().is_none(),
+            "failed conversion should not leave empty workspaces or partial ROMs"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), data);
+    }
 
     #[test]
     fn cleanup_never_removes_recent_or_unknown_conversion_outputs() {

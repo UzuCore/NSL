@@ -8,6 +8,25 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
+use tempfile::NamedTempFile;
+
+const MAX_HFS0_FILES: usize = 16_384;
+const MAX_HFS0_STRING_TABLE: usize = 64 * 1024 * 1024;
+
+/// Publish a completed HFS0 without erasing an existing result. Preserve
+/// no-clobber semantics even if another process publishes during the write.
+fn commit_hfs0(mut staged: NamedTempFile, destination: &Path) -> Result<()> {
+    staged.as_file_mut().sync_all()?;
+    if let Err(error) = staged.persist_noclobber(destination) {
+        let reason = error.error.to_string();
+        drop(error.file); // eagerly remove the temp on Windows
+        bail!(
+            "기존 HFS0 결과물을 덮어쓰지 않았습니다: {} ({reason})",
+            destination.display()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hfs0Entry {
@@ -345,17 +364,47 @@ pub fn build_from_paths_layout(
     header_align: u64,
     data_align: u64,
 ) -> Result<()> {
-    if entries.is_empty() {
-        bail!("HFS0 빌드 대상이 비어 있습니다");
+    build_from_paths_layout_cancelled(
+        entries,
+        out_path,
+        header_align,
+        data_align,
+        &AtomicBool::new(false),
+    )
+}
+
+/// Atomic HFS0 writer for the XCZ compatibility path. Source lengths,
+/// header geometry and names are validated before the first output byte.
+/// Cancellation is checked between bounded I/O blocks, and no previously
+/// published output is removed or replaced.
+pub fn build_from_paths_layout_cancelled(
+    entries: &[(String, PathBuf)],
+    out_path: &Path,
+    header_align: u64,
+    data_align: u64,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if entries.is_empty() || entries.len() > MAX_HFS0_FILES {
+        bail!("비정상 HFS0 빌드 파일 수: {}", entries.len());
     }
     let header_align = header_align.max(1);
     let data_align = data_align.max(1);
     let mut strings = Vec::new();
-    let mut string_offsets = Vec::new();
-    let mut sizes = Vec::new();
-    let mut hashes = Vec::new();
+    let mut string_offsets = Vec::with_capacity(entries.len());
+    let mut sizes = Vec::with_capacity(entries.len());
+    let mut hashes = Vec::with_capacity(entries.len());
+    let mut seen = HashSet::with_capacity(entries.len());
     for (name, path) in entries {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("작업이 중단되었습니다");
+        }
         validate_name(name)?;
+        if !seen.insert(name.to_lowercase()) {
+            bail!("중복 HFS0 파일명: {name}");
+        }
+        if strings.len().saturating_add(name.len()).saturating_add(1) > MAX_HFS0_STRING_TABLE {
+            bail!("HFS0 문자열 테이블이 너무 큽니다");
+        }
         string_offsets.push(strings.len() as u32);
         strings.extend_from_slice(name.as_bytes());
         strings.push(0);
@@ -367,52 +416,109 @@ pub fn build_from_paths_layout(
         f.read_exact(&mut data)?;
         hashes.push(Sha256::digest(&data));
     }
-    let raw_header = 16u64 + entries.len() as u64 * 64 + strings.len() as u64;
-    let header_size = align_up(raw_header, header_align);
-    strings.resize(strings.len() + (header_size - raw_header) as usize, 0);
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
+    let raw_header = 16u64
+        .checked_add(entries.len() as u64 * 64)
+        .and_then(|v| v.checked_add(strings.len() as u64))
+        .context("HFS0 헤더 크기 오버플로")?;
+    let header_size = align_up_checked(raw_header, header_align)?;
+    let header_padding = header_size - raw_header;
+    if header_padding > 16 * 1024 * 1024
+        || strings.len() as u64 + header_padding > MAX_HFS0_STRING_TABLE as u64
+        || data_align > 16 * 1024 * 1024
+    {
+        bail!("HFS0 정렬 또는 문자열 테이블이 비정상적으로 큽니다");
     }
-    let mut out = BufWriter::new(File::create(out_path)?);
+    strings.resize(strings.len() + header_padding as usize, 0);
+    let mut relative_offsets = Vec::with_capacity(entries.len());
+    let mut rel = 0u64;
+    let mut last_end = 0u64;
+    for &size in &sizes {
+        relative_offsets.push(rel);
+        last_end = rel.checked_add(size).context("HFS0 데이터 크기 오버플로")?;
+        rel = align_up_checked(last_end, data_align)?;
+    }
+    let expected_len = header_size
+        .checked_add(last_end)
+        .context("HFS0 출력 길이 오버플로")?;
+    if cancel.load(Ordering::Relaxed) {
+        bail!("작업이 중단되었습니다");
+    }
+    let parent = out_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    if out_path.exists() {
+        bail!(
+            "기존 HFS0 결과물을 덮어쓰지 않습니다: {}",
+            out_path.display()
+        );
+    }
+    let mut staged = tempfile::Builder::new()
+        .prefix(".nsrp-hfs0-")
+        .suffix(".partial")
+        .tempfile_in(parent)?;
+    let mut out = BufWriter::with_capacity(4 * 1024 * 1024, staged.as_file_mut());
     out.write_all(b"HFS0")?;
     out.write_u32::<LittleEndian>(entries.len() as u32)?;
     out.write_u32::<LittleEndian>(strings.len() as u32)?;
     out.write_u32::<LittleEndian>(0)?;
-    let mut rel = 0u64;
     for i in 0..entries.len() {
-        out.write_u64::<LittleEndian>(rel)?;
+        out.write_u64::<LittleEndian>(relative_offsets[i])?;
         out.write_u64::<LittleEndian>(sizes[i])?;
         out.write_u32::<LittleEndian>(string_offsets[i])?;
         out.write_u32::<LittleEndian>(sizes[i].min(0x200) as u32)?;
         out.write_all(&hashes[i])?;
         out.write_u64::<LittleEndian>(0)?;
-        rel = align_up(rel + sizes[i], data_align);
     }
     out.write_all(&strings)?;
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let mut written_data = 0u64;
-    for (_, path) in entries {
-        if !written_data.is_multiple_of(data_align) {
-            let pad = data_align - written_data % data_align;
-            out.write_all(&vec![0u8; pad as usize])?;
-            written_data += pad;
+    for ((_, path), &size) in entries.iter().zip(&sizes) {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("작업이 중단되었습니다");
         }
-        let mut src = BufReader::new(File::open(path)?);
-        loop {
-            let n = src.read(&mut buf)?;
-            if n == 0 {
-                break;
+        if !written_data.is_multiple_of(data_align) {
+            let mut pad = data_align - written_data % data_align;
+            let zeroes = [0u8; 4096];
+            while pad > 0 {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("작업이 중단되었습니다");
+                }
+                let take = pad.min(zeroes.len() as u64) as usize;
+                out.write_all(&zeroes[..take])?;
+                pad -= take as u64;
+                written_data += take as u64;
             }
-            out.write_all(&buf[..n])?;
-            written_data += n as u64;
+        }
+        let mut src = BufReader::with_capacity(buf.len(), File::open(path)?);
+        let mut remaining = size;
+        while remaining > 0 {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("작업이 중단되었습니다");
+            }
+            let take = remaining.min(buf.len() as u64) as usize;
+            src.read_exact(&mut buf[..take])?;
+            out.write_all(&buf[..take])?;
+            written_data += take as u64;
+            remaining -= take as u64;
         }
     }
     out.flush()?;
-    Ok(())
+    drop(out);
+    if staged.as_file().metadata()?.len() != expected_len {
+        bail!("HFS0 패키지 출력 크기 검증 실패");
+    }
+    if cancel.load(Ordering::Relaxed) {
+        bail!("작업이 중단되었습니다");
+    }
+    commit_hfs0(staged, out_path)
 }
 
-fn align_up(v: u64, a: u64) -> u64 {
-    v.div_ceil(a) * a
+fn align_up_checked(v: u64, a: u64) -> Result<u64> {
+    v.checked_add(a - 1)
+        .map(|sum| sum / a * a)
+        .context("HFS0 정렬 크기 오버플로")
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -433,6 +539,98 @@ mod streaming_tests {
             .write(true)
             .create_new(true)
             .open(path)?)
+    }
+
+    #[test]
+    fn staged_layout_refuses_existing_output_and_keeps_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("payload.bin");
+        let target = temp.path().join("previous.hfs0");
+        fs::write(&source, vec![0xa5; 2 * 1024 * 1024 + 77])?;
+        fs::write(&target, b"existing published archive")?;
+        assert!(
+            build_from_paths_layout(&[("main.nca".into(), source)], &target, 0x200, 1).is_err()
+        );
+        assert_eq!(fs::read(&target)?, b"existing published archive");
+        assert_eq!(fs::read_dir(temp.path())?.count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn staged_layout_rejects_names_overflow_and_pre_cancel() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("payload.bin");
+        let target = temp.path().join("output.hfs0");
+        fs::write(&source, b"sample content")?;
+        let names = [
+            ("GAME.NCA".into(), source.clone()),
+            ("game.nca".into(), source.clone()),
+        ];
+        assert!(build_from_paths_layout(&names, &target, 0x200, 1).is_err());
+        assert!(
+            build_from_paths_layout(
+                &[("normal.nca".into(), source.clone())],
+                &target,
+                u64::MAX,
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            build_from_paths_layout(
+                &[("normal.nca".into(), source.clone())],
+                &target,
+                0x200,
+                u64::MAX,
+            )
+            .is_err()
+        );
+        assert!(
+            build_from_paths_layout_cancelled(
+                &[("normal.nca".into(), source)],
+                &target,
+                0x200,
+                1,
+                &AtomicBool::new(true),
+            )
+            .is_err()
+        );
+        assert!(!target.exists());
+        assert_eq!(fs::read_dir(temp.path())?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn simultaneous_hfs0_writers_publish_exactly_once() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("big.nca");
+        let target = temp.path().join("merged.hfs0");
+        fs::write(&source, vec![0x71u8; 3 * 1024 * 1024 + 11])?;
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let (source, target, barrier) = (source.clone(), target.clone(), Arc::clone(&barrier));
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                build_from_paths_layout(&[("main.nca".into(), source)], &target, 0x200, 1).is_ok()
+            }));
+        }
+        assert_eq!(
+            threads
+                .into_iter()
+                .map(|t| usize::from(t.join().expect("HFS0 writer panicked")))
+                .sum::<usize>(),
+            1
+        );
+        let mut file = File::open(&target)?;
+        let size = file.metadata()?.len();
+        let index = Hfs0Index::parse_at(&mut file, 0, size)?;
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].size, 3 * 1024 * 1024 + 11);
+        assert_eq!(fs::read_dir(temp.path())?.count(), 2);
+        Ok(())
     }
 
     #[test]

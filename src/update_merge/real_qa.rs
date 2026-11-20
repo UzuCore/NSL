@@ -41,6 +41,94 @@ fn qa_pfs0_region_sha256(
     digest.finalize().into()
 }
 
+/// Build a synthetic nested gamecard HFS0 using a *real* compressed NCZ
+/// from an isolated NSZ, and prove every NCZ byte stays unchanged.
+/// This does NOT create a Nintendo-signed retail XCI or verify a boot.
+#[test]
+#[ignore = "requires NSL_QA_ROOT and NSL_QA_BASE pointing to an isolated, sub-1GiB NSZ"]
+fn real_package_ncz_nested_hfs0_passthrough() {
+    use nsrp_core::formats::{hfs0, pfs0::Pfs0Index};
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::time::Instant;
+
+    let qa_root = std::fs::canonicalize(std::env::var("NSL_QA_ROOT").unwrap()).unwrap();
+    let source = std::fs::canonicalize(std::env::var("NSL_QA_BASE").unwrap()).unwrap();
+    assert!(source.starts_with(&qa_root));
+    assert!(source
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")));
+    assert!(std::fs::metadata(&source).unwrap().len() < 1 << 30);
+    let index = Pfs0Index::parse(&source).unwrap();
+    let entry = index
+        .entries
+        .iter()
+        .find(|entry| entry.name.to_ascii_lowercase().ends_with(".ncz"))
+        .expect("real isolated NSZ must contain one NCZ");
+    assert!(entry.size > 1024);
+    let work = tempfile::Builder::new()
+        .prefix("stage8-real-hfs0-")
+        .tempdir_in(&qa_root)
+        .unwrap();
+    let start = Instant::now();
+    let payload = work.path().join("compressed_payload.ncz");
+    let mut input = File::open(&source).unwrap();
+    input
+        .seek(SeekFrom::Start(index.data_start + entry.offset))
+        .unwrap();
+    let mut output = File::create(&payload).unwrap();
+    let mut remaining = entry.size;
+    let mut buffer = vec![0u8; 2 * 1024 * 1024];
+    while remaining > 0 {
+        let len = remaining.min(buffer.len() as u64) as usize;
+        input.read_exact(&mut buffer[..len]).unwrap();
+        output.write_all(&buffer[..len]).unwrap();
+        remaining -= len as u64;
+    }
+    drop(output);
+    assert_eq!(std::fs::metadata(&payload).unwrap().len(), entry.size);
+    let original_hash = qa_pfs0_region_sha256(&source, &index, entry);
+    assert_eq!(original_hash, qa_streamed_sha256(&payload));
+
+    let secure = work.path().join("secure.hfs0");
+    let root = work.path().join("root.hfs0");
+    hfs0::build_from_paths_layout(&[(entry.name.clone(), payload)], &secure, 0x200, 1).unwrap();
+    hfs0::build_from_paths_layout(&[("secure".into(), secure)], &root, 0x200, 1).unwrap();
+    let mut file = File::open(&root).unwrap();
+    let len = file.metadata().unwrap().len();
+    let root_index = hfs0::Hfs0Index::parse_at(&mut file, 0, len).unwrap();
+    let secure_entry = root_index.entry("secure").unwrap();
+    let secure_start = root_index.data_start + secure_entry.offset;
+    let nested = hfs0::Hfs0Index::parse_at(&mut file, secure_start, len).unwrap();
+    let nested_entry = nested.entry(&entry.name).unwrap();
+    assert_eq!(nested_entry.size, entry.size);
+    let nested_start = nested.data_start + nested_entry.offset;
+    file.seek(SeekFrom::Start(nested_start)).unwrap();
+    let mut digest = sha2::Sha256::new();
+    let mut remaining = nested_entry.size;
+    while remaining > 0 {
+        let len = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..len]).unwrap();
+        digest.update(&buffer[..len]);
+        remaining -= len as u64;
+    }
+    let verified_hash: [u8; 32] = digest.finalize().into();
+    assert_eq!(original_hash, verified_hash);
+    let root_hash = qa_streamed_sha256(&root);
+    assert!(hfs0::build_from_paths_layout(
+        &[("secure".into(), work.path().join("secure.hfs0"))],
+        &root,
+        0x200,
+        1,
+    )
+    .is_err());
+    assert_eq!(root_hash, qa_streamed_sha256(&root));
+    println!(
+        "STAGE8_REAL_NCZ_NESTED_HFS0_PASS compressed_bytes={} seconds={:.3}",
+        entry.size,
+        start.elapsed().as_secs_f64()
+    );
+}
+
 /// Read-only actual NSZ repack of the original PFS0 regions. This exercises
 /// the exact writer used by fast merges, without decrypting game content.
 #[test]

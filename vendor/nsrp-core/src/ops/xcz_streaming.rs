@@ -2,7 +2,7 @@
 //! Only the final, automatically cleaned temporary output is materialized.
 //! NCA/NCZ files and nested partitions are never staged separately.
 
-use super::{XczOptions, XczStats, collect_xci_ticket_keys, replace_extension};
+use super::{XczOptions, XczStats, collect_xci_ticket_keys, publish_xcz_output, replace_extension};
 use crate::{
     formats::{
         hfs0::{self, Hfs0Index},
@@ -79,6 +79,12 @@ pub(super) fn transform_xci_streamed(
     let (root, header_base) = hfs0::find_xci_root_with_header_base(input)?;
     let output_parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(output_parent)?;
+    if output.exists() {
+        bail!(
+            "기존 XCZ/XCI 결과물을 덮어쓰지 않습니다: {}",
+            output.display()
+        );
+    }
     let mut temporary = tempfile::Builder::new()
         .prefix("nsrp_xcz_stream_")
         .tempfile_in(output_parent)
@@ -161,11 +167,8 @@ pub(super) fn transform_xci_streamed(
         if cancel.load(Ordering::Relaxed) {
             bail!("작업이 중단되었습니다");
         }
-        temporary
-            .persist(output)
-            .context("Unchanged XCI atomic output persistence failed")?;
+        stats.output_size = publish_xcz_output(temporary, output)?;
         stats.nca_count = inspected_ncas;
-        stats.output_size = fs::metadata(output)?.len();
         log("No NCA/NCZ was transformed; original XCI bytes preserved".to_owned());
         progress(1.0);
         return Ok(stats);
@@ -365,13 +368,9 @@ pub(super) fn transform_xci_streamed(
         }
         log("No NCA/NCZ was transformed; original XCI bytes preserved".to_owned());
     }
-    // Persist replaces an existing target atomically. Do not remove the old
-    // output first: a failed rename (e.g. sharing violation) must leave it
-    // intact. Temporary output is deleted automatically on earlier errors.
-    temporary
-        .persist(output)
-        .context("XCI 결과파일 확정 실패")?;
-    stats.output_size = fs::metadata(output)?.len();
+    // Publication must not clobber a result created by another job while
+    // this multi-gigabyte XCZ was being processed.
+    stats.output_size = publish_xcz_output(temporary, output)?;
     progress(1.0);
     Ok(stats)
 }

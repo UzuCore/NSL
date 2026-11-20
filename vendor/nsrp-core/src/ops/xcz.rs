@@ -43,6 +43,21 @@ pub struct XczStats {
     pub output_size: u64,
 }
 
+/// One no-clobber publication boundary shared by streaming XCZ and the
+/// compatibility staging route. A racing destination is never replaced.
+fn publish_xcz_output(mut staged: tempfile::NamedTempFile, output: &Path) -> Result<u64> {
+    staged.as_file_mut().sync_all()?;
+    if let Err(error) = staged.persist_noclobber(output) {
+        let reason = error.error.to_string();
+        drop(error.file);
+        bail!(
+            "기존 XCZ/XCI 결과물을 덮어쓰지 않았습니다: {} ({reason})",
+            output.display()
+        );
+    }
+    Ok(fs::metadata(output)?.len())
+}
+
 pub fn compress_xci(
     input: &Path,
     output: &Path,
@@ -127,10 +142,19 @@ fn transform_xci_staged(
     let (root, header_base) = hfs0::find_xci_root_with_header_base(input)?;
     let out_parent = output.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(out_parent)?;
+    if output.exists() {
+        bail!(
+            "기존 XCZ/XCI 결과물을 덮어쓰지 않습니다: {}",
+            output.display()
+        );
+    }
     let temp = tempfile::Builder::new()
         .prefix("nsrp_xcz_")
         .tempdir_in(out_parent)?;
     let mut source = BufReader::with_capacity(8 * 1024 * 1024, File::open(input)?);
+    // Reuse one bounded copy buffer across all partition files instead of
+    // repeatedly allocating an 8MiB scratch area for every small entry.
+    let mut scratch = vec![0u8; 2 * 1024 * 1024];
 
     if let Some((keys, _)) = compress.as_mut() {
         collect_xci_ticket_keys(&mut source, input_size, &root, keys)?;
@@ -222,11 +246,25 @@ fn transform_xci_staged(
                                 continue;
                             }
                             let path = subdir.join(format!("{file_index}.nca"));
-                            copy_region(&mut source, file_abs, file_entry.size, &path, cancel)?;
+                            copy_region(
+                                &mut source,
+                                file_abs,
+                                file_entry.size,
+                                &path,
+                                cancel,
+                                &mut scratch,
+                            )?;
                             sub_paths.push((file_entry.name.clone(), path));
                         } else {
                             let path = subdir.join(format!("{file_index}.bin"));
-                            copy_region(&mut source, file_abs, file_entry.size, &path, cancel)?;
+                            copy_region(
+                                &mut source,
+                                file_abs,
+                                file_entry.size,
+                                &path,
+                                cancel,
+                                &mut scratch,
+                            )?;
                             sub_paths.push((file_entry.name.clone(), path));
                         }
                     } else if lower.ends_with(".ncz") {
@@ -262,7 +300,14 @@ fn transform_xci_staged(
                         sub_paths.push((name, path));
                     } else {
                         let path = subdir.join(format!("{file_index}.bin"));
-                        copy_region(&mut source, file_abs, file_entry.size, &path, cancel)?;
+                        copy_region(
+                            &mut source,
+                            file_abs,
+                            file_entry.size,
+                            &path,
+                            cancel,
+                            &mut scratch,
+                        )?;
                         sub_paths.push((file_entry.name.clone(), path));
                     }
                     sub_done += file_entry.size;
@@ -270,10 +315,23 @@ fn transform_xci_staged(
                 if sub_paths.is_empty() {
                     bail!("HFS0 파티션이 변환 후 비었습니다: {}", entry.name);
                 }
-                hfs0::build_from_paths_layout(&sub_paths, &partition_path, 0x200, 1)?;
+                hfs0::build_from_paths_layout_cancelled(
+                    &sub_paths,
+                    &partition_path,
+                    0x200,
+                    1,
+                    cancel,
+                )?;
             }
             Err(_) => {
-                copy_region(&mut source, abs, entry.size, &partition_path, cancel)?;
+                copy_region(
+                    &mut source,
+                    abs,
+                    entry.size,
+                    &partition_path,
+                    cancel,
+                    &mut scratch,
+                )?;
             }
         }
         root_paths.push((entry.name.clone(), partition_path));
@@ -282,26 +340,29 @@ fn transform_xci_staged(
     }
 
     let new_root = temp.path().join("root.hfs0");
-    hfs0::build_from_paths_layout(&root_paths, &new_root, 0x200, 1)?;
+    hfs0::build_from_paths_layout_cancelled(&root_paths, &new_root, 0x200, 1, cancel)?;
     let new_root_size = fs::metadata(&new_root)?.len();
     let root_hash = sha256_file(&new_root)?;
-    let partial = output.with_extension(format!(
-        "{}.partial",
-        output.extension().and_then(|s| s.to_str()).unwrap_or("xci")
-    ));
+    let mut staged = tempfile::Builder::new()
+        .prefix(".nsrp-xcz-compat-")
+        .suffix(".partial")
+        .tempfile_in(out_parent)?;
     {
-        let mut out = BufWriter::with_capacity(8 * 1024 * 1024, File::create(&partial)?);
+        let mut out = BufWriter::with_capacity(8 * 1024 * 1024, staged.as_file_mut());
         source.seek(SeekFrom::Start(0))?;
-        copy_exact(&mut source, &mut out, root.base, cancel)?;
+        copy_exact(&mut source, &mut out, root.base, cancel, &mut scratch)?;
         let mut root_file = BufReader::with_capacity(8 * 1024 * 1024, File::open(&new_root)?);
-        std::io::copy(&mut root_file, &mut out)?;
+        copy_exact(
+            &mut root_file,
+            &mut out,
+            new_root_size,
+            cancel,
+            &mut scratch,
+        )?;
         out.flush()?;
     }
     if let Some(base) = header_base {
-        let mut out = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&partial)?;
+        let out = staged.as_file_mut();
         out.seek(SeekFrom::Start(base + 0x138))?;
         out.write_u64::<LittleEndian>(new_root_size)?;
         out.seek(SeekFrom::Start(base + 0x118))?;
@@ -311,11 +372,17 @@ fn transform_xci_staged(
         out.write_all(&root_hash)?;
         out.flush()?;
     }
-    if output.exists() {
-        fs::remove_file(output)?;
+    let expected = root
+        .base
+        .checked_add(new_root_size)
+        .context("XCZ 호환 출력 길이 오버플로")?;
+    if staged.as_file().metadata()?.len() != expected {
+        bail!("XCZ 호환 경로 결과 길이 검증 실패");
     }
-    fs::rename(&partial, output)?;
-    stats.output_size = fs::metadata(output)?.len();
+    if cancel.load(Ordering::Relaxed) {
+        bail!("작업이 중단되었습니다");
+    }
+    stats.output_size = publish_xcz_output(staged, output)?;
     progress(1.0);
     Ok(stats)
 }
@@ -352,10 +419,11 @@ fn copy_region<R: Read + Seek>(
     size: u64,
     output: &Path,
     cancel: &AtomicBool,
+    buffer: &mut [u8],
 ) -> Result<()> {
     source.seek(SeekFrom::Start(offset))?;
-    let mut out = BufWriter::with_capacity(8 * 1024 * 1024, File::create(output)?);
-    copy_exact(source, &mut out, size, cancel)?;
+    let mut out = BufWriter::with_capacity(buffer.len(), File::create(output)?);
+    copy_exact(source, &mut out, size, cancel, buffer)?;
     out.flush()?;
     Ok(())
 }
@@ -365,8 +433,8 @@ fn copy_exact<R: Read, W: Write>(
     output: &mut W,
     mut remaining: u64,
     cancel: &AtomicBool,
+    buffer: &mut [u8],
 ) -> Result<()> {
-    let mut buffer = vec![0u8; 8 * 1024 * 1024];
     while remaining > 0 {
         if cancel.load(Ordering::Relaxed) {
             bail!("작업이 중단되었습니다");
@@ -403,3 +471,135 @@ fn replace_extension(name: &str, extension: &str) -> String {
 #[cfg(test)]
 #[path = "xcz_bktr_tests.rs"]
 mod bktr_tests;
+
+#[cfg(test)]
+mod stage8_compat_tests {
+    use super::*;
+
+    fn test_xci(dir: &Path) -> Result<PathBuf> {
+        let payload = dir.join("payload.nca");
+        fs::write(&payload, vec![0x38u8; 1024 * 1024 + 127])?;
+        let secure = dir.join("secure.hfs0");
+        hfs0::build_from_paths_layout(&[("payload.nca".into(), payload)], &secure, 0x200, 1)?;
+        let root = dir.join("root.hfs0");
+        hfs0::build_from_paths_layout(&[("secure".into(), secure)], &root, 0x200, 1)?;
+        let input = dir.join("original.xci");
+        let mut header = [0u8; 0x200];
+        header[0x100..0x104].copy_from_slice(b"HEAD");
+        header[0x130..0x138].copy_from_slice(&0x200u64.to_le_bytes());
+        let mut out = BufWriter::new(File::create(&input)?);
+        out.write_all(&header)?;
+        out.write_all(&fs::read(&root)?)?;
+        out.flush()?;
+        Ok(input)
+    }
+
+    #[test]
+    fn staged_xcz_protects_existing_output_and_cleans_pre_cancelled_jobs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let input = test_xci(temp.path())?;
+        let existing = temp.path().join("existing.xcz");
+        fs::write(&existing, b"prior validated result")?;
+        let cancel = AtomicBool::new(false);
+        assert!(
+            transform_xci_staged(&input, &existing, None, &cancel, &mut |_| {}, &mut |_| {})
+                .is_err()
+        );
+        assert_eq!(fs::read(&existing)?, b"prior validated result");
+
+        let cancelled = temp.path().join("cancelled.xcz");
+        assert!(
+            transform_xci_staged(
+                &input,
+                &cancelled,
+                None,
+                &AtomicBool::new(true),
+                &mut |_| {},
+                &mut |_| {},
+            )
+            .is_err()
+        );
+        assert!(!cancelled.exists());
+        assert!(fs::read_dir(temp.path())?.all(|entry| {
+            let name = entry.unwrap().file_name();
+            !name.to_string_lossy().starts_with(".nsrp-xcz-compat-")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_and_streamed_xcz_preserve_nested_gamecard_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let original = test_xci(temp.path())?;
+        let staged = temp.path().join("staged.xcz");
+        let streamed = temp.path().join("streamed.xcz");
+        let cancel = AtomicBool::new(false);
+        let result =
+            transform_xci_staged(&original, &staged, None, &cancel, &mut |_| {}, &mut |_| {})?;
+        assert_eq!(result.ncz_count, 0);
+        let result = streaming::transform_xci_streamed(
+            &original,
+            &streamed,
+            None,
+            &cancel,
+            &mut |_| {},
+            &mut |_| {},
+        )?;
+        assert_eq!(result.ncz_count, 0);
+        for output in [&staged, &streamed] {
+            let content = hfs0::collect_leaf_entries(output, false)?;
+            assert_eq!(content.len(), 1);
+            assert_eq!(content[0].0, "payload.nca");
+            assert_eq!(content[0].2, 1024 * 1024 + 127);
+        }
+        assert_eq!(fs::read(&streamed)?, fs::read(&original)?);
+        let old_hash = sha256_file(&staged)?;
+        assert!(
+            transform_xci_staged(&original, &staged, None, &cancel, &mut |_| {}, &mut |_| {})
+                .is_err()
+        );
+        assert_eq!(sha256_file(&staged)?, old_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_streamed_xcz_writers_commit_only_one_output() -> Result<()> {
+        use std::sync::{Arc, Barrier};
+
+        let temp = tempfile::tempdir()?;
+        let original = test_xci(temp.path())?;
+        let destination = temp.path().join("contended.xcz");
+        let barrier = Arc::new(Barrier::new(2));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let (input, output, barrier) =
+                (original.clone(), destination.clone(), Arc::clone(&barrier));
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                streaming::transform_xci_streamed(
+                    &input,
+                    &output,
+                    None,
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                    &mut |_| {},
+                )
+                .is_ok()
+            }));
+        }
+        let committed = threads
+            .into_iter()
+            .map(|handle| usize::from(handle.join().expect("XCZ worker panicked")))
+            .sum::<usize>();
+        assert_eq!(committed, 1);
+        assert_eq!(sha256_file(&original)?, sha256_file(&destination)?);
+        assert!(fs::read_dir(temp.path())?.all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("nsrp_xcz_stream_")
+        }));
+        Ok(())
+    }
+}

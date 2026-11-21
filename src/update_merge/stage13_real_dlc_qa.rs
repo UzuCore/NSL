@@ -400,6 +400,44 @@ fn isolated_stage13_real_two_dlc_cumulative_nsz_wrapper() -> Result<()> {
             "Original DLC changed"
         );
     }
+    // Stage 14 uses the fully verified cumulative output for a separate,
+    // owned Eden loader smoke. Opt-in only: never publish QA packages into
+    // the user's game library, and never overwrite an existing export.
+    if let Some(value) = std::env::var_os("NSL_STAGE14_EDEN_EXPORT") {
+        let export = PathBuf::from(value);
+        let parent = fs::canonicalize(export.parent().context("Eden export has no parent")?)?;
+        let qa = fs::canonicalize(std::env::var("NSL_STAGE13_QA_ROOT")?)?;
+        anyhow::ensure!(
+            parent.starts_with(&qa) && parent != qa && !export.exists(),
+            "Eden export must be a new file in a private QA subdirectory"
+        );
+        anyhow::ensure!(
+            export
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")),
+            "Eden export must retain compressed NSZ format"
+        );
+        let mut staged = tempfile::Builder::new()
+            .prefix(".stage14-export-")
+            .tempfile_in(&parent)?;
+        let copied = std::io::copy(&mut File::open(&current)?, staged.as_file_mut())?;
+        anyhow::ensure!(copied == fs::metadata(&current)?.len());
+        staged.as_file_mut().sync_all()?;
+        let staged_hash = sha256_file(staged.path())?;
+        let final_hash = sha256_file(&current)?;
+        anyhow::ensure!(staged_hash == final_hash, "Eden export SHA-256 mismatch");
+        staged.persist_noclobber(&export)?;
+        let digest = final_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        println!(
+            "STAGE14_EDEN_EXPORT_PASS file={} bytes={} sha256={}",
+            export.display(),
+            copied,
+            digest
+        );
+    }
     println!("STAGE13_REAL_TWO_DLC_CUMULATIVE_NSZ_PASS two_dlcs=true original_sha_unchanged=true elapsed={:.2}",
         started.elapsed().as_secs_f64());
     Ok(())

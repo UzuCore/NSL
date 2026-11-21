@@ -379,6 +379,28 @@ mod tests {
             std::fs::read(&direct).unwrap(),
             std::fs::read(&result).unwrap()
         );
+
+        // Stage31: a retry must never overwrite a previously published XCI.
+        // Keep the previously generated, structurally valid template and
+        // materialized inputs untouched even when the destination exists.
+        let existing = temp.path().join("existing-output.xci");
+        let sentinel = b"user-owned output: do not overwrite";
+        std::fs::write(&existing, sentinel).unwrap();
+        assert!(build_merged_xci_from_template(&source, &merged, &existing, &cancel,).is_err());
+        assert_eq!(std::fs::read(&existing).unwrap(), sentinel);
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&merged).unwrap(), raw);
+
+        // Missing selected content must not create or truncate a destination.
+        let missing_output = temp.path().join("missing-input.xci");
+        assert!(build_merged_xci_from_selected_files(
+            &source,
+            &[("missing.nca".into(), temp.path().join("missing.nca"))],
+            &missing_output,
+            &cancel,
+        )
+        .is_err());
+        assert!(!missing_output.exists());
     }
 
     #[test]

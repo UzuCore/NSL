@@ -114,6 +114,23 @@ fn build_merged_xci_from_sources(
     output: &Path,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    // Reject invalid or duplicate secure-partition names before creating any
+    // output. A duplicate silently makes the generated image ambiguous to
+    // downstream game-card index readers.
+    let mut seen = std::collections::HashSet::with_capacity(sources.len());
+    for entry in sources {
+        anyhow::ensure!(
+            !entry.name.is_empty()
+                && !entry.name.contains(['/', '\\', '\0'])
+                && seen.insert(entry.name.to_ascii_lowercase()),
+            "invalid or duplicate XCI secure entry: {}",
+            entry.name
+        );
+        anyhow::ensure!(
+            entry.path != output,
+            "XCI selected source and destination must differ"
+        );
+    }
     anyhow::ensure!(!cancel.load(Ordering::Relaxed), "XCI 병합이 취소되었습니다");
     anyhow::ensure!(template != output, "XCI 템플릿과 출력 경로 충돌");
     anyhow::ensure!(
@@ -401,6 +418,24 @@ mod tests {
         )
         .is_err());
         assert!(!missing_output.exists());
+
+        // Stage32: reject ambiguous or unsafe HFS0 names before opening output.
+        for invalid in ["BASE.NCA", "dir/patch.nca", "dir\\patch.nca", ""] {
+            let bad_output = temp.path().join("bad-name-output.xci");
+            let selected = if invalid == "BASE.NCA" {
+                vec![
+                    ("base.nca".into(), temp.path().join("selected_base.nca")),
+                    (invalid.into(), temp.path().join("selected_patch.cnmt.nca")),
+                ]
+            } else {
+                vec![(invalid.into(), temp.path().join("selected_base.nca"))]
+            };
+            assert!(
+                build_merged_xci_from_selected_files(&source, &selected, &bad_output, &cancel)
+                    .is_err()
+            );
+            assert!(!bad_output.exists());
+        }
     }
 
     #[test]

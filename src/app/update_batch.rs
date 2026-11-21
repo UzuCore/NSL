@@ -474,7 +474,15 @@ impl NslApp {
                             changed = true;
                         }
                     } else if progress.finished {
-                        verify_rows.push(index);
+                        // A 100% progress snapshot is published BEFORE the
+                        // engine pauses the torrent and releases file locks.
+                        // Wait for its actual successful Download notice,
+                        // which durably marks transfer_finished. Otherwise
+                        // Windows can reject the merge with a sharing error.
+                        if job.status != update_batch::UpdateBatchJobStatus::Downloading {
+                            job.status = update_batch::UpdateBatchJobStatus::Downloading;
+                            changed = true;
+                        }
                     } else {
                         // A previously failed download can resume. A paused
                         // torrent is queued, not a failed post-download merge.

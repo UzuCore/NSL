@@ -219,11 +219,17 @@ fn spawn_engine(
                 }),
                 ..Default::default()
             };
-            // The QA engine uses localhost peers only; do not contact DHT.
+            // Every QA engine is loopback-only, including its listener. Never
+            // expose even synthetic fixtures to LAN/public peers during tests.
             #[cfg(test)]
             {
                 session_options.dht = None;
                 session_options.disable_local_service_discovery = true;
+                session_options.listen = Some(librqbit::ListenerOptions {
+                    mode: librqbit::ListenerMode::TcpOnly,
+                    listen_addr: "127.0.0.1:0".parse()?,
+                    ..Default::default()
+                });
             }
             let session = runtime.block_on(Session::new_with_opts(
                 default_folder.clone(),

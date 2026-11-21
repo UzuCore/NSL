@@ -341,6 +341,14 @@ fn restored_grouped_dlcs_reconnect_by_folder_and_resume_after_download_error() {
     assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
         row.job.as_ref().unwrap().status == update_batch::UpdateBatchJobStatus::Downloading
     }));
+    // rqbit publishes 100% BEFORE its watcher has paused the torrent and
+    // released Windows file handles. Never run native verification yet.
+    app.torrent_progress[1].1.finished = true;
+    app.poll_missing_update_audit(&ctx);
+    assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
+        let job = row.job.as_ref().unwrap();
+        !job.transfer_finished && job.verifying.is_none()
+    }));
     app.handle_missing_update_completion("r54", &Ok(()));
     assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
         let job = row.job.as_ref().unwrap();

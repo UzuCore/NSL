@@ -124,10 +124,15 @@ fn local_file_seeder(
         .build()
         .unwrap();
     let (session, handle, peer, magnet) = runtime.block_on(async {
+        let piece_length = if std::fs::metadata(file).unwrap().len() >= 64 * 1024 * 1024 {
+            512 * 1024
+        } else {
+            32 * 1024
+        };
         let fixture = librqbit::create_torrent(
             file,
             CreateTorrentOptions {
-                piece_length: Some(32 * 1024),
+                piece_length: Some(piece_length),
                 ..Default::default()
             },
             &BlockingSpawner::new(1),
@@ -186,6 +191,229 @@ fn local_file_seeder(
         url::form_urlencoded::byte_serialize(tracker.url.as_bytes()).collect::<String>()
     );
     (runtime, session, handle, tracker, magnet)
+}
+
+/// Full production batch pipeline using an authorized game fixture:
+/// real BitTorrent pieces over TCP loopback, verified metadata preview,
+/// selected-file queue, completion notice, crash-journal restoration,
+/// and the native NSZ game/update merge. No external tracker, DHT, LAN
+/// listener, original-data modification, or emulator process is involved.
+#[test]
+#[ignore = "opt-in private localhost-only real 346 MiB NSP BitTorrent -> NSZ merge"]
+fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::Digest;
+    use std::io::Read as _;
+
+    fn checksum(path: &Path) -> anyhow::Result<[u8; 32]> {
+        let mut hasher = sha2::Sha256::new();
+        let mut source = std::fs::File::open(path)?;
+        let mut block = [0u8; 1024 * 1024];
+        loop {
+            let read = source.read(&mut block)?;
+            if read == 0 {
+                return Ok(hasher.finalize().into());
+            }
+            hasher.update(&block[..read]);
+        }
+    }
+    let qa_root = PathBuf::from("E:\\NSL_QA_20261120");
+    let original_base = qa_root.join("small").join("base.nsz");
+    let original_patch = qa_root.join("small").join("patch.nsp");
+    anyhow::ensure!(
+        original_base.is_file() && original_patch.is_file(),
+        "Stage 16 read-only real game fixtures are unavailable"
+    );
+    let qa = tempfile::Builder::new()
+        .prefix("stage16-local-peer-real-")
+        .tempdir_in(&qa_root)?;
+    let seed_dir = qa.path().join("private-seeder");
+    let game_dir = qa.path().join("private-game");
+    let app_dir = qa.path().join("private-nsl");
+    for directory in [&seed_dir, &game_dir, &app_dir] {
+        std::fs::create_dir_all(directory)?;
+    }
+    let original_base_sha = checksum(&original_base)?;
+    let original_patch_sha = checksum(&original_patch)?;
+    let game = game_dir.join("base.nsz");
+    let seed_file = seed_dir.join("patch.nsp");
+    std::fs::copy(&original_base, &game)?;
+    std::fs::copy(&original_patch, &seed_file)?;
+    anyhow::ensure!(checksum(&game)? == original_base_sha);
+    anyhow::ensure!(checksum(&seed_file)? == original_patch_sha);
+
+    let began = Instant::now();
+    let (seed_runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_file, &seed_dir, 48 * 1024 * 1024);
+    let mut app = crate::NslApp::with_base_dir(app_dir.clone())?;
+    let engine = Arc::clone(
+        app.torrent_engine
+            .as_ref()
+            .context("No NSL torrent engine")?,
+    );
+    let preview_request = engine.preview_files(&magnet)?;
+    let preview = preview_request
+        .receiver
+        .recv_timeout(Duration::from_secs(45))
+        .context("Local magnet metadata preview timeout")?
+        .map_err(anyhow::Error::msg)?;
+    drop(preview_request);
+    anyhow::ensure!(preview.files.len() == 1);
+    let selected = preview.files[0].clone();
+    anyhow::ensure!(selected.size == std::fs::metadata(&original_patch)?.len());
+    anyhow::ensure!(
+        !app_dir.join("downloads").join("stage16-real").exists(),
+        "Metadata-only preview wrote a payload"
+    );
+    let base_id = "0100F7301AAB6000".to_string();
+    let wanted_version = 65536;
+    app.update_batch = Some(crate::update_batch::UpdateBatch {
+        kind: crate::update_batch::BatchKind::Update,
+        rows: vec![crate::update_batch::UpdateBatchRow {
+            library_id: 16,
+            title_id: base_id.clone(),
+            dlc_id: None,
+            name: "Stage16 localhost-only Horror Tale 2 update".into(),
+            installed_version: 0,
+            latest_version: wanted_version,
+            original_path: game.clone(),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: Some(crate::update_batch::UpdateBatchMatch {
+                release: crate::catalog::CatalogItem {
+                    title: "Stage16 isolated real NSP torrent".into(),
+                    title_id: Some(base_id.clone()),
+                    topic_id: "stage16-only".into(),
+                    magnet,
+                    ..Default::default()
+                },
+                file: selected.clone(),
+                version: wanted_version,
+                torrent_bytes: Arc::new(preview.torrent_bytes),
+            }),
+            checked: true,
+            failure: None,
+            job: None,
+        }],
+        running: false,
+        cursor: 1,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+    });
+    // Invoke the real catalog-to-download queue code, not a synthetic Add.
+    app.queue_missing_updates();
+    let job = app
+        .update_batch
+        .as_ref()
+        .context("No batch after queue")?
+        .rows[0]
+        .job
+        .as_ref()
+        .context("Catalog-to-batch queue rejected actual torrent metadata")?;
+    let queue_key = job.key.clone();
+    let downloaded = job.output.clone();
+    anyhow::ensure!(job.expected_file_size == selected.size);
+    let mut copied_bytes_seen = false;
+    let mut peer_seen = false;
+    let mut successful_notice = false;
+    let ctx = eframe::egui::Context::default();
+    let output = loop {
+        anyhow::ensure!(
+            began.elapsed() < Duration::from_secs(340),
+            "Local real-torrent to native-merge E2E timed out"
+        );
+        let (snapshot, notices) = engine.poll();
+        if let Some((_, live)) = snapshot.iter().find(|(key, _)| key == &queue_key) {
+            anyhow::ensure!(
+                live.error.is_none(),
+                "Local BitTorrent peer error: {:?}",
+                live.error
+            );
+            if live.progress_bytes > 0 && !live.finished {
+                copied_bytes_seen = true;
+                peer_seen |= live.active_seeders.unwrap_or(0) + live.active_peers.unwrap_or(0) > 0;
+            }
+        }
+        app.torrent_progress = snapshot;
+        for notice in notices {
+            if let EngineNotice::Download { key, result } = notice {
+                if key == queue_key {
+                    anyhow::ensure!(
+                        result.is_ok(),
+                        "NSL torrent completion was unsuccessful: {result:?}"
+                    );
+                    anyhow::ensure!(copied_bytes_seen, "No live peer transfer recorded");
+                    anyhow::ensure!(peer_seen, "No real loopback BitTorrent peer observed");
+                    // The engine emits this notice only AFTER pausing and
+                    // unlocking its completed file handles.
+                    app.handle_missing_update_completion(&key, &result);
+                    let completed = crate::update_manifest::load(&app_dir)?
+                        .context("Completed torrent was not journaled")?;
+                    anyhow::ensure!(completed.rows[0]
+                        .job
+                        .as_ref()
+                        .is_some_and(|job| job.transfer_finished));
+                    // Simulate an application crash/restart in the narrow
+                    // window between successful transfer and native merge.
+                    app.update_batch = Some(completed);
+                    successful_notice = true;
+                    println!(
+                        "STAGE16_REAL_TORRENT_COMPLETED bytes={} real_peer=true crash_journal_restored=true elapsed_s={:.2}",
+                        std::fs::metadata(&downloaded)?.len(),
+                        began.elapsed().as_secs_f64()
+                    );
+                }
+            }
+        }
+        if successful_notice {
+            app.poll_missing_update_audit(&ctx);
+            if let Some(job) = app
+                .update_batch
+                .as_ref()
+                .and_then(|batch| batch.rows[0].job.as_ref())
+            {
+                match &job.status {
+                    crate::update_batch::UpdateBatchJobStatus::Merged(path) => {
+                        break path.clone();
+                    }
+                    crate::update_batch::UpdateBatchJobStatus::Failed(reason) => {
+                        anyhow::bail!("Post-torrent NSZ native merge failed: {reason}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    anyhow::ensure!(output.is_file());
+    anyhow::ensure!(output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")));
+    anyhow::ensure!(std::fs::metadata(&output)?.len() == 330_474_468);
+    anyhow::ensure!(checksum(&downloaded)? == original_patch_sha);
+    anyhow::ensure!(checksum(&game)? == original_base_sha);
+    anyhow::ensure!(checksum(&original_patch)? == original_patch_sha);
+    anyhow::ensure!(checksum(&original_base)? == original_base_sha);
+    let post = crate::update_manifest::load(&app_dir)?.context("Merged journal missing")?;
+    anyhow::ensure!(post.rows[0].job.as_ref().is_some_and(|job| {
+        job.status == crate::update_batch::UpdateBatchJobStatus::Merged(output.clone())
+    }));
+    let source_hash = checksum(&output)?;
+    println!(
+        "STAGE16_REAL_LOOPBACK_TORRENT_NATIVE_MERGE_PASS bytes_downloaded={} nsz_bytes={} peer_seen=true journal_restored=true source_sha_unchanged=true output_sha256={} elapsed_s={:.2}",
+        selected.size,
+        std::fs::metadata(&output)?.len(),
+        source_hash.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        began.elapsed().as_secs_f64()
+    );
+    drop(app);
+    drop(engine);
+    drop(seed_session);
+    drop(seed_runtime);
+    drop(tracker);
+    Ok(())
 }
 
 #[test]

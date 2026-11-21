@@ -673,9 +673,11 @@ impl NslApp {
                             "현재 연결된 시드와 비시더 피어 수 · 전체 토렌트 네트워크 수 아님 · 연결 정보가 없으면 —",
                         );
                         if let Some(error) = &progress.error {
+                            let readable_error =
+                                torrent::retryable_storage_error_hint(error).unwrap_or(error);
                             let error_response = ui.add(
                                 egui::Label::new(
-                                    egui::RichText::new(error)
+                                    egui::RichText::new(readable_error)
                                         .small()
                                         .color(egui::Color32::LIGHT_RED),
                                 )

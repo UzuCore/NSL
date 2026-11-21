@@ -80,6 +80,235 @@ fn stage27_private_real_dlc_merge_child() -> Result<()> {
     Ok(())
 }
 
+/// Stage28 child-only: runs a real merge but is held by the test-only
+/// production publication hook after the final file exists and before
+/// TempDir cleanup or the durable batch journal's Merged transition.
+#[test]
+#[ignore = "child-only opt-in Stage28 real NSZ publication crash QA"]
+fn stage28_private_dlc_after_publish_child() -> Result<()> {
+    let Some(root) = std::env::var_os("NSL_STAGE28_CHILD_ROOT") else {
+        return Ok(());
+    };
+    let root = fs::canonicalize(root)?;
+    anyhow::ensure!(
+        root.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("stage28-published-crash-")),
+        "Stage28 child was pointed outside test-owned QA directory"
+    );
+    let game = fs::canonicalize(root.join("source-game.nsz"))?;
+    let dlc = fs::canonicalize(root.join("private-app-state/downloads/dlc/patch.nsp"))?;
+    anyhow::ensure!(game.parent() == Some(root.as_path()));
+    anyhow::ensure!(dlc.starts_with(root.join("private-app-state/downloads")));
+    let result =
+        merge_or_recover_dlc_controlled(&game, &dlc, BASE, DLC, 0, &MergeControl::default())?;
+    anyhow::bail!(
+        "Stage28 child must not return before owned kill: {}",
+        result.display()
+    );
+}
+
+/// Real 1.37GiB completed DLC NSZ, killed in the previously-unverified
+/// *post-publication, pre-journal* window. The verified output must be
+/// adopted without a second write or an orphaned 1.37GiB workspace.
+#[test]
+#[ignore = "real read-only DLC + private 16GiB scratch + owned child OS kill"]
+fn stage28_real_dlc_postpublish_prejournal_crash_recovers_without_rewriting() -> Result<()> {
+    use crate::update_batch::{
+        BatchKind, UpdateBatch, UpdateBatchJob, UpdateBatchJobStatus, UpdateBatchRow,
+    };
+
+    let (source, source_dlc, qa) = real_fixture()?;
+    let started = Instant::now();
+    let source_hash = sha256(&source)?;
+    let dlc_hash = sha256(&source_dlc)?;
+    anyhow::ensure!(source_hash == EXPECTED_GAME_SHA && dlc_hash == EXPECTED_DLC_SHA);
+    let scratch = tempfile::Builder::new()
+        .prefix("stage28-published-crash-")
+        .tempdir_in(qa)?;
+    let game = scratch.path().join("source-game.nsz");
+    fs::copy(&source, &game)?;
+    anyhow::ensure!(sha256(&game)? == source_hash);
+    let app_root = scratch.path().join("private-app-state");
+    let download_dir = app_root.join("downloads/dlc");
+    fs::create_dir_all(&download_dir)?;
+    let downloaded = download_dir.join("patch.nsp");
+    fs::copy(&source_dlc, &downloaded)?;
+    anyhow::ensure!(sha256(&downloaded)? == dlc_hash);
+    crate::update_batch::verify_downloaded_dlc(&app_root, &downloaded, BASE, DLC, 0)?;
+    let job = UpdateBatchJob {
+        key: "stage28-private-published-job".into(),
+        directory: download_dir,
+        output: downloaded.clone(),
+        expected_version: 0,
+        expected_file_size: fs::metadata(&downloaded)?.len(),
+        original_size: fs::metadata(&game)?.len(),
+        transfer_finished: true,
+        recovering_since: None,
+        status: UpdateBatchJobStatus::Verifying,
+        verifying: None,
+        merge_control: None,
+    };
+    let batch = UpdateBatch {
+        kind: BatchKind::Dlc,
+        rows: vec![UpdateBatchRow {
+            library_id: 28,
+            title_id: BASE.into(),
+            dlc_id: Some(DLC.into()),
+            name: "Stage28 already-published DLC crash recovery".into(),
+            installed_version: -1,
+            latest_version: 0,
+            original_path: game.clone(),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: None,
+            checked: false,
+            failure: None,
+            job: Some(job),
+        }],
+        running: false,
+        cursor: 1,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+        preview_cache_bytes: 0,
+    };
+    crate::update_manifest::save(&app_root, &batch)?;
+    let destination = expected_dlc_output(&game, BASE, DLC, 0)?;
+    anyhow::ensure!(!destination.exists());
+    let child_log = File::create(scratch.path().join("stage28-child-stderr.log"))?;
+    let child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "update_merge::stage27_real_crash_qa::stage28_private_dlc_after_publish_child",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("NSL_STAGE28_CHILD_ROOT", scratch.path())
+        .env("NSL_STAGE28_AFTER_PUBLISH_CHILD_ROOT", scratch.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(child_log))
+        .spawn()?;
+    let mut owned = OwnedChild(child);
+    let signal = scratch.path().join("stage28-published-and-locked.signal");
+    let waited = Instant::now();
+    while waited.elapsed() < Duration::from_secs(260) {
+        if owned.0.try_wait()?.is_some() {
+            let message = fs::read_to_string(scratch.path().join("stage28-child-stderr.log"))
+                .unwrap_or_default();
+            anyhow::bail!("Stage28 child exited before publication hold: {message}");
+        }
+        if signal.is_file() && destination.is_file() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        signal.is_file() && destination.is_file(),
+        "never observed a real published DLC output before killing owned child"
+    );
+    anyhow::ensure!(
+        owned.0.try_wait()?.is_none(),
+        "owned child died before controlled OS kill"
+    );
+    let published_bytes = fs::metadata(&destination)?.len();
+    anyhow::ensure!(published_bytes > 1024 * 1024 * 1024);
+    let mut owned_workspace: Option<PathBuf> = None;
+    for entry in fs::read_dir(scratch.path())? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".nsl-merge-")
+            && entry.file_type()?.is_dir()
+            && entry.path().join(MERGE_WORK_MARKER).is_file()
+        {
+            anyhow::ensure!(
+                owned_workspace.is_none(),
+                "ambiguous owned merge workspaces"
+            );
+            owned_workspace = Some(entry.path());
+        }
+    }
+    let orphan = owned_workspace.context("published output has no locked owner workspace")?;
+    // Terminate only the test-owned child, not any unrelated NSL or emulator.
+    owned.0.kill()?;
+    let _ = owned.0.wait()?;
+    anyhow::ensure!(destination.is_file() && orphan.is_dir());
+    anyhow::ensure!(fs::read(&signal)? == b"published-qa-only");
+    let before_recovery = sha256(&destination)?;
+    anyhow::ensure!(sha256(&game)? == source_hash && sha256(&downloaded)? == dlc_hash);
+    println!(
+        "STAGE28_REAL_AFTER_PUBLISH_CHILD_KILLED bytes={} published=true journal_stale=true owner_orphan=true",
+        published_bytes
+    );
+
+    drop(batch);
+    let mut restored = crate::update_manifest::load(&app_root)?
+        .context("published-job journal missing after Stage28 child exit")?;
+    anyhow::ensure!(restored.rows[0].job.as_ref().is_some_and(|job| {
+        job.transfer_finished && job.status == UpdateBatchJobStatus::Queued
+    }));
+    let recovery_started = Instant::now();
+    let recovered = merge_or_recover_dlc_controlled(
+        &game,
+        &downloaded,
+        BASE,
+        DLC,
+        0,
+        &MergeControl::default(),
+    )?;
+    anyhow::ensure!(recovered == destination && recovered.is_file());
+    anyhow::ensure!(
+        sha256(&destination)? == before_recovery,
+        "recovered file was rewritten or modified rather than adopted"
+    );
+    anyhow::ensure!(
+        !orphan.exists(),
+        "post-publication orphan was not reclaimed"
+    );
+    // Exactly the same verified output was adopted; mark the production
+    // journal as Merged and verify that the durable path survives restart.
+    restored.rows[0].job.as_mut().unwrap().status = UpdateBatchJobStatus::Merged(recovered.clone());
+    crate::update_manifest::save(&app_root, &restored)?;
+    let final_batch =
+        crate::update_manifest::load(&app_root)?.context("merged job lost after durable save")?;
+    anyhow::ensure!(matches!(
+        final_batch.rows[0].job.as_ref().map(|job| &job.status),
+        Some(UpdateBatchJobStatus::Merged(path)) if path == &destination
+    ));
+    let keys = scanner::prod_keys().context("Stage28 read-only prod.keys unavailable")?;
+    let meta_root = scratch.path().join("stage28-final-cnmt-qa");
+    let disabled_tool = meta_root.join("no-external-tool.exe");
+    let (_, original_meta, _) = cnmt::discover_game_metadata(
+        &game,
+        &meta_root.join("base"),
+        &disabled_tool,
+        &keys,
+        &AtomicBool::new(false),
+    )?;
+    let (_, recovered_meta, _) = cnmt::discover_game_metadata(
+        &destination,
+        &meta_root.join("final"),
+        &disabled_tool,
+        &keys,
+        &AtomicBool::new(false),
+    )?;
+    validate_dlc_cnmts(&recovered_meta, BASE, DLC, 0)?;
+    ensure_existing_content_preserved(&original_meta, &recovered_meta)?;
+    anyhow::ensure!(fs::metadata(&destination)?.len() == published_bytes);
+    anyhow::ensure!(sha256(&source)? == source_hash && sha256(&source_dlc)? == dlc_hash);
+    anyhow::ensure!(sha256(&game)? == source_hash && sha256(&downloaded)? == dlc_hash);
+    println!(
+        "STAGE28_REAL_POSTPUBLISH_PREJOURNAL_RESTORE_PASS bytes={} prior_cnmts={} final_cnmts={} original_hashes=true reused_sha=true orphan_reaped=true durable_merged=true restore_seconds={:.2} total_seconds={:.2}",
+        published_bytes, original_meta.len(), recovered_meta.len(),
+        recovery_started.elapsed().as_secs_f64(), started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 struct OwnedChild(Child);
 impl Drop for OwnedChild {
     fn drop(&mut self) {

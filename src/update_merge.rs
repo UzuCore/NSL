@@ -761,7 +761,42 @@ fn merge_verified_package_target_controlled(
     control.ensure_running()?;
     control.stage("병합 파일 안전 게시");
     publish_without_overwrite(&produced, &destination, cancelled)?;
+    // A crash after no-clobber publication but before the owning batch
+    // journal records Merged must be recoverable without publishing twice.
+    // This opt-in hook exists only in the test binary; production never
+    // waits here. It lets the QA parent terminate precisely in that window.
+    #[cfg(test)]
+    stage28_hold_owned_child_after_publish(work.path(), &destination)?;
     Ok(destination)
+}
+
+#[cfg(test)]
+fn stage28_hold_owned_child_after_publish(work: &Path, destination: &Path) -> Result<()> {
+    let Some(qa_root) = std::env::var_os("NSL_STAGE28_AFTER_PUBLISH_CHILD_ROOT") else {
+        return Ok(());
+    };
+    let qa_root = fs::canonicalize(qa_root)?;
+    anyhow::ensure!(
+        qa_root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.starts_with("stage28-published-crash-"))
+            && destination.parent() == Some(qa_root.as_path())
+            && work.parent() == Some(qa_root.as_path())
+            && work.join(MERGE_WORK_MARKER).is_file()
+            && destination.is_file(),
+        "Stage28 hook may only pause a private, published NSZ QA result"
+    );
+    fs::write(
+        qa_root.join("stage28-published-and-locked.signal"),
+        b"published-qa-only",
+    )?;
+    // Kill only the spawned child from the owning parent test. This simulates
+    // an abrupt exit *after* the destination link is durable but *before*
+    // TempDir/owner locks drop or the parent's batch journal is updated.
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Recover an already published, independently verified package after a
@@ -868,6 +903,14 @@ fn merge_or_recover_target_controlled(
             OutputKind::Nsp | OutputKind::Xci => {}
         }
         control.ensure_running()?;
+        // A crash after successful atomic publication but before the durable
+        // batch journal update leaves a completed result plus an abandoned
+        // private workspace. Only after the result passes full CNMT and
+        // compressed-package verification may its dead workspace be reaped.
+        reap_dead_merge_workspaces(
+            destination.parent().context("병합 출력 상위 폴더 없음")?,
+            &destination,
+        )?;
         return Ok(destination);
     }
     merge_verified_package_target_controlled(original, patch, base_id, dlc_id, version, control)

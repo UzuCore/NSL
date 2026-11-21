@@ -77,6 +77,34 @@ pub(crate) fn retryable_failed_transfer(progress: &TorrentProgress) -> bool {
     progress.error.is_some() && !progress.finished && progress.output_folder.is_some()
 }
 
+/// Actionable UI guidance while retaining the raw Windows/rqbit error in the
+/// tooltip. A WSL device failure (31) must not be mislabeled disk full 112.
+pub(crate) fn retryable_storage_error_hint(error: &str) -> Option<&'static str> {
+    if error.contains("(os error 112)") {
+        return Some(
+            "저장 공간이 부족합니다. 다운로드 드라이브의 여유 공간을 확보한 후 재시도하세요.",
+        );
+    }
+    if [
+        "(os error 53)",
+        "(os error 64)",
+        "(os error 67)",
+        "(os error 121)",
+        "(os error 1231)",
+    ]
+    .iter()
+    .any(|code| error.contains(code))
+    {
+        return Some(
+            "네트워크 공유에 연결할 수 없습니다. SMB 경로와 서버 연결을 확인한 후 재시도하세요.",
+        );
+    }
+    if error.contains("(os error 31)") {
+        return Some("저장 장치에 접근할 수 없습니다. 연결과 접근 권한을 확인한 후 재시도하세요.");
+    }
+    None
+}
+
 /// Split rqbit's connected-peer total into seeders and non-seeding peers.
 /// A paused, completed or failed torrent has no valid live connection count.
 fn connected_peer_counts(live: Option<(u32, u32)>, inactive: bool) -> (Option<u32>, Option<u32>) {
@@ -1528,6 +1556,33 @@ mod tests {
         p.output_folder = Some(PathBuf::from("downloads/session"));
         p.error = None;
         assert!(!retryable_failed_transfer(&p));
+    }
+
+    #[test]
+    fn stage28_win32_diskfull_and_smb_fault_messages_keep_retry_available() {
+        for code in [112, 53, 64, 67, 121, 1231, 31] {
+            let progress = TorrentProgress {
+                output_folder: Some(PathBuf::from("downloads/private-test-session")),
+                error: Some(format!("failed to write payload: (os error {code})")),
+                ..Default::default()
+            };
+            assert!(
+                retryable_failed_transfer(&progress),
+                "retry disabled for OS error {code}"
+            );
+            assert!(
+                retryable_storage_error_hint(progress.error.as_deref().unwrap()).is_some(),
+                "missing actionable Korean guidance for OS error {code}"
+            );
+        }
+        assert!(retryable_storage_error_hint("(os error 1120)").is_none());
+        assert!(retryable_storage_error_hint("unknown failure").is_none());
+        assert!(
+            retryable_storage_error_hint("(os error 31)")
+                .unwrap()
+                .contains("저장 장치"),
+            "WSL code 31 must not be mislabeled disk full 112"
+        );
     }
 
     #[test]

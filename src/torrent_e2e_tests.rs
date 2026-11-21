@@ -1213,6 +1213,292 @@ fn stage20_locked_persistence_file_preserves_session_until_retry() {
     drop(tracker);
 }
 
+/// A true librqbit `ManagedTorrentState::Error`, not an NSL watcher stub:
+/// Windows refuses access to the genuine *.bitv resume file during the
+/// asynchronous initial integrity check of a persisted localhost transfer.
+/// After releasing that OS lock, Retry must restart the real torrent from
+/// already verified pieces and complete byte-for-byte.
+#[cfg(windows)]
+#[test]
+#[ignore = "Windows localhost-only real resume-storage I/O failure and recovery"]
+fn stage21_real_librqbit_error_from_locked_resume_storage_recovers() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(client_dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        client_dir
+            .parent()
+            .unwrap()
+            .join(".stage21-enable-test-fastresume"),
+        b"test-only",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let payload = (0..6 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(131).wrapping_add((i / 4096) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage21-storage.bin");
+    std::fs::write(&source, &payload).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 768 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage21 storage recovery",
+            &magnet,
+            PathBuf::from("storage-fault"),
+        )
+        .unwrap();
+    let (_, partial) = wait_for(&engine, Duration::from_secs(30), |id, progress| {
+        id == key && progress.progress_bytes >= 512 * 1024 && !progress.finished
+    });
+    let output = client_dir.join("storage-fault").join("stage21-storage.bin");
+    assert!(output.exists());
+    drop(engine);
+
+    let state_dir = TorrentEngine::session_state_path(&client_dir);
+    let bitv = std::fs::read_dir(&state_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "bitv"))
+        .expect("persistent resume bitfield not present");
+    let started = Instant::now();
+    let exclusive_guard = loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&bitv)
+        {
+            Ok(file) => break file,
+            Err(error) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(12),
+                    "resume file lock timeout: {error}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+
+    let recovered_engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let started = Instant::now();
+    let mut failed = None;
+    while failed.is_none() {
+        let (jobs, events) = recovered_engine.poll();
+        for (id, progress) in jobs {
+            if id.starts_with('r') && progress.error.is_some() {
+                failed = Some((id, progress));
+            }
+        }
+        for event in events {
+            if let EngineNotice::Download {
+                result: Err(error), ..
+            } = event
+            {
+                eprintln!("STAGE21_REAL_LIBRQBIT_ERROR={error}");
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "locked bitfield did not reach true error state"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (restored_key, failure) = failed.unwrap();
+    assert_eq!(failure.state, "오류");
+    assert!(
+        failure
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("loading have_pieces")
+                || error.contains("bitfield")
+                || error.contains("bitv")),
+        "unexpected error type: {failure:?}"
+    );
+    eprintln!(
+        "STAGE21_REAL_LIBRQBIT_ERROR_DETECTED partial={} error={:?}",
+        partial.progress_bytes, failure.error
+    );
+    drop(exclusive_guard);
+
+    recovered_engine.retry(&restored_key);
+    let retry_start = Instant::now();
+    let mut accepted = false;
+    while !accepted {
+        let (_, events) = recovered_engine.poll();
+        for event in events {
+            if let EngineNotice::Command {
+                key: id,
+                action: "retry",
+                result,
+            } = event
+            {
+                if id == restored_key {
+                    result.expect("real librqbit storage fault did not accept retry");
+                    accepted = true;
+                }
+            }
+        }
+        assert!(
+            retry_start.elapsed() < Duration::from_secs(12),
+            "no retry response after releasing storage lock"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, complete) = wait_for(
+        &recovered_engine,
+        Duration::from_secs(50),
+        |id, progress| id == restored_key && progress.finished,
+    );
+    assert_eq!(complete.progress_bytes, payload.len() as u64);
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    recovered_engine.cancel(&restored_key, false);
+    let started = Instant::now();
+    while recovered_engine
+        .poll()
+        .0
+        .iter()
+        .any(|(id, _)| id == &restored_key)
+    {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    eprintln!("STAGE21_REAL_STORAGE_ERROR_RECOVERED bytes={} genuine_error=true retry=true kept_files=true", payload.len());
+    drop(recovered_engine);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// librqbit 9.1.0 silently ignores a failed session.json rename after it has
+/// already removed the torrent from its in-memory session. Force a *real*
+/// Windows rename sharing violation between NSL's preflight and the delete,
+/// then verify that a durable deletion intent prevents any ghost transfer on
+/// the next launch. Payload bytes are never removed during recovery.
+#[cfg(windows)]
+#[test]
+#[ignore = "Windows localhost-only persistence rename race and durable recovery"]
+fn stage21_late_session_json_rename_failure_recovers_without_ghost_or_lost_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let payload = (0..2 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(31).wrapping_add((i / 1024) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage21-rename.bin");
+    std::fs::write(&source, &payload).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage21 persistence race",
+            &magnet,
+            PathBuf::from("json-race"),
+        )
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(30), |id, p| {
+        id == key && p.finished
+    });
+    let path = client_dir.join("json-race").join("stage21-rename.bin");
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    let persistence = TorrentEngine::session_state_path(&client_dir);
+    let db = persistence.join("session.json");
+    let started = Instant::now();
+    // `wait_for` drains completion notices as well as progress. Observe the
+    // persistent paused flag, not a previously consumed completion event.
+    loop {
+        let ready = std::fs::read(&db)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|json| {
+                json["torrents"]
+                    .as_object()
+                    .and_then(|torrents| torrents.values().next())
+                    .and_then(|entry| entry["is_paused"].as_bool())
+            })
+            .unwrap_or(false);
+        if ready {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let before = std::fs::read(&db).unwrap();
+    let before_json: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(before_json["torrents"].as_object().unwrap().len(), 1);
+
+    engine.inject_late_session_json_rename_denial(&key).unwrap();
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    let mut failure_reported = false;
+    while !failure_reported {
+        let (jobs, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = notice
+            {
+                if id == key {
+                    let error = result.expect_err("rqbit silently ignored late JSON rename fault");
+                    assert!(
+                        error.contains("세션 기록 저장에 실패"),
+                        "unexpected error: {error}"
+                    );
+                    failure_reported = true;
+                }
+            }
+        }
+        if failure_reported {
+            assert!(jobs.iter().all(|(id, _)| id != &key));
+        }
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // This is an actual on-disk persistence failure: the serialized torrent
+    // entry is still there and would otherwise return as a ghost on restart.
+    assert_eq!(std::fs::read(&db).unwrap(), before);
+    let pending = removal_journal::pending(&persistence).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    eprintln!(
+        "STAGE21_LATE_JSON_FLUSH_FAULT_CONFIRMED bytes={} persisted_ghost=true journal=true",
+        payload.len()
+    );
+
+    drop(engine);
+    let restored = TorrentEngine::new(client_dir).unwrap();
+    let started = Instant::now();
+    loop {
+        let journal_empty = removal_journal::pending(&persistence).unwrap().is_empty();
+        let disk_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&db).unwrap()).unwrap();
+        let disk_empty = disk_json["torrents"].as_object().unwrap().is_empty();
+        let no_ghost_row = restored.poll().0.is_empty();
+        if journal_empty && disk_empty && no_ghost_row {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "journal recovery did not clear persisted ghost"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    eprintln!("STAGE21_LATE_JSON_FLUSH_RECOVERED restart=true ghost=false journal_cleared=true payload_preserved=true");
+    drop(restored);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
 /// Longer loopback-only transfer with a real seeder interruption. The pause
 /// models a disconnected/unavailable peer without changing any user network
 /// adapters or touching any non-test torrent process or directory.

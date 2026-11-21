@@ -4,6 +4,9 @@ use librqbit::{
     SessionPersistenceConfig, TorrentStatsState,
 };
 
+#[path = "torrent_removal.rs"]
+mod removal_journal;
+
 /// The handle type as re-exported by the crate root is unavailable in 9.1.0;
 /// mirror its definition here.
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
@@ -32,6 +35,16 @@ fn simulated_terminal_faults() -> &'static Mutex<std::collections::HashSet<(Path
 /// torrent and armed for exactly one request. The actual torrent stays live.
 #[cfg(test)]
 fn simulated_delete_failures() -> &'static Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static FAULTS: std::sync::OnceLock<Mutex<std::collections::HashSet<(PathBuf, String)>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// A real Windows rename denial armed *after* the normal persistence
+/// preflight, to reproduce librqbit 9.1.0's silently swallowed JSON flush
+/// failure. No production build can arm this scheduling hook.
+#[cfg(all(test, windows))]
+fn simulated_late_json_locks() -> &'static Mutex<std::collections::HashSet<(PathBuf, String)>> {
     static FAULTS: std::sync::OnceLock<Mutex<std::collections::HashSet<(PathBuf, String)>>> =
         std::sync::OnceLock::new();
     FAULTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
@@ -250,6 +263,13 @@ fn spawn_engine(
             {
                 session_options.dht = None;
                 session_options.disable_local_service_discovery = true;
+                // Stage 21 isolated storage-fault QA: trigger the real
+                // librqbit fastresume bitfield loading path in only a
+                // disposable test folder. Production remains full-check by
+                // default; do not weaken integrity checks for regular users.
+                session_options.fastresume = default_folder.parent().is_some_and(|parent| {
+                    parent.join(".stage21-enable-test-fastresume").is_file()
+                });
                 session_options.listen = Some(librqbit::ListenerOptions {
                     mode: librqbit::ListenerMode::TcpOnly,
                     listen_addr: "127.0.0.1:0".parse()?,
@@ -268,6 +288,61 @@ fn spawn_engine(
                 }
             };
             let _ = ready_tx.send(Ok(()));
+            // Reconcile any deletion that reached rqbit's in-memory removal
+            // but failed to persist session.json (including a crash after
+            // creating its durable intent). The identity check must match
+            // id, info hash AND destination. Never delete payload files here.
+            match removal_journal::pending(&persistence_folder) {
+                Ok(pending) => {
+                    for (intent, path) in pending {
+                        let id = TorrentIdOrHash::Id(intent.id);
+                        let registered = session.get(id);
+                        if let Some(handle) = registered.as_ref() {
+                            if !intent.matches_handle(handle) {
+                                // The old id was reused for a different
+                                // torrent: never remove the new owner's data.
+                                let _ = removal_journal::finish(&path);
+                                continue;
+                            }
+                            let _ = runtime.block_on(session.delete(id, false));
+                        }
+                        let removed = session.get(id).is_none();
+                        match removal_journal::still_persisted(&persistence_folder, &intent) {
+                            Ok(false) if removed => {
+                                let _ = removal_journal::finish(&path);
+                            }
+                            state => {
+                                if let Some(handle) = registered {
+                                    // If recovery still cannot remove the
+                                    // session, do not seed/download a job
+                                    // the user explicitly asked to delete.
+                                    if !removed {
+                                        let _ = runtime.block_on(session.pause(&handle));
+                                    }
+                                }
+                                let detail = match state {
+                                    Err(error) => error,
+                                    _ => "삭제된 토렌트의 세션 기록이 아직 남아 있습니다".into(),
+                                };
+                                let _ = done_tx.send(EngineNotice::Command {
+                                    key: format!("r{}", intent.id),
+                                    action: "remove",
+                                    result: Err(format!(
+                                        "토렌트 세션 복구 정리가 보류됐습니다: {detail}"
+                                    )),
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = done_tx.send(EngineNotice::Command {
+                        key: "session".into(),
+                        action: "remove",
+                        result: Err(format!("토렌트 삭제 복구 기록을 읽지 못했습니다: {error}")),
+                    });
+                }
+            }
             // Torrents restored from the persisted session (a previous run)
             // resume downloading automatically but have no tracked job, so the
             // UI would show an empty download list. Adopt each of them into a
@@ -707,6 +782,17 @@ async fn remove_torrent(
         // retry the same deletion without losing completed pieces.
         return (Err(error), false);
     }
+    let owned_for_intent = handle
+        .clone()
+        .or_else(|| session.get(TorrentIdOrHash::Id(id)));
+    let Some(owned_for_intent) = owned_for_intent else {
+        return (Err("삭제할 토렌트 세션을 찾을 수 없습니다".into()), false);
+    };
+    let (intent, intent_path) = match removal_journal::begin(persistence_folder, &owned_for_intent)
+    {
+        Ok(record) => record,
+        Err(error) => return (Err(error), false),
+    };
     // Fault injection calls the real librqbit delete API with a guaranteed
     // absent identifier. This tests a genuine delete error without ever
     // modifying the live synthetic transfer or its output data.
@@ -722,10 +808,36 @@ async fn remove_torrent(
     };
     #[cfg(not(test))]
     let requested_id = id;
+    // The test-only hook introduces an actual Windows sharing violation
+    // after the preflight, exercising rqbit's swallowed JSON rename error.
+    #[cfg(all(test, windows))]
+    let late_json_guard = if simulated_late_json_locks().lock().is_ok_and(|mut faults| {
+        faults.remove(&(
+            owned_for_intent.output_folder().to_path_buf(),
+            key.to_owned(),
+        ))
+    }) {
+        use std::os::windows::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(persistence_folder.join("session.json"))
+        {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                let _ = removal_journal::finish(&intent_path);
+                return (Err(format!("Stage 21 fault setup failed: {error}")), false);
+            }
+        }
+    } else {
+        None
+    };
     // When delete_files is false the downloaded bytes stay on disk.
     let result = session
         .delete(TorrentIdOrHash::Id(requested_id), delete_files)
         .await;
+    #[cfg(all(test, windows))]
+    drop(late_json_guard);
     // librqbit can remove a torrent from the session before encountering an
     // error in file cleanup. Reconcile against the real session, not merely
     // the delete() result, to prevent a dead row with a stale handle.
@@ -739,6 +851,27 @@ async fn remove_torrent(
             format!("토렌트 제거 실패: {error:#}")
         }
     });
+    if session_removed {
+        match removal_journal::still_persisted(persistence_folder, &intent) {
+            Ok(true) => {
+                result = Err(
+                    "토렌트는 제거됐지만 세션 기록 저장에 실패했습니다. 다음 NSL 실행에서 삭제 기록을 자동 정리합니다".into(),
+                );
+            }
+            Ok(false) => {
+                if let Err(error) = removal_journal::finish(&intent_path) {
+                    result = Err(error);
+                }
+            }
+            Err(error) => {
+                result = Err(format!(
+                    "토렌트는 제거됐지만 세션 저장을 확인하지 못했습니다. 다음 실행에서 복구합니다: {error}"
+                ));
+            }
+        }
+    } else if let Err(error) = removal_journal::finish(&intent_path) {
+        result = Err(format!("토렌트 제거 실패 후 삭제 기록 정리 실패: {error}"));
+    }
     if session_removed && delete_files && result.is_ok() {
         let remaining = delete_paths
             .iter()
@@ -1128,6 +1261,23 @@ impl TorrentEngine {
         simulated_delete_failures()
             .lock()
             .map_err(|_| anyhow::anyhow!("Stage 20 test delete fault map unavailable"))?
+            .insert((output, key.to_owned()));
+        Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    fn inject_late_session_json_rename_denial(&self, key: &str) -> Result<()> {
+        let output = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(key).cloned())
+            .filter(|job| job.output_folder.is_some())
+            .and_then(|job| job.output_folder)
+            .context("Stage 21 late JSON fault requires a managed torrent")?;
+        simulated_late_json_locks()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Stage 21 fault map unavailable"))?
             .insert((output, key.to_owned()));
         Ok(())
     }

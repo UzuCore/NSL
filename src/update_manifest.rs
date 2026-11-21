@@ -69,6 +69,45 @@ fn valid_download_location(base_dir: &Path, folder: &Path, file: &Path) -> bool 
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+/// Refuse stale or untrusted batch records that could resume an unrelated
+/// Title ID, a non-newer update, or a zero-length file after restart.
+fn validate_job_identity(job: &SavedJob) -> Result<()> {
+    anyhow::ensure!(
+        job.title_id.len() == 16 && job.title_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "일괄 작업 기록의 게임 Title ID가 올바르지 않습니다"
+    );
+    let base = u64::from_str_radix(&job.title_id, 16)?;
+    anyhow::ensure!(base & 0x1fff == 0, "기본 게임 Title ID가 아닙니다");
+    anyhow::ensure!(
+        job.name.chars().count() <= 512
+            && job.expected_file_size > 0
+            && job.original_size > 0
+            && !job.engine_key.is_empty()
+            && job.engine_key.len() <= 256,
+        "일괄 작업 기록의 파일 크기 또는 작업 정보가 올바르지 않습니다"
+    );
+    if job.kind == BatchKind::Dlc {
+        let id = job.dlc_id.as_deref().context("DLC 작업 ID가 없습니다")?;
+        let dlc = u64::from_str_radix(id, 16)?;
+        anyhow::ensure!(
+            id.len() == 16
+                && dlc & !0x1fff == base
+                && dlc & 0x1fff >= 0x1000
+                && job.expected_version >= 0,
+            "DLC 작업 기록의 Title ID 또는 버전이 일치하지 않습니다"
+        );
+    } else {
+        anyhow::ensure!(
+            job.dlc_id.is_none()
+                && job.expected_version > 0
+                && job.expected_version > job.installed_version
+                && job.expected_version >= job.latest_version,
+            "업데이트 작업 기록의 Title ID 또는 설치 버전이 올바르지 않습니다"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
     let jobs: Vec<SavedJob> = batch
         .rows
@@ -110,6 +149,7 @@ pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
         "저장할 일괄 업데이트 작업 수 한도 초과"
     );
     for job in &jobs {
+        validate_job_identity(job)?;
         anyhow::ensure!(
             valid_download_location(base_dir, &job.download_folder, &job.download_file),
             "저장할 일괄 다운로드 경로가 안전하지 않습니다"
@@ -169,32 +209,11 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
     );
     let mut rows = Vec::with_capacity(manifest.jobs.len());
     for saved in manifest.jobs {
+        validate_job_identity(&saved)?;
         anyhow::ensure!(
             valid_download_location(base_dir, &saved.download_folder, &saved.download_file),
             "안전하지 않은 일괄 업데이트 다운로드 경로"
         );
-        anyhow::ensure!(
-            saved.title_id.len() == 16 && saved.title_id.bytes().all(|b| b.is_ascii_hexdigit()),
-            "작업 기록의 게임 타이틀 ID가 올바르지 않습니다"
-        );
-        anyhow::ensure!(
-            saved.name.chars().count() <= 512
-                && (saved.expected_version > 0
-                    || (kind == BatchKind::Dlc && saved.expected_version == 0)),
-            "일괄 업데이트 작업 기록 데이터가 올바르지 않습니다"
-        );
-        if kind == BatchKind::Dlc {
-            let id = saved.dlc_id.as_deref().context("DLC 작업 ID가 없습니다")?;
-            let base = u64::from_str_radix(&saved.title_id, 16)?;
-            let dlc = u64::from_str_radix(id, 16)?;
-            anyhow::ensure!(
-                id.len() == 16
-                    && base & 0x1fff == 0
-                    && dlc & !0x1fff == base
-                    && dlc & 0x1fff >= 0x1000,
-                "DLC 작업 기록의 Title ID가 일치하지 않습니다"
-            );
-        }
         let status = if matches!(saved.status, UpdateBatchJobStatus::Verifying) {
             // The worker did not survive exit. A recorded completed transfer
             // is safe to verify/merge again; a partial transfer must wait for
@@ -366,5 +385,49 @@ mod tests {
         )
         .unwrap();
         assert!(load(dir.path()).is_err());
+    }
+
+    #[test]
+    fn stage25_corrupt_batch_identity_and_lengths_fail_closed_without_original_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("original.nsz");
+        std::fs::write(&source, b"stage25 untouched original").unwrap();
+        let example = example_batch(dir.path());
+        save(dir.path(), &example).unwrap();
+        let trusted_bytes = fs::read(manifest_file(dir.path())).unwrap();
+        let baseline: serde_json::Value = serde_json::from_slice(&trusted_bytes).unwrap();
+        let corrupt = [
+            ("title_id", serde_json::json!("0100D2C0115B6800")),
+            ("title_id", serde_json::json!("0100D2C0115B7001")),
+            ("expected_version", serde_json::json!(65536)),
+            ("expected_version", serde_json::json!(0)),
+            ("expected_file_size", serde_json::json!(0)),
+            ("original_size", serde_json::json!(0)),
+            ("engine_key", serde_json::json!("")),
+            ("dlc_id", serde_json::json!("0100D2C0115B7001")),
+        ];
+        for (field, value) in corrupt {
+            let mut entry = baseline.clone();
+            entry["jobs"][0][field] = value;
+            let payload = serde_json::to_vec(&entry).unwrap();
+            fs::write(manifest_file(dir.path()), &payload).unwrap();
+            let error = load(dir.path())
+                .err()
+                .expect("corrupted batch journal must not be restored");
+            assert!(!error.to_string().is_empty());
+            assert_eq!(fs::read(manifest_file(dir.path())).unwrap(), payload);
+            assert_eq!(fs::read(&source).unwrap(), b"stage25 untouched original");
+        }
+        fs::write(manifest_file(dir.path()), &trusted_bytes).unwrap();
+        assert!(load(dir.path()).unwrap().is_some());
+        let mut invalid_save = example_batch(dir.path());
+        invalid_save.rows[0]
+            .job
+            .as_mut()
+            .unwrap()
+            .expected_file_size = 0;
+        assert!(save(dir.path(), &invalid_save).is_err());
+        assert_eq!(fs::read(manifest_file(dir.path())).unwrap(), trusted_bytes);
+        assert_eq!(fs::read(&source).unwrap(), b"stage25 untouched original");
     }
 }

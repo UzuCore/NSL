@@ -9,9 +9,10 @@ use std::path::Path;
 // start one worker per completed torrent: process just one merge at a time.
 const MAX_PARALLEL_UPDATE_MERGES: usize = 1;
 
-/// A single torrent can contain dozens of DLC files. Register it only once
-/// with the union of the selected file indices; librqbit keys a torrent by
-/// its info hash and cannot safely maintain separate only_files handles.
+/// A torrent may contain *multiple games' patches* as well as dozens of DLCs.
+/// Register a single selected-files transfer per infohash for BOTH kinds:
+/// librqbit keys by infohash, not the magnet tracker URL, and cannot safely
+/// host multiple independent only_files handles of the same torrent.
 pub(crate) fn grouped_batch_downloads(batch: &update_batch::UpdateBatch) -> Vec<Vec<usize>> {
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut magnets = HashMap::<String, usize>::new();
@@ -22,22 +23,77 @@ pub(crate) fn grouped_batch_downloads(batch: &update_batch::UpdateBatch) -> Vec<
         let Some(found) = &row.found else {
             continue;
         };
-        if batch.kind == update_batch::BatchKind::Dlc {
-            // Different tracker URLs can refer to the same torrent infohash.
-            // libRQbit keys these by infohash, not by the full magnet string.
-            let identity = found
-                .release
-                .info_hash()
-                .unwrap_or_else(|| found.release.magnet.clone());
-            if let Some(group) = magnets.get(&identity) {
-                groups[*group].push(index);
-                continue;
-            }
-            magnets.insert(identity, groups.len());
+        // Different tracker URLs can refer to the same infohash. Fall back
+        // to the full magnet only when no infohash can be parsed at all.
+        let identity = found
+            .release
+            .info_hash()
+            .unwrap_or_else(|| found.release.magnet.clone());
+        if let Some(group) = magnets.get(&identity) {
+            groups[*group].push(index);
+            continue;
         }
+        magnets.insert(identity, groups.len());
         groups.push(vec![index]);
     }
     groups
+}
+
+/// Guard against conflicting previews for the same torrent. A stale or
+/// untrusted catalog release must not map one selected torrent index to two
+/// paths, sizes or different Title IDs, or assign two indices to one output
+/// filename. Compute exactly once for both download selection and disk budget.
+pub(crate) fn checked_group_selection(
+    batch: &update_batch::UpdateBatch,
+    ready: &[(usize, u64)],
+) -> Result<(Vec<usize>, u64), String> {
+    let mut indices =
+        std::collections::BTreeMap::<usize, (PathBuf, u64, String, Option<String>)>::new();
+    let mut output_paths = HashMap::<PathBuf, usize>::new();
+    for &(row_index, _) in ready {
+        let row = batch
+            .rows
+            .get(row_index)
+            .ok_or_else(|| "일괄 다운로드 행 인덱스가 잘못되었습니다".to_string())?;
+        let found = row
+            .found
+            .as_ref()
+            .ok_or_else(|| "일괄 다운로드 선택 파일의 메타데이터가 없습니다".to_string())?;
+        let file = &found.file;
+        if file.size == 0
+            || !file
+                .path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err("토렌트 파일 크기 또는 경로가 올바르지 않습니다".into());
+        }
+        let identity = (
+            file.path.clone(),
+            file.size,
+            row.title_id.clone(),
+            row.dlc_id.clone(),
+        );
+        if let Some(previous) = indices.get(&file.index) {
+            if previous != &identity {
+                return Err(
+                    "동일 토렌트의 파일 인덱스에 서로 다른 게임 ID·경로·크기가 있습니다".into(),
+                );
+            }
+        } else {
+            if output_paths.insert(file.path.clone(), file.index).is_some() {
+                return Err("다른 토렌트 인덱스가 동일 출력 파일명을 사용합니다".into());
+            }
+            indices.insert(file.index, identity);
+        }
+    }
+    let mut bytes = 0u64;
+    for (_, length, _, _) in indices.values() {
+        bytes = bytes
+            .checked_add(*length)
+            .ok_or_else(|| "토렌트 파일 선택 크기 합계가 계산 범위를 초과했습니다".to_string())?;
+    }
+    Ok((indices.into_keys().collect(), bytes))
 }
 
 /// Persisted torrent runtime keys can be reused after restart. Rebind a
@@ -82,7 +138,7 @@ pub(crate) fn cumulative_dlc_input(
     let mut latest = None;
     for earlier in batch.rows[..index]
         .iter()
-        .filter(|prior| prior.title_id == row.title_id)
+        .filter(|prior| prior.title_id == row.title_id && prior.original_path == row.original_path)
     {
         if let Some(job) = &earlier.job {
             match &job.status {
@@ -748,22 +804,18 @@ impl NslApp {
             if ready.is_empty() {
                 continue;
             }
-            let mut only_files: Vec<usize> = ready
-                .iter()
-                .map(|(index, _)| batch.rows[*index].found.as_ref().unwrap().file.index)
-                .collect();
-            only_files.sort_unstable();
-            only_files.dedup();
-            let requested_bytes = only_files.iter().fold(0u64, |sum, selected| {
-                let bytes = ready
-                    .iter()
-                    .find_map(|(index, _)| {
-                        let file = &batch.rows[*index].found.as_ref().unwrap().file;
-                        (file.index == *selected).then_some(file.size)
-                    })
-                    .unwrap_or(0);
-                sum.saturating_add(bytes)
-            });
+            let (only_files, requested_bytes) = match checked_group_selection(batch, &ready) {
+                Ok(selection) => selection,
+                Err(error) => {
+                    // Reject every row in this torrent rather than partially
+                    // downloading metadata with conflicting file indices.
+                    for (index, _) in ready {
+                        batch.rows[index].failure = Some(error.clone());
+                        failed += 1;
+                    }
+                    continue;
+                }
+            };
             let proposed_reservation = match update_batch::reserve_batch_download_space(
                 available_bytes,
                 reserved_bytes,

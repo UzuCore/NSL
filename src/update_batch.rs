@@ -828,6 +828,66 @@ mod tests {
         }
     }
 
+    /// Verify genuine metadata rather than inferring it from a torrent name.
+    /// The original opt-in NSP is read-only; a private full copy is scanned.
+    #[test]
+    #[ignore = "requires NSL_STAGE25_PATCH_QA and NSL_STAGE25_BASE_ID; 346 MiB private copy"]
+    fn stage25_real_patch_cnmt_rejects_cross_game_and_nonnewer_version() -> Result<()> {
+        use anyhow::Context as _;
+        use sha2::{Digest, Sha256};
+        use std::io::Read as _;
+
+        fn sha(path: &Path) -> Result<[u8; 32]> {
+            let mut hash = Sha256::new();
+            let mut file = std::fs::File::open(path)?;
+            let mut chunk = [0u8; 1024 * 1024];
+            loop {
+                let got = file.read(&mut chunk)?;
+                if got == 0 {
+                    return Ok(hash.finalize().into());
+                }
+                hash.update(&chunk[..got]);
+            }
+        }
+
+        let source = PathBuf::from(
+            std::env::var_os("NSL_STAGE25_PATCH_QA")
+                .context("Stage 25 real QA patch source path not specified")?,
+        );
+        let base = std::env::var("NSL_STAGE25_BASE_ID")?;
+        let source = source.canonicalize()?;
+        let size = std::fs::metadata(&source)?.len();
+        anyhow::ensure!(size > 0 && size < 1024 * 1024 * 1024);
+        let original_hash = sha(&source)?;
+        let sandbox = tempfile::Builder::new()
+            .prefix("stage25-cnmt-qa-")
+            .tempdir_in(source.parent().context("QA source has no parent")?)?;
+        let folder = sandbox.path().join("downloads").join("private-patch");
+        std::fs::create_dir_all(&folder)?;
+        let copy = folder.join("copied-update.nsp");
+        std::fs::copy(&source, &copy)?;
+        anyhow::ensure!(sha(&copy)? == original_hash);
+
+        verify_downloaded_patch(sandbox.path(), &copy, &base, 65_536, 0)?;
+        let other_base = format!("{:016X}", u64::from_str_radix(&base, 16)? ^ 0x2000);
+        anyhow::ensure!(
+            verify_downloaded_patch(sandbox.path(), &copy, &other_base, 65_536, 0).is_err(),
+            "cross-game Title ID unexpectedly passed real CNMT verification"
+        );
+        anyhow::ensure!(
+            verify_downloaded_patch(sandbox.path(), &copy, &base, 131_072, 0).is_err(),
+            "older patch unexpectedly passed a newer-version requirement"
+        );
+        anyhow::ensure!(
+            verify_downloaded_patch(sandbox.path(), &copy, &base, 65_536, 65_536).is_err(),
+            "a non-newer patch passed installed-version validation"
+        );
+        anyhow::ensure!(sha(&copy)? == original_hash);
+        anyhow::ensure!(sha(&source)? == original_hash);
+        println!("STAGE25_REAL_CNMT_PASS source_bytes={size} exact_id=true cross_game_rejected=true old_version_rejected=true source_sha_unchanged=true");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires NSL_DLC_QA_FILE (a read-only DLC NSP or NSZ below 16 MiB)"]
     fn isolated_real_dlc_cnmt_validation_rejects_other_title_ids() -> Result<()> {

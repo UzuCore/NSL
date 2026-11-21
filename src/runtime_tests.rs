@@ -301,6 +301,147 @@ fn two_missing_dlcs_reuse_one_catalog_torrent_preview() {
 }
 
 #[test]
+fn stage25_multi_game_updates_share_one_infohash_and_reserve_unique_files() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut alpha = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    alpha.update_version = 65_536;
+    alpha.latest_version = 196_608;
+    let mut beta = alpha.clone();
+    beta.id += 100;
+    beta.title_id = "0100AABBCCDDE000".into();
+    beta.title_name = "Beta patch".into();
+    let torrent = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567";
+    let catalogs = [
+        catalog::CatalogItem {
+            title: "Alpha + Beta Bundle".into(),
+            title_id: Some(alpha.title_id.clone()),
+            magnet: torrent.into(),
+            ..Default::default()
+        },
+        catalog::CatalogItem {
+            title: "Beta + Alpha Bundle".into(),
+            title_id: Some(beta.title_id.clone()),
+            magnet: format!("{torrent}&tr=http://different-tracker.invalid/announce"),
+            ..Default::default()
+        },
+    ];
+    let mut batch = update_batch::new_update_batch(&[alpha, beta], &catalogs, "");
+    assert_eq!(batch.rows.len(), 2);
+    for (index, row) in batch.rows.iter_mut().enumerate() {
+        row.found = Some(update_batch::UpdateBatchMatch {
+            release: catalogs[index].clone(),
+            file: torrent::TorrentFileEntry {
+                index: if index == 0 { 7 } else { 3 },
+                path: format!(
+                    "Patch [{:016X}][v196608].nsp",
+                    u64::from_str_radix(&row.title_id, 16).unwrap() | 0x800
+                )
+                .into(),
+                size: if index == 0 { 700 } else { 300 },
+            },
+            version: 196_608,
+            torrent_bytes: Arc::new(vec![1, 2, 3]),
+        });
+    }
+    assert_eq!(
+        app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0, 1]],
+        "distinct games in the same BitTorrent infohash must share one transfer"
+    );
+    let selected =
+        app::update_batch::checked_group_selection(&batch, &[(0, 50), (1, 100)]).unwrap();
+    assert_eq!(selected, (vec![3, 7], 1_000));
+    // A malicious second catalog preview may claim the same index for an
+    // unrelated Title ID. Never queue that ambiguous per-torrent selection.
+    batch.rows[1].found.as_mut().unwrap().file.index = 7;
+    assert!(
+        app::update_batch::checked_group_selection(&batch, &[(0, 50), (1, 100)])
+            .unwrap_err()
+            .contains("서로 다른 게임 ID")
+    );
+    // Even different indices may not resolve to the same output filename.
+    batch.rows[1].found.as_mut().unwrap().file.index = 3;
+    let first_path = batch.rows[0].found.as_ref().unwrap().file.path.clone();
+    batch.rows[1].found.as_mut().unwrap().file.path = first_path;
+    assert!(
+        app::update_batch::checked_group_selection(&batch, &[(0, 50), (1, 100)])
+            .unwrap_err()
+            .contains("동일 출력 파일명")
+    );
+}
+
+#[test]
+fn stage25_ten_thousand_catalog_matches_group_in_one_pass() {
+    // Synthetic stress only: never scans E:\\NSW or contacts any torrent
+    // tracker. 10,000 update rows share 500 infohashes, 20 files per torrent.
+    let started = std::time::Instant::now();
+    let metadata = Arc::new(vec![1u8, 2, 3]);
+    let mut rows = Vec::with_capacity(10_000);
+    for i in 0..10_000usize {
+        let base_id = format!("{:016X}", 0x0100_0000_0000_0000u64 + ((i as u64) << 13));
+        rows.push(update_batch::UpdateBatchRow {
+            library_id: i as i64,
+            title_id: base_id.clone(),
+            dlc_id: None,
+            name: format!("Generated {i}"),
+            installed_version: 0,
+            latest_version: 65_536,
+            original_path: PathBuf::from(format!("synthetic-base-{i}.nsz")),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: Some(update_batch::UpdateBatchMatch {
+                release: catalog::CatalogItem {
+                    title: format!("Synthetic batch {i}"),
+                    title_id: Some(base_id),
+                    magnet: format!(
+                        "magnet:?xt=urn:btih:{:040X}&tr=http://127.0.0.1:{}/announce",
+                        i / 20,
+                        10_000 + i
+                    ),
+                    ..Default::default()
+                },
+                file: torrent::TorrentFileEntry {
+                    index: i % 20,
+                    path: format!("selected-{i}.nsp").into(),
+                    size: 1024,
+                },
+                version: 65_536,
+                torrent_bytes: Arc::clone(&metadata),
+            }),
+            checked: true,
+            failure: None,
+            job: None,
+        });
+    }
+    let batch = update_batch::UpdateBatch {
+        kind: update_batch::BatchKind::Update,
+        rows,
+        running: false,
+        cursor: 10_000,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+        preview_cache_bytes: 0,
+    };
+    let groups = app::update_batch::grouped_batch_downloads(&batch);
+    assert_eq!(groups.len(), 500);
+    assert!(groups.iter().all(|group| group.len() == 20));
+    let mut selected = 0usize;
+    for group in groups {
+        let ready = group.iter().map(|&i| (i, 1u64)).collect::<Vec<_>>();
+        let (files, bytes) = app::update_batch::checked_group_selection(&batch, &ready).unwrap();
+        assert_eq!(files.len(), 20);
+        assert_eq!(bytes, 20 * 1024);
+        selected += files.len();
+    }
+    assert_eq!(selected, 10_000);
+    eprintln!("STAGE25_SYNTHETIC_10000_GROUPS_PASS rows=10000 torrents=500 selected_files=10000 elapsed_ms={}", started.elapsed().as_millis());
+}
+
+#[test]
 fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -341,6 +482,24 @@ fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
         app::update_batch::cumulative_dlc_input(&batch, 1),
         Some(Some(prior_output))
     );
+    // Even equal base Title IDs cannot cross cumulative merge chains when
+    // the original files live in different user library directories.
+    let own_path = batch.rows[1].original_path.clone();
+    batch.rows[1].original_path = app.base_dir.join("another-copy-of-same-title.nsz");
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        Some(None),
+        "DLCs for two independent copies of one game must not cross-merge"
+    );
+    batch.rows[0].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Failed("other copy blocked".into());
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        Some(None),
+        "failure of another original copy must not block this merge chain"
+    );
+    batch.rows[1].original_path = own_path;
+    assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
 }
 
 #[test]

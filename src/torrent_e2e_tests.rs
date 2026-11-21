@@ -175,7 +175,8 @@ fn local_file_seeder(
         while !handle.stats().finished {
             assert!(
                 started.elapsed() < Duration::from_secs(15),
-                "generated test seeder did not become ready"
+                "generated test seeder did not become ready: {:?}",
+                handle.stats()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -630,6 +631,206 @@ fn stage24_real_quota_exhaustion_download_retry_exact_bytes() {
     drop(seed_session);
     drop(runtime);
     drop(tracker);
+}
+
+/// A generated multi-file BitTorrent bundle with two different base games'
+/// update filenames. Both must share ONE native selected-files transfer,
+/// neither original game sentinel can be modified, and a third unselected
+/// file must not be downloaded. The bytes are unsigned synthetic fixtures:
+/// their failure to pass a trusted CNMT scan is intentional.
+#[test]
+#[ignore = "generated localhost-only multi-file torrent; no actual game contents"]
+fn stage25_two_games_one_torrent_selected_files_and_originals_preserved() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let temp = tempfile::tempdir()?;
+    let seed_dir = temp.path().join("seed");
+    let bundle = seed_dir.join("stage25-bundle");
+    let app_dir = temp.path().join("app");
+    let source_dir = temp.path().join("source-originals");
+    for dir in [&bundle, &app_dir, &source_dir] {
+        std::fs::create_dir_all(dir)?;
+    }
+    let ids = ["0100D2C0115B6000", "0100AABBCCDDE000"];
+    let mut inputs = Vec::new();
+    for (i, base_id) in ids.iter().enumerate() {
+        let patch_id = u64::from_str_radix(base_id, 16)? | 0x800;
+        let name = format!("Stage25 {i} [{patch_id:016X}][v196608].nsp");
+        let bytes = (0..1024 * 1024)
+            .map(|offset| (offset as u32).wrapping_mul(41 + i as u32) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(bundle.join(&name), &bytes)?;
+        inputs.push((name, bytes));
+    }
+    let unselected_name = "zzz-not-requested [0100D2C0115B6000][v0].dat";
+    std::fs::write(bundle.join(unselected_name), vec![0x5Au8; 1024 * 1024])?;
+    let mut originals = Vec::new();
+    for i in 0..2 {
+        let name = source_dir.join(format!("original-{i}.nsz"));
+        let marker = format!("stage25-original-sentinel-{i}").into_bytes();
+        std::fs::write(&name, &marker)?;
+        originals.push((name, marker));
+    }
+    let (seed_runtime, seed_session, _seed_handle, tracker, magnet) =
+        // librqbit's multi-file create_torrent() publishes paths relative to
+        // the chosen directory, so its seeder output_root must be that same
+        // directory (single-file fixtures use the parent instead).
+        local_file_seeder(&bundle, &bundle, 4 * 1024 * 1024);
+    let mut app = crate::NslApp::with_base_dir(app_dir.clone())?;
+    let engine = app
+        .torrent_engine
+        .as_ref()
+        .context("no private NSL engine")?
+        .clone();
+    let preview_request = engine.preview_files(&magnet)?;
+    let preview = preview_request
+        .receiver
+        .recv_timeout(Duration::from_secs(25))
+        .context("local multi-file preview timed out")?
+        .map_err(anyhow::Error::msg)?;
+    drop(preview_request);
+    assert_eq!(preview.files.len(), 3, "generated bundle must have 3 files");
+    let metadata = Arc::new(preview.torrent_bytes);
+    let mut rows = Vec::new();
+    for (index, ((name, bytes), (original, _))) in inputs.iter().zip(originals.iter()).enumerate() {
+        let file = preview
+            .files
+            .iter()
+            .find(|file| {
+                file.path
+                    .file_name()
+                    .is_some_and(|part| part == name.as_str())
+            })
+            .context("selected update missing from preview")?
+            .clone();
+        assert_eq!(file.size, bytes.len() as u64);
+        rows.push(crate::update_batch::UpdateBatchRow {
+            library_id: 2500 + index as i64,
+            title_id: ids[index].to_string(),
+            dlc_id: None,
+            name: format!("Stage25 game {index}"),
+            installed_version: 65_536,
+            latest_version: 196_608,
+            original_path: original.clone(),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: Some(crate::update_batch::UpdateBatchMatch {
+                release: crate::catalog::CatalogItem {
+                    title: "Stage25 local multi-game bundle".into(),
+                    title_id: Some(ids[index].to_string()),
+                    topic_id: "stage25-only".into(),
+                    magnet: if index == 0 {
+                        magnet.clone()
+                    } else {
+                        format!("{magnet}&tr=http://127.0.0.1:1/unused-tracker")
+                    },
+                    ..Default::default()
+                },
+                file,
+                version: 196_608,
+                torrent_bytes: Arc::clone(&metadata),
+            }),
+            checked: true,
+            failure: None,
+            job: None,
+        });
+    }
+    let batch = crate::update_batch::UpdateBatch {
+        kind: crate::update_batch::BatchKind::Update,
+        rows,
+        running: false,
+        cursor: 2,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+        preview_cache_bytes: 0,
+    };
+    assert_eq!(
+        crate::app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0, 1]]
+    );
+    app.update_batch = Some(batch);
+    app.queue_missing_updates();
+    let queued = app.update_batch.as_ref().unwrap();
+    assert!(app.status.contains("토렌트 1건"), "{}", app.status);
+    let jobs = queued
+        .rows
+        .iter()
+        .map(|row| row.job.as_ref().context("update was not enqueued"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    assert_eq!(jobs[0].key, jobs[1].key);
+    assert_eq!(jobs[0].directory, jobs[1].directory);
+    let key = jobs[0].key.clone();
+    let out_dir = jobs[0].directory.clone();
+    let started = Instant::now();
+    let mut completed_notice = false;
+    while !completed_notice {
+        let (status, notices) = engine.poll();
+        for (id, progress) in status {
+            if id == key {
+                anyhow::ensure!(
+                    progress.error.is_none(),
+                    "download failure: {:?}",
+                    progress.error
+                );
+            }
+        }
+        for notice in notices {
+            if let EngineNotice::Download { key: id, result } = notice {
+                if id == key {
+                    result.map_err(anyhow::Error::msg)?;
+                    app.handle_missing_update_completion(&id, &Ok(()));
+                    completed_notice = true;
+                }
+            }
+        }
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(45),
+            "multi-game torrent timed out"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for (name, bytes) in &inputs {
+        let file = walkdir::WalkDir::new(&out_dir)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_type().is_file() && entry.file_name() == name.as_str())
+            .context("selected file was not downloaded")?;
+        assert_eq!(std::fs::read(file.path())?, *bytes);
+    }
+    // librqbit is allowed to create a zero-filled, length-reserved
+    // placeholder for unselected files. Verify the *payload* remains absent,
+    // rather than treating an empty placeholder as a downloaded third file.
+    let unselected = walkdir::WalkDir::new(&out_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_type().is_file() && entry.file_name() == unselected_name);
+    if let Some(file) = unselected {
+        let actual = std::fs::read(file.path())?;
+        anyhow::ensure!(
+            !actual.contains(&0x5A),
+            "unselected third file unexpectedly contains actual seeded payload bytes"
+        );
+        eprintln!("STAGE25_UNSELECTED_PLACEHOLDER_BYTES={}", actual.len());
+    }
+    for (path, bytes) in &originals {
+        assert_eq!(std::fs::read(path)?, *bytes);
+    }
+    assert!(app
+        .update_batch
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .all(|row| { row.job.as_ref().is_some_and(|job| job.transfer_finished) }));
+    eprintln!("STAGE25_TWO_GAME_TORRENT_PASS selected_files=2 torrent_jobs=1 bytes=2097152 original_sentinels_unchanged=true unselected_payload_absent=true completion_notice=true");
+    drop(app);
+    drop(engine);
+    drop(seed_session);
+    drop(seed_runtime);
+    drop(tracker);
+    Ok(())
 }
 
 /// Opt-in public-network transfer of a small CC BY 3.0 subtitle from the

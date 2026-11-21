@@ -2,6 +2,8 @@
 //! The original game files are never changed by discovery or downloads.
 
 use crate::*;
+use anyhow::Context;
+use std::path::Path;
 
 // Streaming game merges can occupy tens of GiB of scratch disk space. Never
 // start one worker per completed torrent: process just one merge at a time.
@@ -38,6 +40,34 @@ pub(crate) fn grouped_batch_downloads(batch: &update_batch::UpdateBatch) -> Vec<
     groups
 }
 
+/// Persisted torrent runtime keys can be reused after restart. Rebind a
+/// restored job using its dedicated output directory, never a stale `tNN`.
+pub(crate) fn batch_job_progress<'a>(
+    job: &update_batch::UpdateBatchJob,
+    progress: &'a [(String, torrent::TorrentProgress)],
+) -> Option<(&'a String, &'a torrent::TorrentProgress)> {
+    let folder_match = |item: &&(String, torrent::TorrentProgress)| {
+        item.1.output_folder.as_deref() == Some(job.directory.as_path())
+    };
+    if job.recovering_since.is_some() {
+        return progress
+            .iter()
+            .find(folder_match)
+            .map(|(key, value)| (key, value));
+    }
+    progress
+        .iter()
+        .find(|(key, value)| {
+            key == &job.key
+                && value
+                    .output_folder
+                    .as_deref()
+                    .is_none_or(|folder| folder == job.directory.as_path())
+        })
+        .or_else(|| progress.iter().find(folder_match))
+        .map(|(key, value)| (key, value))
+}
+
 /// For DLCs of one base game, finish previously queued packages first and
 /// feed the last published result into the next merge. Otherwise each DLC
 /// would be merged against the original and the final file would lose DLCs.
@@ -63,6 +93,162 @@ pub(crate) fn cumulative_dlc_input(
         }
     }
     Some(latest)
+}
+
+/// Only after the last selected DLC for one game has been merged may its
+/// previous NSL-generated results be retired. First atomically redirect the
+/// crash-recovery journal to the final output, then remove obsolete outputs.
+/// Downloaded packages and the original game are never cleanup candidates.
+///
+/// Paths must exactly match native output_for_dlc() for a job in this batch.
+/// This is deliberately stricter than merely checking the "[NSL DLC]" prefix.
+pub(crate) fn consolidate_finished_dlc_outputs(
+    base_dir: &Path,
+    batch: &mut update_batch::UpdateBatch,
+) -> anyhow::Result<u64> {
+    if batch.kind != update_batch::BatchKind::Dlc || batch.running {
+        return Ok(0);
+    }
+    // Group once. A library can have thousands of DLC rows, so scanning all
+    // rows again for each game would stall the egui frame (quadratic work).
+    let mut groups: HashMap<(String, PathBuf), Vec<usize>> = HashMap::new();
+    for (index, row) in batch.rows.iter().enumerate() {
+        groups
+            .entry((row.title_id.clone(), row.original_path.clone()))
+            .or_default()
+            .push(index);
+    }
+    let mut plans: Vec<(Vec<usize>, PathBuf, Vec<PathBuf>)> = Vec::new();
+    for (identity, members) in groups {
+        let related = members
+            .iter()
+            .map(|index| (*index, &batch.rows[*index]))
+            .collect::<Vec<_>>();
+        if related.iter().any(|(_, row)| {
+            (row.checked && row.found.is_some() && row.job.is_none())
+                || row.job.as_ref().is_some_and(|job| {
+                    !matches!(job.status, update_batch::UpdateBatchJobStatus::Merged(_))
+                })
+        }) {
+            continue;
+        }
+        let completed = related
+            .iter()
+            .filter_map(|(index, row)| row.job.as_ref().map(|job| (*index, *row, job)))
+            .collect::<Vec<_>>();
+        if completed.len() < 2 {
+            continue;
+        }
+        let expected = completed
+            .iter()
+            .map(|(_, row, job)| {
+                update_merge::expected_dlc_output(
+                    &row.original_path,
+                    &row.title_id,
+                    row.dlc_id.as_deref().context("DLC ID가 없는 병합 작업")?,
+                    job.expected_version,
+                )
+            })
+            .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
+        let published = completed
+            .iter()
+            .map(|(_, _, job)| match &job.status {
+                update_batch::UpdateBatchJobStatus::Merged(path) => Ok(path.clone()),
+                _ => anyhow::bail!("완료되지 않은 DLC 병합"),
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            published.iter().all(|path| expected.contains(path)),
+            "병합 결과가 NSL이 생성한 DLC 경로와 일치하지 않아 정리하지 않았습니다"
+        );
+        let final_path = published.last().context("DLC 최종 결과 없음")?.clone();
+        let latest = completed.last().context("DLC 마지막 작업 없음")?;
+        let latest_expected = update_merge::expected_dlc_output(
+            &latest.1.original_path,
+            &latest.1.title_id,
+            latest.1.dlc_id.as_deref().context("최종 DLC ID 누락")?,
+            latest.2.expected_version,
+        )?;
+        anyhow::ensure!(
+            final_path == latest_expected,
+            "최신 DLC 병합 결과가 최종 경로와 일치하지 않습니다"
+        );
+        let retired = published
+            .iter()
+            .filter(|path| **path != final_path)
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if retired.is_empty() {
+            continue;
+        }
+        let original_parent = identity
+            .1
+            .parent()
+            .context("원본 게임 상위 폴더 누락")?
+            .canonicalize()?;
+        for path in std::iter::once(&final_path).chain(retired.iter()) {
+            anyhow::ensure!(
+                path != &identity.1
+                    && path.parent().is_some_and(|parent| {
+                        parent.canonicalize().ok().as_deref() == Some(original_parent.as_path())
+                    }),
+                "원본 게임 폴더 밖의 파일은 정리할 수 없습니다"
+            );
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) => {
+                    anyhow::ensure!(
+                        metadata.file_type().is_file() && metadata.len() > 0,
+                        "DLC 중간 결과가 일반 파일이 아니거나 비어 있습니다"
+                    );
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && path != &final_path => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        plans.push((
+            completed.iter().map(|(index, _, _)| *index).collect(),
+            final_path,
+            retired,
+        ));
+    }
+    if plans.is_empty() {
+        return Ok(0);
+    }
+    let mut rollback = Vec::new();
+    for (indices, final_path, _) in &plans {
+        for &index in indices {
+            let job = batch.rows[index].job.as_mut().context("DLC 작업 누락")?;
+            rollback.push((index, job.status.clone()));
+            job.status = update_batch::UpdateBatchJobStatus::Merged(final_path.clone());
+        }
+    }
+    if let Err(error) = update_manifest::save(base_dir, batch) {
+        for (index, old) in rollback {
+            batch.rows[index].job.as_mut().unwrap().status = old;
+        }
+        return Err(error);
+    }
+    let mut freed = 0u64;
+    for (_, _, retired) in plans {
+        for path in retired {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    // We deliberately do not guess the original size here;
+                    // success is the number of files removed, not bytes.
+                    freed += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => anyhow::bail!(
+                    "완료된 DLC의 이전 병합 파일을 정리하지 못했습니다 (원본 보존): {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    Ok(freed)
 }
 
 /// A completed torrent is rechecked from disk after restart. Never trust a
@@ -268,14 +454,13 @@ impl NslApp {
                 job.status,
                 update_batch::UpdateBatchJobStatus::Queued
                     | update_batch::UpdateBatchJobStatus::Downloading
-            ) {
+            ) || (matches!(job.status, update_batch::UpdateBatchJobStatus::Failed(_))
+                && !job.transfer_finished)
+            {
                 if job.transfer_finished {
                     verify_rows.push(index);
                 } else if let Some((key, progress)) =
-                    self.torrent_progress.iter().find(|(key, progress)| {
-                        key == &job.key
-                            || progress.output_folder.as_deref() == Some(job.directory.as_path())
-                    })
+                    batch_job_progress(job, &self.torrent_progress)
                 {
                     if job.key != *key {
                         job.key = key.clone();
@@ -283,17 +468,30 @@ impl NslApp {
                     }
                     job.recovering_since = None;
                     if let Some(error) = &progress.error {
-                        job.status = update_batch::UpdateBatchJobStatus::Failed(error.clone());
-                        changed = true;
+                        let next = update_batch::UpdateBatchJobStatus::Failed(error.clone());
+                        if job.status != next {
+                            job.status = next;
+                            changed = true;
+                        }
                     } else if progress.finished {
                         verify_rows.push(index);
-                    } else if job.status != update_batch::UpdateBatchJobStatus::Downloading {
-                        job.status = update_batch::UpdateBatchJobStatus::Downloading;
-                        changed = true;
+                    } else {
+                        // A previously failed download can resume. A paused
+                        // torrent is queued, not a failed post-download merge.
+                        let next = if progress.paused {
+                            update_batch::UpdateBatchJobStatus::Queued
+                        } else {
+                            update_batch::UpdateBatchJobStatus::Downloading
+                        };
+                        if job.status != next {
+                            job.status = next;
+                            changed = true;
+                        }
                     }
                 } else if job
                     .recovering_since
                     .is_some_and(|started| started.elapsed() > std::time::Duration::from_secs(60))
+                    && !matches!(job.status, update_batch::UpdateBatchJobStatus::Failed(_))
                 {
                     job.status = update_batch::UpdateBatchJobStatus::Failed(
                         "재시작 후 다운로드 세션을 복구할 수 없습니다. 다운로드 목록을 확인하세요"
@@ -372,6 +570,22 @@ impl NslApp {
             self.persist_batch_jobs();
         }
         if needs_scan {
+            if let Some(batch) = self.update_batch.as_mut() {
+                match consolidate_finished_dlc_outputs(&self.base_dir, batch) {
+                    Ok(cleaned) if cleaned > 0 => {
+                        self.status = format!(
+                            "DLC 누적 병합 완료 · 최종 파일만 유지 · 중간 파일 {cleaned}개 정리"
+                        );
+                        let _ = self.log_sender.send(format!("✅ {}", self.status));
+                    }
+                    Err(error) => {
+                        let _ = self.log_sender.send(format!(
+                            "⚠ DLC 최종 결과는 유지되지만 중간 파일 자동 정리를 완료하지 못했습니다: {error}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             self.batch_rescan_pending = true;
         }
     }

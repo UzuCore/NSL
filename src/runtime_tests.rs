@@ -253,6 +253,385 @@ fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
 }
 
 #[test]
+fn restored_grouped_dlcs_reconnect_by_folder_and_resume_after_download_error() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    game.missing_dlcs = (1..=2)
+        .map(|n| {
+            (
+                format!("{:016X}", base | (0x1000 + n)),
+                format!("Extra DLC {n}"),
+            )
+        })
+        .collect();
+    let mut batch = update_batch::new_dlc_batch(&[game], &[], "");
+    batch.running = false;
+    let folder = app
+        .base_dir
+        .join("downloads")
+        .join("stage15-grouped-recovery");
+    for (index, row) in batch.rows.iter_mut().enumerate() {
+        row.job = Some(update_batch::UpdateBatchJob {
+            key: "t1".into(),
+            directory: folder.clone(),
+            output: folder.join(format!("dlc{index}.nsp")),
+            expected_version: 0,
+            expected_file_size: 1024,
+            original_size: 4096,
+            transfer_finished: false,
+            recovering_since: None,
+            status: update_batch::UpdateBatchJobStatus::Failed("peer disconnected".into()),
+            verifying: None,
+            merge_control: None,
+        });
+    }
+    update_manifest::save(&app.base_dir, &batch).unwrap();
+    app.update_batch = update_manifest::load(&app.base_dir).unwrap();
+    app.torrent_engine = None;
+    app.torrent_progress = vec![
+        (
+            "t1".into(),
+            torrent::TorrentProgress {
+                output_folder: Some(app.base_dir.join("downloads").join("unrelated")),
+                finished: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "r54".into(),
+            torrent::TorrentProgress {
+                output_folder: Some(folder.clone()),
+                state: "downloading".into(),
+                ..Default::default()
+            },
+        ),
+    ];
+    app.poll_missing_update_audit(&ctx);
+    for row in &app.update_batch.as_ref().unwrap().rows {
+        let job = row.job.as_ref().unwrap();
+        assert_eq!(job.key, "r54", "old t1 must not bind unrelated torrent");
+        assert_eq!(job.status, update_batch::UpdateBatchJobStatus::Downloading);
+        assert!(!job.transfer_finished);
+        assert!(job.verifying.is_none());
+    }
+    let restored = update_manifest::load(&app.base_dir).unwrap().unwrap();
+    assert!(restored
+        .rows
+        .iter()
+        .all(|row| row.job.as_ref().unwrap().key == "r54"));
+    app.torrent_progress[1].1.paused = true;
+    app.poll_missing_update_audit(&ctx);
+    assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
+        row.job.as_ref().unwrap().status == update_batch::UpdateBatchJobStatus::Queued
+    }));
+    app.torrent_progress[1].1.paused = false;
+    app.torrent_progress[1].1.error = Some("temporary failure".into());
+    app.poll_missing_update_audit(&ctx);
+    assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
+        matches!(
+            row.job.as_ref().unwrap().status,
+            update_batch::UpdateBatchJobStatus::Failed(_)
+        )
+    }));
+    app.torrent_progress[1].1.error = None;
+    app.poll_missing_update_audit(&ctx);
+    assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
+        row.job.as_ref().unwrap().status == update_batch::UpdateBatchJobStatus::Downloading
+    }));
+    app.handle_missing_update_completion("r54", &Ok(()));
+    assert!(app.update_batch.as_ref().unwrap().rows.iter().all(|row| {
+        let job = row.job.as_ref().unwrap();
+        job.transfer_finished && job.status == update_batch::UpdateBatchJobStatus::Queued
+    }));
+    app.poll_missing_update_audit(&ctx);
+    let jobs = app
+        .update_batch
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .filter_map(|row| row.job.as_ref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        jobs.iter().filter(|job| job.verifying.is_some()).count(),
+        1,
+        "two DLCs must not run simultaneous native merges"
+    );
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.status == update_batch::UpdateBatchJobStatus::Queued)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fully_merged_dlc_chain_preserves_only_final_file_and_crash_safe_journal() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    game.missing_dlcs = (1..=4)
+        .map(|n| (format!("{:016X}", base | (0x1000 + n)), format!("DLC {n}")))
+        .collect();
+    let mut batch = update_batch::new_dlc_batch(&[game], &[], "");
+    assert_eq!(batch.rows.len(), 4);
+    batch.running = false;
+    let original = app.base_dir.join("original.nsz");
+    let unrelated = app.base_dir.join("user-owned.nsz");
+    std::fs::write(&original, b"Original game is never deleted").unwrap();
+    std::fs::write(&unrelated, b"User file is never deleted").unwrap();
+    let folder = app.base_dir.join("downloads").join("stage15-merge-final");
+    let mut published = Vec::new();
+    for (index, row) in batch.rows.iter_mut().enumerate() {
+        row.original_path = original.clone();
+        if index == 3 {
+            row.checked = false;
+            continue;
+        }
+        let path = update_merge::expected_dlc_output(
+            &original,
+            &row.title_id,
+            row.dlc_id.as_deref().unwrap(),
+            0,
+        )
+        .unwrap();
+        std::fs::write(&path, vec![(index + 1) as u8; 128]).unwrap();
+        published.push(path.clone());
+        row.job = Some(update_batch::UpdateBatchJob {
+            key: format!("t{index}"),
+            directory: folder.clone(),
+            output: folder.join(format!("dlc{index}.nsp")),
+            expected_version: 0,
+            expected_file_size: 1024,
+            original_size: 100,
+            transfer_finished: true,
+            recovering_since: None,
+            status: update_batch::UpdateBatchJobStatus::Merged(path),
+            verifying: None,
+            merge_control: None,
+        });
+    }
+
+    // Even one unresolved selected DLC prevents cleanup of the preceding
+    // successful outputs, which may still be required as restart inputs.
+    batch.rows[2].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Failed("retry later".into());
+    assert_eq!(
+        app::update_batch::consolidate_finished_dlc_outputs(&app.base_dir, &mut batch).unwrap(),
+        0
+    );
+    assert!(published.iter().all(|path| path.is_file()));
+    batch.rows[2].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Merged(published[2].clone());
+
+    // A forged path from a persisted journal must never authorize removal of
+    // a user-owned file with an unrelated name.
+    batch.rows[0].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Merged(unrelated.clone());
+    assert!(
+        app::update_batch::consolidate_finished_dlc_outputs(&app.base_dir, &mut batch).is_err()
+    );
+    assert!(unrelated.is_file() && published.iter().all(|path| path.is_file()));
+    batch.rows[0].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Merged(published[0].clone());
+
+    // A durable journal is mandatory before destructive cleanup. Simulate a
+    // journal write failure; statuses and all data must roll back unchanged.
+    let journal = app.base_dir.join("batch-updates.json");
+    std::fs::create_dir(&journal).unwrap();
+    assert!(
+        app::update_batch::consolidate_finished_dlc_outputs(&app.base_dir, &mut batch).is_err()
+    );
+    assert!(published.iter().all(|path| path.is_file()));
+    assert_eq!(
+        batch.rows[0].job.as_ref().unwrap().status,
+        update_batch::UpdateBatchJobStatus::Merged(published[0].clone())
+    );
+    std::fs::remove_dir(&journal).unwrap();
+
+    assert_eq!(
+        app::update_batch::consolidate_finished_dlc_outputs(&app.base_dir, &mut batch).unwrap(),
+        2,
+        "only NSL-owned intermediate results may be removed"
+    );
+    assert!(!published[0].exists() && !published[1].exists());
+    assert!(published[2].is_file() && original.is_file() && unrelated.is_file());
+    let restored = update_manifest::load(&app.base_dir).unwrap().unwrap();
+    for row in restored.rows {
+        assert_eq!(
+            row.job.unwrap().status,
+            update_batch::UpdateBatchJobStatus::Merged(published[2].clone())
+        );
+    }
+    assert_eq!(
+        app::update_batch::consolidate_finished_dlc_outputs(&app.base_dir, &mut batch).unwrap(),
+        0,
+        "cleanup must be idempotent"
+    );
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 3),
+        Some(Some(published[2].clone())),
+        "new DLC additions must continue from the retained final result"
+    );
+}
+
+/// Opt-in end-to-end handoff with independently verified real game content.
+/// The network transfer itself is simulated by placing the authorized NSP in
+/// an isolated download directory and delivering the actual completion event.
+/// The production crash journal, patch verification and merge worker run.
+#[test]
+#[ignore = "requires read-only E:\\NSL_QA_20261120\\small real game fixtures"]
+fn isolated_real_finished_transfer_restart_runs_native_nsz_merge() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::Digest;
+    use std::io::Read;
+    use std::path::Path;
+    fn sha256(path: &Path) -> anyhow::Result<[u8; 32]> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = sha2::Sha256::new();
+        let mut bytes = [0u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut bytes)?;
+            if count == 0 {
+                return Ok(hasher.finalize().into());
+            }
+            hasher.update(&bytes[..count]);
+        }
+    }
+    let fixtures = PathBuf::from("E:\\NSL_QA_20261120\\small");
+    let qa_root = PathBuf::from("E:\\NSL_QA_20261120");
+    let base_source = fixtures.join("base.nsz");
+    let patch_source = fixtures.join("patch.nsp");
+    anyhow::ensure!(base_source.is_file() && patch_source.is_file());
+    let private = tempfile::Builder::new()
+        .prefix("stage15-batch-e2e-")
+        .tempdir_in(&qa_root)?;
+    let base = private.path().join("private_base.nsz");
+    std::fs::copy(&base_source, &base)?;
+    let base_hash = sha256(&base)?;
+    anyhow::ensure!(base_hash == sha256(&base_source)?);
+    let (mut app, _app_tmp) = seeded_app();
+    app.torrent_engine = None;
+    let folder = app
+        .base_dir
+        .join("downloads")
+        .join("stage15-real-downloaded");
+    std::fs::create_dir_all(&folder)?;
+    let downloaded = folder.join("real_patch.nsp");
+    std::fs::copy(&patch_source, &downloaded)?;
+    let patch_hash = sha256(&downloaded)?;
+    anyhow::ensure!(patch_hash == sha256(&patch_source)?);
+    let base_id = "0100F7301AAB6000".to_string();
+    let wanted = 65536;
+    let batch = update_batch::UpdateBatch {
+        kind: update_batch::BatchKind::Update,
+        rows: vec![update_batch::UpdateBatchRow {
+            library_id: 1,
+            title_id: base_id.clone(),
+            dlc_id: None,
+            name: "Horror Tale 2 isolated Stage 15".into(),
+            installed_version: 0,
+            latest_version: wanted,
+            original_path: base.clone(),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: None,
+            checked: true,
+            failure: None,
+            job: Some(update_batch::UpdateBatchJob {
+                key: "t-local-finished".into(),
+                directory: folder,
+                output: downloaded.clone(),
+                expected_version: wanted,
+                expected_file_size: std::fs::metadata(&downloaded)?.len(),
+                original_size: std::fs::metadata(&base)?.len(),
+                transfer_finished: false,
+                recovering_since: None,
+                status: update_batch::UpdateBatchJobStatus::Queued,
+                verifying: None,
+                merge_control: None,
+            }),
+        }],
+        running: false,
+        cursor: 1,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+    };
+    app.update_batch = Some(batch);
+    // Actual NSL completion handler persists "all bytes transferred".
+    app.handle_missing_update_completion("t-local-finished", &Ok(()));
+    let saved = update_manifest::load(&app.base_dir)?.context("missing completion journal")?;
+    anyhow::ensure!(saved.rows[0].job.as_ref().unwrap().transfer_finished);
+    // Simulate a crash/restart after the transfer, before the native worker.
+    app.update_batch = Some(saved);
+    let ctx = egui::Context::default();
+    let started = std::time::Instant::now();
+    let output = loop {
+        app.poll_missing_update_audit(&ctx);
+        let job = app.update_batch.as_ref().unwrap().rows[0]
+            .job
+            .as_ref()
+            .unwrap();
+        match &job.status {
+            update_batch::UpdateBatchJobStatus::Merged(path) => break path.clone(),
+            update_batch::UpdateBatchJobStatus::Failed(reason) => {
+                anyhow::bail!("Stage 15 actual merge failed: {reason}")
+            }
+            _ => {
+                anyhow::ensure!(
+                    started.elapsed() < std::time::Duration::from_secs(240),
+                    "Stage 15 real batch merge timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+    anyhow::ensure!(output.is_file() && output.parent() == base.parent());
+    anyhow::ensure!(output
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nsz")));
+    let keys = scanner::prod_keys().context("Stage 15 read-only prod.keys missing")?;
+    let metadata_work = private.path().join("metadata");
+    std::fs::create_dir(&metadata_work)?;
+    let (_entries, cnmts, _legacy) = nsrp_core::ops::cnmt::discover_game_metadata(
+        &output,
+        &metadata_work,
+        &private.path().join("external-tool-disabled.exe"),
+        &keys,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    anyhow::ensure!(cnmts.iter().any(|item| {
+        item.meta_type == nsrp_core::ops::cnmt::ContentMetaType::Base && item.title_id == base_id
+    }));
+    anyhow::ensure!(cnmts.iter().any(|item| {
+        item.meta_type == nsrp_core::ops::cnmt::ContentMetaType::Update
+            && item.title_id == "0100F7301AAB6800"
+            && item.version >= wanted as u32
+    }));
+    anyhow::ensure!(sha256(&base)? == base_hash && sha256(&downloaded)? == patch_hash);
+    let journal = update_manifest::load(&app.base_dir)?.context("missing final journal")?;
+    anyhow::ensure!(
+        journal.rows[0].job.as_ref().unwrap().status
+            == update_batch::UpdateBatchJobStatus::Merged(output.clone())
+    );
+    println!(
+        "STAGE15_OFFLINE_BATCH_E2E_PASS native_nsz={} bytes={} cnmts={} transfer_complete_journal_recovered=true sources_unchanged=true elapsed_seconds={:.2}",
+        output.display(),
+        std::fs::metadata(&output)?.len(),
+        cnmts.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+#[test]
 fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merge() {
     let (mut app, dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);

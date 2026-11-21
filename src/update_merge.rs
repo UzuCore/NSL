@@ -158,6 +158,18 @@ fn output_for_dlc(
     ))
 }
 
+/// Exact output identity for a native DLC merge. Safe batch cleanup must
+/// validate every candidate against this complete ID/version/extension path,
+/// never a filename prefix alone.
+pub(crate) fn expected_dlc_output(
+    original: &Path,
+    base_id: &str,
+    dlc_id: &str,
+    version: i64,
+) -> Result<PathBuf> {
+    Ok(output_for_dlc(original, base_id, dlc_id, version)?.0)
+}
+
 fn validate_dlc_cnmts(
     cnmts: &[CnmtInfo],
     base_id: &str,

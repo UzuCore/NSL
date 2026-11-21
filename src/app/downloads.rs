@@ -11,7 +11,25 @@ impl NslApp {
         progress: &torrent::TorrentProgress,
     ) {
         let is_done = progress.finished || progress.error.is_some();
-        if !is_done {
+        if torrent::retryable_failed_transfer(progress) {
+            let retry = ui.add_enabled(
+                self.torrent_engine.is_some(),
+                egui::Button::new("재시도").small(),
+            );
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new(("nsl_test_download_retry_button", key)),
+                    retry.rect,
+                );
+            });
+            if retry.clicked() {
+                if let Some(engine) = &self.torrent_engine {
+                    engine.retry(key);
+                    self.status = "다운로드 재연결 요청됨".into();
+                }
+            }
+        } else if !is_done {
             if progress.paused {
                 if ui.small_button("재개").clicked() {
                     if let Some(engine) = &self.torrent_engine {

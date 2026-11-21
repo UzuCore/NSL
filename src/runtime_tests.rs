@@ -2104,6 +2104,57 @@ fn download_delete_button_opens_dialog_for_all_states_and_respects_file_choice()
 }
 
 #[test]
+fn failed_download_retry_button_requires_a_resumable_torrent_session() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "DOWNLOADS".into();
+    app.torrent_engine = None; // UI-only verification, never start a transfer.
+    app.torrent_progress = vec![
+        (
+            "retry-file".into(),
+            torrent::TorrentProgress {
+                name: "Interrupted download".into(),
+                error: Some("connection failed".into()),
+                output_folder: Some(PathBuf::from("downloads/isolated")),
+                ..Default::default()
+            },
+        ),
+        (
+            "retry-metadata".into(),
+            torrent::TorrentProgress {
+                name: "Metadata unavailable".into(),
+                error: Some("metadata timed out".into()),
+                ..Default::default()
+            },
+        ),
+    ];
+    draw_card_test_frames(&ctx, &mut app, 3);
+    let (retry, delete, no_session_retry) = ctx.data_mut(|data| {
+        (
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_download_retry_button",
+                "retry-file",
+            ))),
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_download_delete_button",
+                "retry-file",
+            ))),
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "nsl_test_download_retry_button",
+                "retry-metadata",
+            ))),
+        )
+    });
+    let retry = retry.expect("failed transfer must offer a bounded retry");
+    assert!(!retry.intersects(delete.expect("delete remains available")));
+    assert!(
+        no_session_retry.is_none(),
+        "missing metadata has no resumable torrent"
+    );
+}
+
+#[test]
 fn loaded_grid_icon_and_store_cover_are_clickable_whole_card_targets() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -2617,6 +2668,17 @@ fn torrent_preview_failure_disconnect_and_escape_clear_busy_status() {
             .iter()
             .any(|view| view.label == "토렌트 파일 목록 확인"));
         assert!(canceled_flag.load(Ordering::Relaxed));
+        let retry = ctx.data_mut(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_torrent_preview_retry_button"))
+                .expect("metadata error must provide an in-dialog retry action")
+        });
+        click_cell(&ctx, &mut app, retry.center(), 1456.0, 900.0);
+        let dialog = app.catalog_torrent_dialog.as_ref().unwrap();
+        assert!(
+            dialog.request.is_none(),
+            "no engine must not create a pending request"
+        );
+        assert!(dialog.error.as_ref().is_some_and(|s| s.contains("엔진")));
         send_escape_to_app(&mut app, &ctx);
         assert!(app.catalog_torrent_dialog.is_none());
         assert_eq!(app.status, "토렌트 파일 선택 취소됨");
@@ -2742,6 +2804,46 @@ fn real_catalog_title_db_metadata_matches_read_only_and_is_bounded() {
         details.len(),
         elapsed.as_secs_f64()
     );
+}
+
+#[test]
+#[ignore = "read-only 7k+ local catalog performance QA; no network or game access"]
+fn stage18_real_catalog_store_filter_and_lazy_paint_latency() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let catalog = catalog::load(root).expect("existing real catalog cache");
+    assert!(catalog.items.len() > 5_000);
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    app.folder_filter = "CATALOG".into();
+    app.torrent_engine = None;
+    app.catalog_state = catalog;
+    app.catalog_title_metadata_loaded = true;
+    app.catalog_title_load_result = None;
+    app.catalog_genre_filter = "all".into();
+    app.catalog_format_filter = "all".into();
+    app.catalog_language_filter = "all".into();
+    for query in ["", "mario", "zelda", "no_matching_game_9f83"] {
+        app.catalog_search = query.into();
+        app.catalog_search_committed = query.into();
+        app.catalog_search_pending = None;
+        app.catalog_search_cache = None;
+        let filter_start = std::time::Instant::now();
+        app.refresh_catalog_matches(&ctx);
+        let filter_elapsed = filter_start.elapsed();
+        assert!(app.catalog_matching_indices.len() <= app.catalog_state.items.len());
+        let paint_start = std::time::Instant::now();
+        draw_card_test_frames_at(&ctx, &mut app, 2, 1456.0, 900.0);
+        let paint_elapsed = paint_start.elapsed();
+        eprintln!(
+            "STAGE18_CATALOG_PERF rows={} query={:?} matches={} filter_ms={:.3} paint_2_frames_ms={:.3}",
+            app.catalog_state.items.len(),
+            query,
+            app.catalog_matching_indices.len(),
+            filter_elapsed.as_secs_f64() * 1000.0,
+            paint_elapsed.as_secs_f64() * 1000.0,
+        );
+    }
 }
 
 #[test]

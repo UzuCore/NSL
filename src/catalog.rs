@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     io::Read,
@@ -47,7 +48,9 @@ impl CatalogItem {
     /// library's own grouping, so an update entry matches the base game.
     pub fn base_title_id(&self) -> Option<String> {
         let raw = self.title_id.as_deref()?.trim();
-        if raw.is_empty() {
+        // Parsing u64 alone accepts short values and overlong leading-zero
+        // identifiers, which could accidentally match an unrelated game.
+        if raw.len() != 16 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
         let value = u64::from_str_radix(raw, 16).ok()?;
@@ -88,10 +91,21 @@ fn agent(timeout: Duration) -> ureq::Agent {
 }
 
 fn safe_http_etag(value: &str) -> bool {
+    let opaque = value.strip_prefix("W/").unwrap_or(value);
+    let Some(opaque) = opaque.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+        return false;
+    };
     value.len() <= 200
-        && (value.starts_with('"') || value.starts_with("W/\""))
-        && value.ends_with('"')
-        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+        && opaque
+            .bytes()
+            .all(|byte| byte == 0x21 || (0x23..=0x7e).contains(&byte))
+}
+
+/// Bind the validator to the exact snapshot, including its source URL. Older
+/// caches remain readable, but cannot send an ETag until refreshed once.
+fn snapshot_digest(source_url: &str, items: &[CatalogItem], etag: Option<&str>) -> Result<String> {
+    let payload = serde_json::to_vec(&(source_url, items, etag))?;
+    Ok(format!("{:x}", Sha256::digest(payload)))
 }
 
 fn cached_not_modified(
@@ -134,23 +148,33 @@ pub fn download_with_progress(
         .and_then(|state| state.etag.as_deref())
         .filter(|value| safe_http_etag(value))
         .map(str::to_owned);
-    let mut request = agent(Duration::from_secs(120))
-        .get(source_url)
-        .set("User-Agent", "NSL");
-    if let Some(etag) = &validator {
-        request = request.set("If-None-Match", etag);
-    }
-    let response = match request.call() {
-        // ureq 2.x treats a normal 304 as an Ok 3xx response.
-        Ok(response) if response.status() == 304 => {
-            anyhow::ensure!(validator.is_some(), "검증되지 않은 카탈로그 304 응답입니다");
-            return cached_not_modified(cached, progress);
+    let mut retry_unconditional = false;
+    let response = loop {
+        let use_validator = !retry_unconditional && validator.is_some();
+        let mut request = agent(Duration::from_secs(120))
+            .get(source_url)
+            .set("User-Agent", "NSL");
+        if use_validator {
+            request = request.set("If-None-Match", validator.as_deref().unwrap_or_default());
         }
-        Ok(response) => response,
-        Err(ureq::Error::Status(304, _)) if validator.is_some() => {
-            return cached_not_modified(cached, progress);
+        let response = request.call();
+        // ureq 2.x can surface HTTP 304 either as a normal response or as
+        // Error::Status. The cache may have been damaged while in flight.
+        let not_modified = matches!(&response, Ok(r) if r.status() == 304)
+            || matches!(&response, Err(ureq::Error::Status(304, _)));
+        if not_modified {
+            anyhow::ensure!(use_validator, "검증되지 않은 카탈로그 304 응답입니다");
+            if let Some(latest) = load(base_dir).filter(|state| {
+                state.source_url == source_url && state.etag.as_deref() == validator.as_deref()
+            }) {
+                return cached_not_modified(Some(latest), progress);
+            }
+            // Exactly one unconditional recovery attempt. Never rewrite or
+            // present an invalid snapshot as "already up to date".
+            retry_unconditional = true;
+            continue;
         }
-        Err(error) => return Err(error).context("카탈로그 다운로드 실패"),
+        break response.context("카탈로그 다운로드 실패")?;
     };
     let etag = response
         .header("ETag")
@@ -202,6 +226,7 @@ pub fn save(base_dir: &Path, state: &CatalogState) -> Result<()> {
         source_url: &state.source_url,
         items: &state.items,
         etag: state.etag.as_deref(),
+        snapshot_sha256: snapshot_digest(&state.source_url, &state.items, state.etag.as_deref())?,
     };
     crate::database::atomic_write(&path, &serde_json::to_vec(&payload)?)?;
     Ok(())
@@ -213,6 +238,7 @@ struct CatalogBorrowed<'a> {
     items: &'a [CatalogItem],
     #[serde(skip_serializing_if = "Option::is_none")]
     etag: Option<&'a str>,
+    snapshot_sha256: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -223,11 +249,24 @@ struct CatalogFile {
     items: Vec<CatalogItem>,
     #[serde(default)]
     etag: Option<String>,
+    #[serde(default)]
+    snapshot_sha256: Option<String>,
 }
 
 pub fn load(base_dir: &Path) -> Option<CatalogState> {
     let bytes = fs::read(catalog_path(base_dir)).ok()?;
     let payload: CatalogFile = serde_json::from_slice(&bytes).ok()?;
+    let verified = match payload.snapshot_sha256.as_deref() {
+        Some(expected) => {
+            snapshot_digest(&payload.source_url, &payload.items, payload.etag.as_deref())
+                .ok()?
+                .eq_ignore_ascii_case(expected)
+        }
+        None => false,
+    };
+    if payload.snapshot_sha256.is_some() && !verified {
+        return None;
+    }
     Some(CatalogState {
         items: payload
             .items
@@ -238,7 +277,9 @@ pub fn load(base_dir: &Path) -> Option<CatalogState> {
         updated_at: fs::metadata(catalog_path(base_dir))
             .and_then(|m| m.modified())
             .ok(),
-        etag: payload.etag.filter(|value| safe_http_etag(value)),
+        etag: payload
+            .etag
+            .filter(|value| verified && safe_http_etag(value)),
         not_modified: false,
     })
 }
@@ -380,6 +421,21 @@ mod tests {
     }
 
     #[test]
+    fn catalog_ids_must_be_exactly_16_hex_digits_before_folding() {
+        let item = |id: &str| CatalogItem {
+            title_id: Some(id.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            item("0100D2C0115B6800").base_title_id().as_deref(),
+            Some("0100D2C0115B6000")
+        );
+        assert!(item("100D2C0115B6800").base_title_id().is_none());
+        assert!(item("00100D2C0115B6800").base_title_id().is_none());
+        assert!(item("0100D2C0115B68G0").base_title_id().is_none());
+    }
+
+    #[test]
     fn catalog_round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let state = CatalogState {
@@ -402,6 +458,50 @@ mod tests {
         assert_eq!(loaded.source_url, DEFAULT_CATALOG_URL);
         assert_eq!(loaded.etag.as_deref(), Some("\"sample-etag\""));
         assert!(!loaded.not_modified);
+    }
+
+    #[test]
+    fn damaged_snapshot_is_not_usable_as_a_valid_conditional_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = CatalogState {
+            items: vec![CatalogItem {
+                title: "Original".into(),
+                magnet: "magnet:?xt=urn:btih:ABCD".into(),
+                ..Default::default()
+            }],
+            source_url: DEFAULT_CATALOG_URL.into(),
+            etag: Some("\"safe-etag\"".into()),
+            ..Default::default()
+        };
+        save(dir.path(), &state).unwrap();
+        assert!(load(dir.path()).unwrap().etag.is_some());
+        let file = catalog_path(dir.path());
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        json["items"][0]["title"] = "Tampered".into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(load(dir.path()).is_none());
+        json["items"][0]["title"] = "Original".into();
+        json["source_url"] = "https://other.invalid/catalog.json".into();
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn old_cache_without_digest_remains_readable_but_cannot_send_etag() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("titledb")).unwrap();
+        fs::write(
+            catalog_path(dir.path()),
+            r#"{"source_url":"https://example.org/catalog.json","etag":"\"old\"","items":[{"title":"Legacy","magnet":"magnet:?xt=urn:btih:ABCD"}]}"#,
+        )
+        .unwrap();
+        let state = load(dir.path()).expect("legacy snapshot remains visible");
+        assert_eq!(state.items[0].title, "Legacy");
+        assert!(
+            state.etag.is_none(),
+            "legacy snapshots must request fresh data"
+        );
     }
 
     #[test]
@@ -489,12 +589,107 @@ mod tests {
     }
 
     #[test]
+    fn damaged_cache_during_http_304_refetches_without_stale_etag() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let dir = tempfile::tempdir().unwrap();
+        let cache = catalog_path(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/catalog.json", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(12);
+            let mut headers = Vec::new();
+            while headers.len() < 3 && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(error) => panic!("loopback HTTP failure: {error}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut request = [0u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let header = String::from_utf8_lossy(&request[..count]).to_ascii_lowercase();
+                let conditional = header.contains("if-none-match: \"etag-1\"");
+                let attempt = headers.len();
+                headers.push(conditional);
+                if attempt == 1 {
+                    // The disk snapshot becomes corrupt after NSL has sent
+                    // If-None-Match, but before its 304 reply arrives.
+                    fs::write(&cache, b"corrupt during request").unwrap();
+                    stream.write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    let body = br#"[{"title":"Fresh","magnet":"magnet:?xt=urn:btih:ABCD"}]"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nETag: \"etag-1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    stream.write_all(body).unwrap();
+                }
+            }
+            headers
+        });
+        let first = download_with_progress(dir.path(), &url, None).unwrap();
+        assert_eq!(first.items[0].title, "Fresh");
+        let repaired = download_with_progress(dir.path(), &url, None).unwrap();
+        assert!(!repaired.not_modified);
+        assert_eq!(load(dir.path()).unwrap().items[0].title, "Fresh");
+        assert_eq!(handle.join().unwrap(), vec![false, true, false]);
+    }
+
+    #[test]
+    fn failed_http_refresh_keeps_the_last_verified_snapshot_unchanged() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/catalog.json", listener.local_addr().unwrap());
+        let state = CatalogState {
+            items: vec![CatalogItem {
+                title: "Still valid".into(),
+                magnet: "magnet:?xt=urn:btih:ABCD".into(),
+                ..Default::default()
+            }],
+            source_url: url.clone(),
+            etag: Some("\"keep-me\"".into()),
+            ..Default::default()
+        };
+        save(dir.path(), &state).unwrap();
+        let before = fs::read(catalog_path(dir.path())).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+        assert!(download_with_progress(dir.path(), &url, None).is_err());
+        handle.join().unwrap();
+        assert_eq!(fs::read(catalog_path(dir.path())).unwrap(), before);
+        let preserved = load(dir.path()).expect("previous verified catalog must survive");
+        assert_eq!(preserved.items[0].title, "Still valid");
+        assert_eq!(preserved.etag.as_deref(), Some("\"keep-me\""));
+    }
+
+    #[test]
     fn unsafe_http_etags_are_not_persisted_or_sent() {
         assert!(safe_http_etag("\"abc\""));
         assert!(safe_http_etag("W/\"abc\""));
         assert!(!safe_http_etag("abc"));
         assert!(!safe_http_etag("\"bad\r\nInjection: 1\""));
         assert!(!safe_http_etag(&format!("\"{}\"", "z".repeat(256))));
+        assert!(safe_http_etag("\"\""));
+        assert!(!safe_http_etag("\"abc\"extra\""));
+        assert!(!safe_http_etag("W/\"abc\"extra\""));
+        assert!(!safe_http_etag("\"nested\"quote\""));
     }
 
     #[test]
@@ -504,6 +699,48 @@ mod tests {
                 .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "A");
+    }
+
+    #[test]
+    #[ignore = "requires external HTTPS; catalog metadata only, no game/payload downloads"]
+    fn stage18_live_catalog_id_and_duplicate_release_audit() -> Result<()> {
+        use std::collections::{HashMap, HashSet};
+        let isolated = tempfile::tempdir()?;
+        let start = std::time::Instant::now();
+        let catalog = download_with_progress(isolated.path(), DEFAULT_CATALOG_URL, None)?;
+        let mut per_base = HashMap::<String, usize>::new();
+        let mut btih = HashSet::new();
+        let mut duplicate_hashes = 0_usize;
+        let mut missing_ids = 0_usize;
+        let mut invalid_ids = 0_usize;
+        for item in &catalog.items {
+            match item.base_title_id() {
+                Some(base) => *per_base.entry(base).or_default() += 1,
+                None if item.title_id.is_none() => missing_ids += 1,
+                None => invalid_ids += 1,
+            }
+            if let Some(hash) = item.info_hash().filter(|hash| {
+                hash.len() == 40 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                if !btih.insert(hash) {
+                    duplicate_hashes += 1;
+                }
+            }
+        }
+        let many_release_games = per_base.values().filter(|count| **count > 3).count();
+        let maximum_releases = per_base.values().copied().max().unwrap_or(0);
+        anyhow::ensure!(
+            catalog.items.len() > 1_000,
+            "real catalog unexpectedly small"
+        );
+        anyhow::ensure!(per_base.len() > 1_000, "real title ID grouping failed");
+        eprintln!(
+            "STAGE18_CATALOG_AUDIT rows={} unique_base_ids={} unique_btih={} repeated_btih={} missing_ids={} invalid_ids={} groups_over_3={} max_releases={} elapsed_s={:.3}",
+            catalog.items.len(), per_base.len(), btih.len(), duplicate_hashes,
+            missing_ids, invalid_ids, many_release_games, maximum_releases,
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(())
     }
 
     #[test]

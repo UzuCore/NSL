@@ -39,6 +39,10 @@ pub struct TorrentProgress {
     pub error: Option<String>,
 }
 
+pub(crate) fn retryable_failed_transfer(progress: &TorrentProgress) -> bool {
+    progress.error.is_some() && !progress.finished && progress.output_folder.is_some()
+}
+
 /// Split rqbit's connected-peer total into seeders and non-seeding peers.
 /// A paused, completed or failed torrent has no valid live connection count.
 fn connected_peer_counts(live: Option<(u32, u32)>, inactive: bool) -> (Option<u32>, Option<u32>) {
@@ -156,6 +160,8 @@ pub enum EngineCommand {
     Pause(String),
     /// Resume a previously paused torrent.
     Resume(String),
+    /// Retry a terminal transfer error using its existing persisted torrent.
+    Retry(String),
     /// Remove a torrent from the session. The flag controls whether the
     /// downloaded files are deleted along with it.
     Cancel(String, bool),
@@ -347,6 +353,22 @@ fn spawn_engine(
                                 result,
                             })
                         }
+                        EngineCommand::Retry(key) => {
+                            let result = retry_failed_torrent(
+                                session,
+                                key.clone(),
+                                progress,
+                                cancels,
+                                handles,
+                                done_tx.clone(),
+                            )
+                            .await;
+                            Some(EngineNotice::Command {
+                                key,
+                                action: "retry",
+                                result,
+                            })
+                        }
                         EngineCommand::Cancel(key, delete_files) => {
                             // Signal the watch loop first so it exits; then
                             // drop the torrent from the session. The persisted
@@ -409,6 +431,83 @@ async fn pause_torrent(
     outcome.map_err(|e| format!("토렌트 상태 변경 실패: {e:#}"))
 }
 
+/// A failed transfer has no watch task anymore: merely unpausing its session
+/// handle would leave the UI stuck on an old error forever. Reserve the key
+/// before awaiting so repeated retry clicks cannot start multiple watchers.
+async fn retry_failed_torrent(
+    session: Arc<Session>,
+    key: String,
+    progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
+    cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
+    done_tx: mpsc::Sender<EngineNotice>,
+) -> Result<(), String> {
+    let failed = progress.lock().ok().and_then(|map| map.get(&key).cloned());
+    if !failed.is_some_and(|row| retryable_failed_transfer(&row)) {
+        return Err(
+            "실패한 전송 기록이 없습니다. 메타데이터 실패라면 스토어에서 다시 선택하세요".into(),
+        );
+    }
+    let handle = handles
+        .lock()
+        .ok()
+        .and_then(|map| map.get(&key).cloned())
+        .ok_or_else(|| "복구할 토렌트 세션을 찾을 수 없습니다".to_owned())?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut active = cancels
+            .lock()
+            .map_err(|_| "토렌트 재시도 상태를 잠글 수 없습니다".to_owned())?;
+        if active.contains_key(&key) {
+            return Err("이 다운로드를 이미 복구 중입니다".into());
+        }
+        active.insert(key.clone(), cancel.clone());
+    }
+    if let Err(error) = session.unpause(&handle).await {
+        if let Ok(mut active) = cancels.lock() {
+            active.remove(&key);
+        }
+        return Err(format!("다운로드 재연결 실패: {error:#}"));
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return Err("취소된 다운로드는 재시도할 수 없습니다".into());
+    }
+    let updated = progress.lock().ok().is_some_and(|mut map| {
+        if let Some(row) = map.get_mut(&key) {
+            if row.error.is_some() && !row.finished {
+                row.error = None;
+                row.paused = false;
+                row.state = "재연결 중".into();
+                row.download_speed_bps = 0;
+                return true;
+            }
+        }
+        false
+    });
+    if !updated {
+        if let Ok(mut active) = cancels.lock() {
+            active.remove(&key);
+        }
+        return Err("재시도 중 다운로드 항목이 변경되었습니다".into());
+    }
+    tokio::spawn(async move {
+        if let Some(result) = watch_torrent(
+            session,
+            key.clone(),
+            handle,
+            progress,
+            cancels,
+            handles,
+            cancel,
+        )
+        .await
+        {
+            let _ = done_tx.send(EngineNotice::Download { key, result });
+        }
+    });
+    Ok(())
+}
+
 async fn remove_torrent(
     session: &Arc<Session>,
     handles: &Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
@@ -460,6 +559,7 @@ async fn watch_torrent(
         map.insert(key.clone(), cancel.clone());
     }
     let name = handle.name().unwrap_or_default();
+    let mut no_peers_since: Option<std::time::Instant> = None;
     loop {
         if cancel.load(Ordering::Relaxed) {
             // Cancel semantics: the entry disappears from the list; downloaded
@@ -492,6 +592,22 @@ async fn watch_torrent(
             }),
             paused || stats.finished || stats.error.is_some(),
         );
+        // Zero *connected* peers does not prove zero available seeds in the
+        // swarm. Show an informational state only after sustained inactivity.
+        let no_live_connections = !paused
+            && !stats.finished
+            && stats.error.is_none()
+            && stats.total_bytes > stats.progress_bytes
+            && live_speed_bps == 0
+            && active_seeders == Some(0)
+            && active_peers == Some(0);
+        if no_live_connections {
+            no_peers_since.get_or_insert_with(std::time::Instant::now);
+        } else {
+            no_peers_since = None;
+        }
+        let prolonged_wait =
+            no_peers_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(15));
         let update = TorrentProgress {
             name: name.to_owned(),
             output_folder: Some(handle.output_folder().to_path_buf()),
@@ -506,6 +622,9 @@ async fn watch_torrent(
             } else {
                 match stats.state {
                     TorrentStatsState::Initializing { .. } => "초기화".into(),
+                    TorrentStatsState::Live if prolonged_wait => {
+                        "연결된 시더·피어 없음 · 재연결 대기".into()
+                    }
                     TorrentStatsState::Live => "다운로드".into(),
                     TorrentStatsState::Paused => "일시정지".into(),
                     TorrentStatsState::Error => "오류".into(),
@@ -845,6 +964,12 @@ impl TorrentEngine {
         let _ = self.command_tx.send(EngineCommand::Resume(key.to_owned()));
     }
 
+    /// Retry a failed transfer only when its managed torrent still exists.
+    /// Metadata-only failures require a fresh selection from the store.
+    pub fn retry(&self, key: &str) {
+        let _ = self.command_tx.send(EngineCommand::Retry(key.to_owned()));
+    }
+
     /// Ask a running job to stop. The engine removes the torrent from the
     /// session; when `delete_files` is set the downloaded files are deleted
     /// too. The entry disappears from the list either way.
@@ -897,6 +1022,25 @@ mod tests {
         assert_eq!(p.total_bytes, 0);
         assert!(p.error.is_none());
         assert_eq!((p.active_seeders, p.active_peers), (None, None));
+        assert!(!retryable_failed_transfer(&p));
+    }
+
+    #[test]
+    fn retry_requires_a_failed_transfer_with_a_persisted_session() {
+        let mut p = TorrentProgress {
+            output_folder: Some(PathBuf::from("downloads/session")),
+            error: Some("temporary storage error".into()),
+            ..Default::default()
+        };
+        assert!(retryable_failed_transfer(&p));
+        p.finished = true;
+        assert!(!retryable_failed_transfer(&p));
+        p.finished = false;
+        p.output_folder = None;
+        assert!(!retryable_failed_transfer(&p));
+        p.output_folder = Some(PathBuf::from("downloads/session"));
+        p.error = None;
+        assert!(!retryable_failed_transfer(&p));
     }
 
     #[test]

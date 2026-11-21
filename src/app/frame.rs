@@ -2531,6 +2531,7 @@ impl NslApp {
             }
             let mut canceled = false;
             let mut confirmed = false;
+            let mut retry_requested = false;
             let response = show_centered_popup(
                 ctx,
                 "store_select_torrent_files",
@@ -2568,7 +2569,18 @@ impl NslApp {
                             egui::Color32::LIGHT_RED,
                             format!("파일 목록 조회 실패: {error}"),
                         );
-                        ui.label("취소 후 다시 다운로드 버튼을 누르면 재시도할 수 있습니다.");
+                        ui.label("피어 연결·트래커 응답 지연일 수 있습니다. 다시 조회해 보세요.");
+                        let retry = ui.button("파일 목록 다시 조회");
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("nsl_test_torrent_preview_retry_button"),
+                                retry.rect,
+                            );
+                        });
+                        if retry.clicked() {
+                            retry_requested = true;
+                        }
                     } else {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -2621,6 +2633,27 @@ impl NslApp {
             }
             #[cfg(not(test))]
             let _ = response;
+            if retry_requested && !confirmed && !canceled {
+                match self.torrent_engine.as_ref() {
+                    Some(engine) => match engine.preview_files(&dialog.item.magnet) {
+                        Ok(request) => {
+                            dialog.request = Some(request);
+                            dialog.error = None;
+                            dialog.files = None;
+                            self.status = "토렌트 파일 목록 다시 조회 중".into();
+                            ctx.request_repaint();
+                        }
+                        Err(error) => {
+                            dialog.error = Some(error.to_string());
+                            self.status = format!("토렌트 파일 목록 재조회 실패: {error}");
+                        }
+                    },
+                    None => {
+                        dialog.error = Some("토렌트 엔진을 사용할 수 없습니다".into());
+                        self.status = "토렌트 엔진을 사용할 수 없습니다".into();
+                    }
+                }
+            }
             if confirmed {
                 if let Some(files) = dialog.files.take() {
                     self.start_selected_catalog_torrent(&dialog.item, files);

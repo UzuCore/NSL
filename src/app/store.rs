@@ -57,6 +57,10 @@ impl NslApp {
     /// Start a torrent download for one catalog entry into its own sub-folder
     /// under the app's `downloads` directory.
     pub(crate) fn start_catalog_torrent(&mut self, item: &catalog::CatalogItem) {
+        if self.catalog_torrent_dialog.is_some() {
+            self.status = "다운로드 파일 선택 창이 이미 열려 있습니다".into();
+            return;
+        }
         let Some(engine) = self.torrent_engine.clone() else {
             self.status = "토렌트 엔진을 사용할 수 없습니다".into();
             return;

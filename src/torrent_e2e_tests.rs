@@ -1499,6 +1499,298 @@ fn stage21_late_session_json_rename_failure_recovers_without_ghost_or_lost_files
     drop(tracker);
 }
 
+/// Windows LockFileEx blocks writes by other file handles without changing
+/// ACLs or truncating downloaded data. This forces librqbit's actual
+/// FileOps::write_chunk -> pwrite_all -> fatal-errors receiver path, not a
+/// synthetic watcher failure. Unlock, retry, checksum and preserve output.
+#[cfg(windows)]
+#[test]
+#[ignore = "localhost-only real Windows locked payload write / fatal retry E2E"]
+fn stage22_real_librqbit_live_payload_write_failure_recovers() {
+    use fs2::FileExt as _;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let payload = (0..8 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(79).wrapping_add((i / 8192) as u32) as u8)
+        .collect::<Vec<_>>();
+    let seed_file = seed_dir.join("stage22-write.bin");
+    std::fs::write(&seed_file, &payload).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_file, &seed_dir, 768 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage22 real payload fault",
+            &magnet,
+            PathBuf::from("locked-write"),
+        )
+        .unwrap();
+    let (_, partial) = wait_for(&engine, Duration::from_secs(30), |id, progress| {
+        id == key && progress.progress_bytes >= 256 * 1024 && !progress.finished
+    });
+    let output = client_dir.join("locked-write").join("stage22-write.bin");
+    use std::fs::OpenOptions;
+    let guard = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(0x1 | 0x2 | 0x4)
+        .open(&output)
+        .unwrap();
+    guard
+        .try_lock_exclusive()
+        .expect("could not acquire real Windows byte-range write denial");
+    let started = Instant::now();
+    let mut saw_actual_error = None;
+    while saw_actual_error.is_none() {
+        let (jobs, notices) = engine.poll();
+        for (id, job) in jobs {
+            if id == key && job.error.is_some() {
+                saw_actual_error = job.error;
+            }
+        }
+        for notice in notices {
+            if let EngineNotice::Download {
+                key: id,
+                result: Err(error),
+            } = notice
+            {
+                if id == key {
+                    eprintln!("STAGE22_FATAL_WRITE_NOTICE={error}");
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "real Windows byte-range lock did not trigger librqbit's fatal write state"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let message = saw_actual_error.unwrap();
+    eprintln!(
+        "STAGE22_FATAL_WRITE_CONFIRMED partial={} error={message}",
+        partial.progress_bytes
+    );
+    assert!(
+        message.contains("lock")
+            || message.contains("write")
+            || message.contains("Lock")
+            || message.contains("chunk")
+            || message.contains("os error 33"),
+        "unexpected live fatal error: {message}"
+    );
+    fs2::FileExt::unlock(&guard).unwrap();
+    drop(guard);
+
+    engine.retry(&key);
+    let retry_start = Instant::now();
+    let mut accepted = false;
+    while !accepted {
+        let (_, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "retry",
+                result,
+            } = notice
+            {
+                if id == key {
+                    result.expect("live pwrite_all failure was not retryable");
+                    accepted = true;
+                }
+            }
+        }
+        assert!(retry_start.elapsed() < Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, completed) = wait_for(&engine, Duration::from_secs(50), |id, progress| {
+        id == key && progress.finished
+    });
+    assert_eq!(completed.progress_bytes, payload.len() as u64);
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    while engine.poll().0.iter().any(|(id, _)| id == &key) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    eprintln!(
+        "STAGE22_REAL_PWRITE_FATAL_RECOVERED bytes={} retry=true exact_bytes=true payload_preserved=true",
+        payload.len()
+    );
+    drop(engine);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// Treat a durable deletion intent as if the process exited immediately
+/// after journal fsync and before Session::delete. The first run supplies a
+/// mismatched folder to prove unrelated torrents are never removed; the
+/// second run supplies the exact identity and must clear the stale entry.
+#[test]
+#[ignore = "localhost-only simulated journal-before-delete crash boundary"]
+fn stage22_journal_crash_boundary_rejects_wrong_folder_and_recovers_exact_match() {
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..2 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(53).wrapping_add((i / 2048) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage22-crash.bin");
+    std::fs::write(&source, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage22 journal boundary",
+            &magnet,
+            PathBuf::from("retained"),
+        )
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(25), |id, job| {
+        id == key && job.finished
+    });
+    let output = client_dir.join("retained").join("stage22-crash.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    let state = TorrentEngine::session_state_path(&client_dir);
+    let db = state.join("session.json");
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&db).unwrap()).unwrap();
+    let torrents = json["torrents"].as_object().unwrap();
+    assert_eq!(torrents.len(), 1);
+    let (id_string, serialized) = torrents.iter().next().unwrap();
+    let exact = removal_journal::RemovalIntent {
+        id: id_string.parse::<usize>().unwrap(),
+        info_hash: serialized["info_hash"].as_str().unwrap().to_owned(),
+        output_folder: PathBuf::from(serialized["output_folder"].as_str().unwrap()),
+    };
+    assert_eq!(exact.output_folder, client_dir.join("retained"));
+    let unrelated = removal_journal::RemovalIntent {
+        output_folder: client_dir.join("not-this-torrent"),
+        ..exact.clone()
+    };
+    removal_journal::begin_intent(&state, unrelated).unwrap();
+    drop(engine);
+
+    let first_restart = TorrentEngine::new(client_dir.clone()).unwrap();
+    let (restored_key, _) = wait_for(&first_restart, Duration::from_secs(30), |id, job| {
+        id.starts_with('r') && job.finished
+    });
+    assert!(removal_journal::pending(&state).unwrap().is_empty());
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE22_REUSED_ID_HASH_WRONG_FOLDER_GUARD=PASS key={restored_key}");
+
+    // Simulate the precise fsynced-intent-to-crash boundary (without using
+    // a real taskkill, which could interfere with another running process).
+    removal_journal::begin_intent(&state, exact).unwrap();
+    assert_eq!(removal_journal::pending(&state).unwrap().len(), 1);
+    drop(first_restart);
+    let final_restart = TorrentEngine::new(client_dir).unwrap();
+    let started = Instant::now();
+    loop {
+        let no_intents = removal_journal::pending(&state).unwrap().is_empty();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&db).unwrap()).unwrap();
+        let no_session = persisted["torrents"].as_object().unwrap().is_empty();
+        let no_row = final_restart.poll().0.is_empty();
+        if no_intents && no_session && no_row {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "journal crash recovery timed out"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE22_JOURNAL_CRASH_BOUNDARY_RECOVERED bytes={} wrong_folder_protected=true exact_reconciled=true files_preserved=true", data.len());
+    drop(final_restart);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// Two simultaneous remove commands must not both mutate the same journal
+/// and Session::delete. Exactly one succeeds, one safely rejects, output is
+/// unchanged, and the next run has no stale session or pending intent.
+#[test]
+#[ignore = "localhost-only concurrent duplicate torrent removal"]
+fn stage22_duplicate_remove_commands_serialized_without_ghost_or_data_loss() {
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..2 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(97).wrapping_add((i / 2048) as u32) as u8)
+        .collect::<Vec<_>>();
+    let seed = seed_dir.join("stage22-duplicate.bin");
+    std::fs::write(&seed, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage22 duplicate removal",
+            &magnet,
+            PathBuf::from("double"),
+        )
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(25), |id, job| {
+        id == key && job.finished
+    });
+    let output = client_dir.join("double").join("stage22-duplicate.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    engine.cancel(&key, false);
+    engine.cancel(&key, false);
+    let mut success = 0;
+    let mut rejected = 0;
+    let started = Instant::now();
+    while success + rejected < 2 {
+        let (_, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = notice
+            {
+                if id == key {
+                    match result {
+                        Ok(()) => success += 1,
+                        Err(_) => rejected += 1,
+                    }
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "concurrent remove notices missing"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!((success, rejected), (1, 1));
+    assert!(engine.poll().0.iter().all(|(id, _)| id != &key));
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    let state = TorrentEngine::session_state_path(&client_dir);
+    assert!(removal_journal::pending(&state).unwrap().is_empty());
+    drop(engine);
+    let restarted = TorrentEngine::new(client_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(350));
+    assert!(restarted.poll().0.is_empty());
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE22_DUPLICATE_CANCEL_SAFE bytes={} success=1 rejected=1 no_ghost=true payload_preserved=true", data.len());
+    drop(restarted);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
 /// Longer loopback-only transfer with a real seeder interruption. The pause
 /// models a disconnected/unavailable peer without changing any user network
 /// adapters or touching any non-test torrent process or directory.

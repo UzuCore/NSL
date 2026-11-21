@@ -12,7 +12,7 @@ mod removal_journal;
 type ManagedTorrentHandle = Arc<ManagedTorrent>;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -398,6 +398,12 @@ fn spawn_engine(
             // `run_job` must be able to register handles too, so wrap the
             // shared maps once more for the loop below.
             let loop_handles = handles.clone();
+            // Separate cancel commands are dispatched onto the async runtime.
+            // Reserve each underlying torrent identity so two rapid Remove
+            // clicks cannot mutate the same persisted JSON/journal or delete
+            // its output concurrently. Independent torrents stay parallel.
+            let active_removals: Arc<Mutex<HashSet<String>>> =
+                Arc::new(Mutex::new(HashSet::new()));
             while let Ok(command) = command_rx.recv() {
                 let session = session.clone();
                 let progress = progress.clone();
@@ -405,6 +411,7 @@ fn spawn_engine(
                 let handles = loop_handles.clone();
                 let done_tx = done_tx.clone();
                 let persistence_folder = persistence_folder.clone();
+                let active_removals = active_removals.clone();
                 runtime.spawn(async move {
                     let notice = match command {
                         EngineCommand::Add(job) => {
@@ -465,6 +472,22 @@ fn spawn_engine(
                             })
                         }
                         EngineCommand::Cancel(key, delete_files) => {
+                            let reservation = handles
+                                .lock()
+                                .ok()
+                                .and_then(|map| map.get(&key).map(|handle| format!("id:{}", handle.id())))
+                                .unwrap_or_else(|| format!("key:{key}"));
+                            let claimed = active_removals
+                                .lock()
+                                .is_ok_and(|mut ongoing| ongoing.insert(reservation.clone()));
+                            if !claimed {
+                                let _ = done_tx.send(EngineNotice::Command {
+                                    key,
+                                    action: "remove",
+                                    result: Err("이 토렌트는 이미 삭제 처리 중입니다".into()),
+                                });
+                                return;
+                            }
                             // Keep the watcher and its progress visible until
                             // the session actually drops the torrent. A failed
                             // delete (e.g. a stale id) must not strand a
@@ -493,6 +516,9 @@ fn spawn_engine(
                                 if let Ok(mut map) = handles.lock() {
                                     map.remove(&key);
                                 }
+                            }
+                            if let Ok(mut ongoing) = active_removals.lock() {
+                                ongoing.remove(&reservation);
                             }
                             Some(EngineNotice::Command {
                                 key,

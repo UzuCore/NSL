@@ -50,10 +50,21 @@ fn safe_journal_dir(persistence: &Path) -> Result<PathBuf, String> {
             return Err("토렌트 삭제 기록 폴더가 안전하지 않습니다".into());
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&dir).map_err(|e| format!("토렌트 삭제 기록 폴더 생성 실패: {e}"))?;
+            if let Err(error) = fs::create_dir(&dir) {
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(format!("토렌트 삭제 기록 폴더 생성 실패: {error}"));
+                }
+            }
         }
         Err(e) => return Err(format!("토렌트 삭제 기록 폴더 확인 실패: {e}")),
         _ => {}
+    }
+    // Another NSL command or process could create or replace the directory
+    // after the initial stat. Never write an intent through a symlink.
+    let checked = fs::symlink_metadata(&dir)
+        .map_err(|e| format!("토렌트 삭제 기록 폴더 재확인 실패: {e}"))?;
+    if !checked.is_dir() || checked.file_type().is_symlink() {
+        return Err("토렌트 삭제 기록 폴더가 일반 디렉터리가 아닙니다".into());
     }
     Ok(dir)
 }
@@ -69,8 +80,17 @@ pub(super) fn begin(
     persistence: &Path,
     handle: &ManagedTorrent,
 ) -> Result<(RemovalIntent, PathBuf), String> {
+    begin_intent(persistence, RemovalIntent::from_handle(handle))
+}
+
+/// The same crash-durable write operation with an explicit identity; used by
+/// the isolated process-restart test to reproduce an abrupt exit immediately
+/// after the intent reached disk but before librqbit deleted any torrent.
+pub(super) fn begin_intent(
+    persistence: &Path,
+    intent: RemovalIntent,
+) -> Result<(RemovalIntent, PathBuf), String> {
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let intent = RemovalIntent::from_handle(handle);
     let dir = safe_journal_dir(persistence)?;
     let path = intent_path(&dir, &intent);
     if path.exists() {
@@ -123,11 +143,16 @@ pub(super) fn still_persisted(persistence: &Path, intent: &RemovalIntent) -> Res
         .get("torrents")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "토렌트 세션 기록에 torrents 항목이 없습니다".to_string())?;
-    Ok(torrents
-        .get(&intent.id.to_string())
-        .and_then(|value| value.get("info_hash"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|hash| hash.eq_ignore_ascii_case(&intent.info_hash)))
+    Ok(torrents.get(&intent.id.to_string()).is_some_and(|value| {
+        value
+            .get("info_hash")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(&intent.info_hash))
+            && value
+                .get("output_folder")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|folder| Path::new(folder) == intent.output_folder)
+    }))
 }
 
 pub(super) fn finish(path: &Path) -> Result<(), String> {
@@ -194,12 +219,27 @@ mod tests {
         let absent = intent(8, "aabbcc", folder);
         fs::write(
             folder.join("session.json"),
-            br#"{"torrents":{"7":{"info_hash":"aabbcc"},"9":{"info_hash":"ddeeff"}}}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "torrents": {
+                    "7": {"info_hash": "aabbcc", "output_folder": owned.output_folder},
+                    "9": {"info_hash": "ddeeff", "output_folder": folder.join("other")}
+                }
+            }))
+            .unwrap(),
         )
         .unwrap();
         assert!(still_persisted(folder, &owned).unwrap());
         assert!(!still_persisted(folder, &unrelated).unwrap());
         assert!(!still_persisted(folder, &absent).unwrap());
+        let same_id_and_hash_elsewhere = RemovalIntent {
+            id: 7,
+            info_hash: "aabbcc".into(),
+            output_folder: folder.join("unrelated"),
+        };
+        assert!(
+            !still_persisted(folder, &same_id_and_hash_elsewhere).unwrap(),
+            "an unrelated destination with identical ID/hash must not be mistaken for a pending removal"
+        );
         fs::write(folder.join("session.json"), b"invalid json").unwrap();
         assert!(still_persisted(folder, &owned).is_err());
     }
@@ -226,5 +266,37 @@ mod tests {
         finish(&valid_path).unwrap();
         finish(&valid_path).unwrap();
         assert!(pending(folder).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sixteen_concurrent_unique_intents_preserve_every_record_and_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path();
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            let barrier = &barrier;
+            for id in 0..16 {
+                scope.spawn(move || {
+                    barrier.wait();
+                    let record = intent(id, &format!("{id:040x}"), folder);
+                    let (saved, path) = begin_intent(folder, record.clone()).unwrap();
+                    assert_eq!(saved, record);
+                    assert!(path.is_file());
+                });
+            }
+        });
+        let mut records = pending(folder).unwrap();
+        records.sort_by_key(|(intent, _)| intent.id);
+        assert_eq!(records.len(), 16);
+        for (id, (intent, path)) in records.into_iter().enumerate() {
+            assert_eq!(intent.id, id);
+            finish(&path).unwrap();
+        }
+        assert!(pending(folder).unwrap().is_empty());
+        assert!(fs::read_dir(journal_dir(folder)).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_none_or(|ext| ext != "tmp")));
     }
 }

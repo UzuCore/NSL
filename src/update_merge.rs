@@ -19,13 +19,14 @@ use nsrp_core::{
 };
 use std::{
     fs::{self, File},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 const MAX_COMPRESSION_WORKERS: usize = 4;
 const DEFAULT_ZSTD_LEVEL: i32 = 6;
+const MERGE_WORK_MARKER: &str = ".nsl-merge-owner-v1";
 
 mod fast_nsz;
 
@@ -334,6 +335,100 @@ fn is_fast_nsz_candidate(original: &Path, patch: &Path, format: OutputKind) -> b
             })
 }
 
+/// Normal TempDir cleanup cannot run after process termination. Tag each new
+/// private work directory with a destination-specific ownership marker and
+/// hold an OS lock for the entire merge. A later retry may remove only
+/// unlocked, identically tagged workspaces in that same original-game folder.
+fn work_marker_bytes(destination: &Path) -> Result<Vec<u8>> {
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("병합 출력 파일 이름 없음")?;
+    anyhow::ensure!(name.is_ascii() && name.len() <= 200);
+    Ok(format!("NSL-MERGE-WORK-V1\n{name}\n").into_bytes())
+}
+
+fn hold_merge_workspace_lock(work: &Path, destination: &Path) -> Result<Option<File>> {
+    let path = work.join(MERGE_WORK_MARKER);
+    let mut marker = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    if fs2::FileExt::try_lock_exclusive(&marker).is_err() {
+        // Some network/FAT filesystems may not support locks. Preserve their
+        // ability to merge, but do not mark such work as safely reclaimable.
+        drop(marker);
+        fs::remove_file(path)?;
+        return Ok(None);
+    }
+    marker.write_all(&work_marker_bytes(destination)?)?;
+    marker.sync_all()?;
+    Ok(Some(marker))
+}
+
+fn reap_dead_merge_workspaces(parent: &Path, destination: &Path) -> Result<usize> {
+    let expected = work_marker_bytes(destination)?;
+    let mut removed = 0;
+    for entry in fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(".nsl-merge-") || name.len() > 100 {
+            continue;
+        }
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            // A Windows junction is also a reparse point; never descend.
+            if meta.file_attributes() & 0x400 != 0 {
+                continue;
+            }
+        }
+        let marker_path = path.join(MERGE_WORK_MARKER);
+        let Ok(marker_meta) = fs::symlink_metadata(&marker_path) else {
+            continue;
+        };
+        if !marker_meta.file_type().is_file()
+            || marker_meta.file_type().is_symlink()
+            || marker_meta.len() != expected.len() as u64
+        {
+            continue;
+        }
+        let Ok(mut marker) = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker_path)
+        else {
+            continue; // An active worker may hold its marker.
+        };
+        let mut contents = Vec::with_capacity(expected.len());
+        if marker.read_to_end(&mut contents).is_err() || contents != expected {
+            continue;
+        }
+        if fs2::FileExt::try_lock_exclusive(&marker).is_err() {
+            continue; // An active worker owns this exact workspace.
+        }
+        // A unique orphaned temporary directory is never resumed in place.
+        // Release the marker handle before deleting the directory on Windows.
+        drop(marker);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => anyhow::bail!(
+                "이전 병합 작업의 격리된 임시 폴더를 안전하게 정리하지 못했습니다: {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    Ok(removed)
+}
+
 fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     anyhow::ensure!(
         !cancel.load(Ordering::Relaxed),
@@ -457,6 +552,10 @@ fn merge_verified_package_target_controlled(
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
+    // Only a dead, locked-marker-free workspace for this exact destination
+    // may be reclaimed. Do this before the free-space preflight: a crashed
+    // merge may otherwise strand several GiB and block its own safe retry.
+    reap_dead_merge_workspaces(parent, &destination)?;
     // The native NSZ passthrough preserves the original NCZ payloads for
     // both updates and additional DLCs; avoid inflating and recompressing
     // every already-installed DLC on each cumulative merge.
@@ -473,6 +572,7 @@ fn merge_verified_package_target_controlled(
     let work = tempfile::Builder::new()
         .prefix(".nsl-merge-")
         .tempdir_in(parent)?;
+    let _merge_work_lock = hold_merge_workspace_lock(work.path(), &destination)?;
     let disabled_tool = work.path().join("_nsl_external_tool_disabled.exe");
     let cancelled = &control.cancelled;
     control.ensure_running()?;
@@ -790,8 +890,75 @@ mod stage10_wrapper_qa;
 mod stage13_real_dlc_qa;
 
 #[cfg(test)]
+#[path = "update_merge/stage27_real_crash_qa.rs"]
+mod stage27_real_crash_qa;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stage27_orphan_merge_reaper_only_removes_same_destination_and_dead_ownership() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let target = temp
+            .path()
+            .join("[NSL DLC] [0100111122220000][0100111122221001][v0].nsz");
+        let another = temp
+            .path()
+            .join("[NSL DLC] [0100111122220000][0100111122221002][v0].nsz");
+        let original = temp.path().join("original.nsz");
+        let unrelated = temp.path().join("[NSL DLC] valuable.nsz");
+        fs::write(&original, b"original must remain unchanged")?;
+        fs::write(&unrelated, b"unrelated must remain unchanged")?;
+
+        let dead = tempfile::Builder::new()
+            .prefix(".nsl-merge-")
+            .tempdir_in(temp.path())?;
+        let dead_path = dead.path().to_path_buf();
+        let dead_marker = hold_merge_workspace_lock(dead.path(), &target)?;
+        anyhow::ensure!(
+            dead_marker.is_some(),
+            "local filesystem unexpectedly has no file locks"
+        );
+        fs::write(dead.path().join("orphaned.partial"), vec![1u8; 1024])?;
+        // Keep this directory after its owning worker's last handle closes.
+        drop(dead_marker);
+        let _dead_path = dead.keep();
+
+        let live = tempfile::Builder::new()
+            .prefix(".nsl-merge-")
+            .tempdir_in(temp.path())?;
+        let live_marker = hold_merge_workspace_lock(live.path(), &target)?;
+        anyhow::ensure!(live_marker.is_some());
+        fs::write(live.path().join("live.partial"), b"unfinished data")?;
+
+        let other = tempfile::Builder::new()
+            .prefix(".nsl-merge-")
+            .tempdir_in(temp.path())?;
+        let other_path = other.path().to_path_buf();
+        let other_marker = hold_merge_workspace_lock(other.path(), &another)?;
+        anyhow::ensure!(other_marker.is_some());
+        drop(other_marker);
+        let _other_path = other.keep();
+
+        let user_dir = temp.path().join(".nsl-merge-user-files");
+        fs::create_dir(&user_dir)?;
+        fs::write(user_dir.join("important.txt"), b"not an NSL workspace")?;
+        assert_eq!(reap_dead_merge_workspaces(temp.path(), &target)?, 1);
+        assert!(!dead_path.exists());
+        assert!(live.path().join("live.partial").is_file());
+        assert!(other_path.is_dir());
+        assert!(user_dir.join("important.txt").is_file());
+        assert_eq!(fs::read(&original)?, b"original must remain unchanged");
+        assert_eq!(fs::read(&unrelated)?, b"unrelated must remain unchanged");
+        assert_eq!(reap_dead_merge_workspaces(temp.path(), &target)?, 0);
+        drop(live_marker);
+        drop(live);
+        assert_eq!(reap_dead_merge_workspaces(temp.path(), &another)?, 1);
+        assert!(!other_path.exists());
+        Ok(())
+    }
 
     #[test]
     fn output_preserves_the_original_package_kind_and_rejects_path_injection() {

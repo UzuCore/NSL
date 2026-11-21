@@ -1202,6 +1202,110 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
     Ok(())
 }
 
+/// Stage 27: 256 MiB generated on disk in 1 MiB streaming chunks. Only
+/// localhost peers/tracker, isolated QA root; no game data or external DHT.
+/// The test deliberately checks pause, resumed progress and persisted-session
+/// recovery without allocating a 256 MiB in-memory source/expected buffer.
+#[test]
+#[ignore = "opt-in real 256MiB localhost BitTorrent I/O and isolated storage"]
+fn stage27_streamed_256mib_local_torrent_restart_sha256() -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufWriter, Read, Write};
+
+    fn sha(path: &Path) -> anyhow::Result<[u8; 32]> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut block = [0u8; 1024 * 1024];
+        loop {
+            let n = file.read(&mut block)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&block[..n]);
+        }
+        Ok(hash.finalize().into())
+    }
+
+    let root = std::env::var_os("NSL_STAGE27_TORRENT_QA_ROOT")
+        .ok_or_else(|| anyhow::anyhow!("explicit Stage27 isolated torrent QA root required"))?;
+    let root = std::fs::canonicalize(root)?;
+    anyhow::ensure!(std::fs::metadata(&root)?.is_dir());
+    anyhow::ensure!(fs2::available_space(&root)? > 5 * 1024 * 1024 * 1024);
+    let owned = tempfile::Builder::new()
+        .prefix("stage27-streamed-torrent-")
+        .tempdir_in(root)?;
+    let seed_dir = owned.path().join("seed");
+    let client_dir = owned.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir)?;
+    std::fs::create_dir_all(&client_dir)?;
+    let source = seed_dir.join("stage27-256mib.bin");
+    let mut out = BufWriter::with_capacity(2 * 1024 * 1024, std::fs::File::create(&source)?);
+    let mut block = vec![0u8; 1024 * 1024];
+    for chunk in 0..256u32 {
+        for (i, value) in block.iter_mut().enumerate() {
+            *value =
+                ((i as u32).wrapping_mul(29) ^ chunk.wrapping_mul(113) ^ ((i >> 13) as u32)) as u8;
+        }
+        out.write_all(&block)?;
+    }
+    out.flush()?;
+    drop(out);
+    anyhow::ensure!(std::fs::metadata(&source)?.len() == 256 * 1024 * 1024);
+    let source_sha = sha(&source)?;
+    drop(block);
+    let (runtime, seeder, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 16 * 1024 * 1024);
+    let started = Instant::now();
+    let engine = TorrentEngine::new(client_dir.clone())?;
+    let key = engine.start_download(
+        "Stage27 private 256MiB streaming",
+        &magnet,
+        PathBuf::from("selected"),
+    )?;
+    let (_, first) = wait_for(&engine, Duration::from_secs(90), |id, progress| {
+        id == key && progress.progress_bytes >= 16 * 1024 * 1024 && !progress.finished
+    });
+    engine.pause(&key);
+    let (_, paused) = wait_for(&engine, Duration::from_secs(25), |id, progress| {
+        id == key && progress.paused
+    });
+    anyhow::ensure!(paused.progress_bytes >= first.progress_bytes);
+    engine.resume(&key);
+    let (_, resumed) = wait_for(&engine, Duration::from_secs(30), |id, progress| {
+        id == key && !progress.paused && progress.progress_bytes > paused.progress_bytes
+    });
+    anyhow::ensure!(resumed.progress_bytes < 256 * 1024 * 1024);
+    drop(engine);
+    let restored = TorrentEngine::new(client_dir.clone())?;
+    let (key, final_progress) = wait_for(&restored, Duration::from_secs(180), |id, progress| {
+        id.starts_with('r') && progress.finished
+    });
+    anyhow::ensure!(final_progress.progress_bytes == 256 * 1024 * 1024);
+    let output = client_dir.join("selected").join("stage27-256mib.bin");
+    anyhow::ensure!(std::fs::metadata(&output)?.len() == 256 * 1024 * 1024);
+    anyhow::ensure!(
+        sha(&output)? == source_sha,
+        "256MiB transfer SHA-256 changed"
+    );
+    restored.cancel(&key, false);
+    let wait = Instant::now();
+    while restored.poll().0.iter().any(|(job, _)| job == &key) {
+        anyhow::ensure!(wait.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(sha(&output)? == source_sha);
+    println!(
+        "STAGE27_STREAMED_256MIB_PASS bytes={} pause_resume=true session_restarted=true sha256_exact=true no_game_data=true elapsed_s={:.2}",
+        final_progress.progress_bytes,
+        started.elapsed().as_secs_f64()
+    );
+    drop(restored);
+    drop(seeder);
+    drop(runtime);
+    drop(tracker);
+    Ok(())
+}
+
 #[test]
 #[ignore = "localhost-only real torrent transfer with generated data (run explicitly)"]
 fn transfer_pause_restart_resume_delete_preserves_other_files() {

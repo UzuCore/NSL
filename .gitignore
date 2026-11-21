@@ -34,6 +34,9 @@
 # minimal public GitHub build tree. The private local master may already
 # track some of these; the GitHub publication uses a strict allowlist.
 /docs/
+# Handoff reports belong only on the local development workstation.
+# Do not add new handoff documents to GitHub.
+/HANDOFF_*.md
 /scripts/apply-local-release-update.ps1
 /scripts/smoke-release.ps1
 /scripts/test-package-verify.ps1

@@ -1,7 +1,9 @@
 //! Crash-safe batch update journal. Stores file paths and job identities,
 //! never torrent metadata, API keys, downloaded payloads or decrypted NCAs.
 
-use crate::update_batch::{UpdateBatch, UpdateBatchJob, UpdateBatchJobStatus, UpdateBatchRow};
+use crate::update_batch::{
+    BatchKind, UpdateBatch, UpdateBatchJob, UpdateBatchJobStatus, UpdateBatchRow,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -22,8 +24,12 @@ struct Manifest {
 
 #[derive(Serialize, Deserialize)]
 struct SavedJob {
+    #[serde(default)]
+    kind: BatchKind,
     library_id: i64,
     title_id: String,
+    #[serde(default)]
+    dlc_id: Option<String>,
     name: String,
     installed_version: i64,
     latest_version: i64,
@@ -69,8 +75,10 @@ pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
         .iter()
         .filter_map(|row| {
             row.job.as_ref().map(|job| SavedJob {
+                kind: batch.kind,
                 library_id: row.library_id,
                 title_id: row.title_id.clone(),
+                dlc_id: row.dlc_id.clone(),
                 name: row.name.clone(),
                 installed_version: row.installed_version,
                 latest_version: row.latest_version,
@@ -151,6 +159,14 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         manifest.jobs.len() <= MAX_JOBS,
         "일괄 업데이트 작업 기록 수가 너무 많습니다"
     );
+    let kind = manifest
+        .jobs
+        .first()
+        .map_or(BatchKind::Update, |job| job.kind);
+    anyhow::ensure!(
+        manifest.jobs.iter().all(|job| job.kind == kind),
+        "한 작업 기록에서 업데이트와 DLC가 섞여 있습니다"
+    );
     let mut rows = Vec::with_capacity(manifest.jobs.len());
     for saved in manifest.jobs {
         anyhow::ensure!(
@@ -162,9 +178,23 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
             "작업 기록의 게임 타이틀 ID가 올바르지 않습니다"
         );
         anyhow::ensure!(
-            saved.name.chars().count() <= 512 && saved.expected_version > 0,
+            saved.name.chars().count() <= 512
+                && (saved.expected_version > 0
+                    || (kind == BatchKind::Dlc && saved.expected_version == 0)),
             "일괄 업데이트 작업 기록 데이터가 올바르지 않습니다"
         );
+        if kind == BatchKind::Dlc {
+            let id = saved.dlc_id.as_deref().context("DLC 작업 ID가 없습니다")?;
+            let base = u64::from_str_radix(&saved.title_id, 16)?;
+            let dlc = u64::from_str_radix(id, 16)?;
+            anyhow::ensure!(
+                id.len() == 16
+                    && base & 0x1fff == 0
+                    && dlc & !0x1fff == base
+                    && dlc & 0x1fff >= 0x1000,
+                "DLC 작업 기록의 Title ID가 일치하지 않습니다"
+            );
+        }
         let status = if matches!(saved.status, UpdateBatchJobStatus::Verifying) {
             // The worker did not survive exit. A recorded completed transfer
             // is safe to verify/merge again; a partial transfer must wait for
@@ -189,6 +219,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         rows.push(UpdateBatchRow {
             library_id: saved.library_id,
             title_id: saved.title_id,
+            dlc_id: saved.dlc_id,
             name: saved.name,
             installed_version: saved.installed_version,
             latest_version: saved.latest_version,
@@ -204,11 +235,13 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
     }
     let count = rows.len();
     Ok(Some(UpdateBatch {
+        kind,
         rows,
         running: false,
         cursor: count,
         active: None,
         confirm_queue: false,
+        preview_cache: Default::default(),
     }))
 }
 
@@ -220,9 +253,11 @@ mod tests {
     fn example_batch(root: &Path) -> UpdateBatch {
         let folder = root.join("downloads").join("batch-safe-123");
         UpdateBatch {
+            kind: BatchKind::Update,
             rows: vec![UpdateBatchRow {
                 library_id: 42,
                 title_id: "0100D2C0115B6000".into(),
+                dlc_id: None,
                 name: "Game".into(),
                 installed_version: 65536,
                 latest_version: 196608,
@@ -251,6 +286,7 @@ mod tests {
             cursor: 1,
             active: None,
             confirm_queue: false,
+            preview_cache: Default::default(),
         }
     }
 
@@ -276,6 +312,39 @@ mod tests {
         assert!(job.recovering_since.is_some());
         assert!(job.output.ends_with("nested/update.nsz"));
         assert!(!recovered.running);
+    }
+
+    #[test]
+    fn dlc_journal_preserves_id_and_zero_version_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = example_batch(dir.path());
+        batch.kind = BatchKind::Dlc;
+        batch.rows[0].dlc_id = Some("0100D2C0115B7001".into());
+        batch.rows[0].job.as_mut().unwrap().expected_version = 0;
+        save(dir.path(), &batch).unwrap();
+        let restored = load(dir.path()).unwrap().unwrap();
+        assert_eq!(restored.kind, BatchKind::Dlc);
+        assert_eq!(restored.rows[0].dlc_id.as_deref(), Some("0100D2C0115B7001"));
+        assert_eq!(restored.rows[0].job.as_ref().unwrap().expected_version, 0);
+        assert_eq!(
+            restored.rows[0].job.as_ref().unwrap().status,
+            UpdateBatchJobStatus::Queued
+        );
+        assert!(restored.rows[0]
+            .job
+            .as_ref()
+            .unwrap()
+            .merge_control
+            .is_none());
+        let mut corrupt: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifest_file(dir.path())).unwrap()).unwrap();
+        corrupt["jobs"][0]["dlc_id"] = serde_json::json!("0100D2C0115B7002BAD");
+        fs::write(
+            manifest_file(dir.path()),
+            serde_json::to_vec(&corrupt).unwrap(),
+        )
+        .unwrap();
+        assert!(load(dir.path()).is_err());
     }
 
     #[test]

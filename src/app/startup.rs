@@ -250,7 +250,16 @@ impl NslApp {
                 let count = batch.rows.len();
                 app.update_batch = Some(batch);
                 let _ = app.log_sender.send(format!(
-                    "ℹ 일괄 업데이트 작업 {count}개 복원 · 다운로드 상태 재연결 중"
+                    "ℹ {} 작업 {count}개 복원 · 다운로드 상태 재연결 중",
+                    if app
+                        .update_batch
+                        .as_ref()
+                        .is_some_and(|batch| batch.kind == update_batch::BatchKind::Dlc)
+                    {
+                        "일괄 DLC"
+                    } else {
+                        "일괄 업데이트"
+                    }
                 ));
             }
             Ok(None) => {}

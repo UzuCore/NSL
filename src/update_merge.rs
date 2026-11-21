@@ -127,6 +127,81 @@ fn output_for_game(original: &Path, base_id: &str, version: i64) -> Result<(Path
     ))
 }
 
+fn output_for_dlc(
+    original: &Path,
+    base_id: &str,
+    dlc_id: &str,
+    version: i64,
+) -> Result<(PathBuf, OutputKind)> {
+    let base = u64::from_str_radix(base_id, 16)?;
+    let dlc = u64::from_str_radix(dlc_id, 16)?;
+    anyhow::ensure!(
+        base_id.len() == 16
+            && dlc_id.len() == 16
+            && base & 0x1fff == 0
+            && dlc & !0x1fff == base
+            && dlc & 0x1fff >= 0x1000,
+        "기본 게임과 DLC Title ID가 일치하지 않습니다"
+    );
+    anyhow::ensure!(
+        (0..=u32::MAX as i64).contains(&version),
+        "DLC 버전이 올바르지 않습니다"
+    );
+    let kind = OutputKind::from_path(original)?;
+    let parent = original.parent().context("원본 게임의 폴더가 없습니다")?;
+    Ok((
+        parent.join(format!(
+            "[NSL DLC] [{base:016X}][{dlc:016X}][v{version}].{}",
+            kind.extension()
+        )),
+        kind,
+    ))
+}
+
+fn validate_dlc_cnmts(
+    cnmts: &[CnmtInfo],
+    base_id: &str,
+    dlc_id: &str,
+    required_version: i64,
+) -> Result<()> {
+    anyhow::ensure!(
+        cnmts
+            .iter()
+            .any(|c| c.title_id.eq_ignore_ascii_case(base_id)
+                && c.meta_type == ContentMetaType::Base),
+        "병합 결과에 기본 게임 CNMT가 없습니다"
+    );
+    let dlcs = cnmts
+        .iter()
+        .filter(|c| c.title_id.eq_ignore_ascii_case(dlc_id) && c.meta_type == ContentMetaType::Dlc);
+    let selected: Vec<_> = dlcs.collect();
+    anyhow::ensure!(
+        selected.len() == 1 && i64::from(selected[0].version) >= required_version,
+        "병합 결과에서 요청한 DLC Title ID/버전이 확인되지 않습니다"
+    );
+    Ok(())
+}
+
+fn ensure_existing_content_preserved(prior: &[CnmtInfo], final_cnmts: &[CnmtInfo]) -> Result<()> {
+    for entry in prior.iter().filter(|entry| {
+        matches!(
+            entry.meta_type,
+            ContentMetaType::Update | ContentMetaType::Dlc
+        )
+    }) {
+        anyhow::ensure!(
+            final_cnmts.iter().any(|present| {
+                present.title_id.eq_ignore_ascii_case(&entry.title_id)
+                    && present.meta_type == entry.meta_type
+                    && present.version >= entry.version
+            }),
+            "DLC 병합에서 기존 콘텐츠가 누락됨: {}",
+            entry.title_id
+        );
+    }
+    Ok(())
+}
+
 fn validate_selected_cnmts(cnmts: &[CnmtInfo], base_id: &str, required_version: i64) -> Result<()> {
     let base = u64::from_str_radix(base_id, 16)? & !0x1fff;
     let base = format!("{base:016X}");
@@ -319,6 +394,7 @@ pub(crate) fn merge_verified_package(
     )
 }
 
+#[cfg(test)]
 fn merge_verified_package_controlled(
     original: &Path,
     patch: &Path,
@@ -326,9 +402,31 @@ fn merge_verified_package_controlled(
     wanted_version: i64,
     control: &MergeControl,
 ) -> Result<PathBuf> {
+    merge_verified_package_target_controlled(
+        original,
+        patch,
+        base_id,
+        None,
+        wanted_version,
+        control,
+    )
+}
+
+fn merge_verified_package_target_controlled(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    dlc_id: Option<&str>,
+    wanted_version: i64,
+    control: &MergeControl,
+) -> Result<PathBuf> {
     control.ensure_running()?;
-    control.stage("업데이트 병합 사전 검증");
-    let (destination, format) = output_for_game(original, base_id, wanted_version)?;
+    control.stage("콘텐츠 병합 사전 검증");
+    let (destination, format) = if let Some(id) = dlc_id {
+        output_for_dlc(original, base_id, id, wanted_version)?
+    } else {
+        output_for_game(original, base_id, wanted_version)?
+    };
     let ext = patch.extension().and_then(|e| e.to_str()).unwrap_or("");
     anyhow::ensure!(
         ext.eq_ignore_ascii_case("nsp") || ext.eq_ignore_ascii_case("nsz"),
@@ -347,7 +445,7 @@ fn merge_verified_package_controlled(
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
-    let fast_candidate = is_fast_nsz_candidate(original, patch, format);
+    let fast_candidate = dlc_id.is_none() && is_fast_nsz_candidate(original, patch, format);
     if fast_candidate {
         check_fast_nsz_space(parent, original, patch)?;
     } else {
@@ -529,7 +627,21 @@ fn merge_verified_package_controlled(
         cancelled,
     )
     .context("병합 출력 CNMT 검증 실패")?;
-    validate_selected_cnmts(&verified, base_id, wanted_version)?;
+    if let Some(dlc_id) = dlc_id {
+        validate_dlc_cnmts(&verified, base_id, dlc_id, wanted_version)?;
+        // A second DLC must not replace the first one or discard an installed
+        // update. Verify every prior update/DLC CNMT is still represented.
+        let (_, prior, _) = cnmt::discover_game_metadata(
+            original,
+            &work.path().join("verify_original"),
+            &disabled_tool,
+            &prod_keys,
+            cancelled,
+        )?;
+        ensure_existing_content_preserved(&prior, &verified)?;
+    } else {
+        validate_selected_cnmts(&verified, base_id, wanted_version)?;
+    }
     control.ensure_running()?;
     control.stage("병합 파일 안전 게시");
     publish_without_overwrite(&produced, &destination, cancelled)?;
@@ -561,8 +673,34 @@ pub(crate) fn merge_or_recover_existing_controlled(
     version: i64,
     control: &MergeControl,
 ) -> Result<PathBuf> {
+    merge_or_recover_target_controlled(original, patch, base_id, None, version, control)
+}
+
+pub(crate) fn merge_or_recover_dlc_controlled(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    dlc_id: &str,
+    version: i64,
+    control: &MergeControl,
+) -> Result<PathBuf> {
+    merge_or_recover_target_controlled(original, patch, base_id, Some(dlc_id), version, control)
+}
+
+fn merge_or_recover_target_controlled(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    dlc_id: Option<&str>,
+    version: i64,
+    control: &MergeControl,
+) -> Result<PathBuf> {
     control.ensure_running()?;
-    let (destination, format) = output_for_game(original, base_id, version)?;
+    let (destination, format) = if let Some(id) = dlc_id {
+        output_for_dlc(original, base_id, id, version)?
+    } else {
+        output_for_game(original, base_id, version)?
+    };
     if destination.is_file() {
         control.stage("기존 병합 결과 CNMT 재검증");
         let keys = scanner::prod_keys().context("병합 결과 검증을 위한 prod.keys 없음")?;
@@ -576,8 +714,21 @@ pub(crate) fn merge_or_recover_existing_controlled(
             &control.cancelled,
         )?;
         control.ensure_running()?;
-        validate_selected_cnmts(&cnmts, base_id, version)
-            .context("동일 이름의 기존 파일이 요청한 병합 결과와 일치하지 않습니다")?;
+        if let Some(id) = dlc_id {
+            validate_dlc_cnmts(&cnmts, base_id, id, version)
+                .context("동일 이름의 기존 파일이 요청한 DLC와 다릅니다")?;
+            let (_, prior, _) = cnmt::discover_game_metadata(
+                original,
+                &work.path().join("verify_original"),
+                &disabled_tool,
+                &keys,
+                &control.cancelled,
+            )?;
+            ensure_existing_content_preserved(&prior, &cnmts)?;
+        } else {
+            validate_selected_cnmts(&cnmts, base_id, version)
+                .context("동일 이름의 기존 파일이 요청한 병합 결과와 일치하지 않습니다")?;
+        }
         match format {
             OutputKind::Nsz => {
                 let index = nsrp_core::formats::pfs0::Pfs0Index::parse(&destination)?;
@@ -603,7 +754,7 @@ pub(crate) fn merge_or_recover_existing_controlled(
         control.ensure_running()?;
         return Ok(destination);
     }
-    merge_verified_package_controlled(original, patch, base_id, version, control)
+    merge_verified_package_target_controlled(original, patch, base_id, dlc_id, version, control)
 }
 
 #[cfg(test)]
@@ -724,5 +875,65 @@ mod tests {
             validate_selected_cnmts(&[base, patch.clone(), patch], "0100D2C0115B6000", 196608)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dlc_outputs_have_distinct_names_and_require_exact_title_ids() {
+        let input = Path::new("C:/Games/Base.NSZ");
+        let (one, kind) = output_for_dlc(input, "0100D2C0115B6000", "0100D2C0115B7001", 0).unwrap();
+        let (two, _) = output_for_dlc(input, "0100D2C0115B6000", "0100D2C0115B7002", 0).unwrap();
+        assert_eq!(kind, OutputKind::Nsz);
+        assert_ne!(one, two);
+        assert_eq!(one.parent(), input.parent());
+        assert!(output_for_dlc(input, "0100D2C0115B6000", "0100D2C0115B6800", 0).is_err());
+        assert!(output_for_dlc(input, "0100D2C0115B6000", "0100D2C0115B7001", -1).is_err());
+        let entry = |id: &str, kind| CnmtInfo {
+            cnmt_nca_name: format!("{id}.cnmt.nca"),
+            title_id: id.into(),
+            version: 0,
+            meta_type: kind,
+            required_system_version: 0,
+            contents: vec![],
+            raw: vec![],
+        };
+        let base = entry("0100D2C0115B6000", ContentMetaType::Base);
+        let dlc = entry("0100D2C0115B7001", ContentMetaType::Dlc);
+        assert!(validate_dlc_cnmts(
+            &[base.clone(), dlc.clone()],
+            &base.title_id,
+            &dlc.title_id,
+            0
+        )
+        .is_ok());
+        assert!(validate_dlc_cnmts(
+            &[base.clone(), dlc.clone()],
+            &base.title_id,
+            "0100D2C0115B7002",
+            0
+        )
+        .is_err());
+        assert!(validate_dlc_cnmts(
+            &[base.clone(), dlc.clone()],
+            &base.title_id,
+            &dlc.title_id,
+            1
+        )
+        .is_err());
+        assert!(validate_dlc_cnmts(
+            &[base, dlc.clone(), dlc.clone()],
+            "0100D2C0115B6000",
+            &dlc.title_id,
+            0
+        )
+        .is_err());
+        let prior = vec![
+            entry("0100D2C0115B6800", ContentMetaType::Update),
+            entry("0100D2C0115B7002", ContentMetaType::Dlc),
+        ];
+        let only_new_dlc = vec![dlc.clone()];
+        assert!(ensure_existing_content_preserved(&prior, &only_new_dlc).is_err());
+        let mut cumulative = prior.clone();
+        cumulative.push(dlc);
+        assert!(ensure_existing_content_preserved(&prior, &cumulative).is_ok());
     }
 }

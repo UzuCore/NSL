@@ -135,7 +135,11 @@ impl NslApp {
             if batch.running {
                 let (done, total) = batch.progress();
                 views.push(ProgressView::counted(
-                    "미보유 업데이트 카탈로그 대조",
+                    if batch.kind == update_batch::BatchKind::Dlc {
+                        "미보유 DLC 카탈로그 대조"
+                    } else {
+                        "미보유 업데이트 카탈로그 대조"
+                    },
                     done as u64,
                     total as u64,
                 ));
@@ -147,7 +151,13 @@ impl NslApp {
                 .find(|job| job.verifying.is_some())
             {
                 views.push(job.merge_control.as_ref().map_or_else(
-                    || ProgressView::busy("업데이트 병합·재압축"),
+                    || {
+                        ProgressView::busy(if batch.kind == update_batch::BatchKind::Dlc {
+                            "DLC 병합·재압축"
+                        } else {
+                            "업데이트 병합·재압축"
+                        })
+                    },
                     |control| {
                         if control.is_cancel_requested() {
                             ProgressView::busy("업데이트 병합 중단 처리 중")
@@ -1402,7 +1412,7 @@ impl NslApp {
                     });
                     return;
                 }
-                if self.folder_filter == "MISSING_UPDATES" {
+                if matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS") {
                     ui.scope(|ui| {
                         outlined_action_style(ui);
                         self.missing_update_toolbar(ui);
@@ -1722,8 +1732,11 @@ impl NslApp {
                                                             ));
                                                         });
                                                     });
-                                                if self.folder_filter == "MISSING_UPDATES"
-                                                    && self.update_batch.as_ref().and_then(|batch| batch.by_id(row.id)).is_some_and(|audit| audit.found.is_some())
+                                                if matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
+                                                    && self.update_batch.as_ref().is_some_and(|batch| {
+                                                        (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
+                                                            && batch.has_match_for_game(row.id)
+                                                    })
                                                 {
                                                     if let Some(icon) = &icon_response {
                                                         let indicator = egui::Rect::from_min_size(
@@ -1734,7 +1747,7 @@ impl NslApp {
                                                         ui.painter().text(
                                                             indicator.center(),
                                                             egui::Align2::CENTER_CENTER,
-                                                            "↑",
+                                                            if self.folder_filter == "MISSING_DLCS" { "+" } else { "↑" },
                                                             egui::FontId::proportional(14.0),
                                                             egui::Color32::WHITE,
                                                         );
@@ -1920,11 +1933,13 @@ impl NslApp {
                                 .show(ui, |ui| {
                                 for row in &page_items[row_range] {
                                     let selected = self.selected == Some(row.id);
-                                    let update_audited = self.folder_filter == "MISSING_UPDATES"
-                                        && self.update_batch.as_ref().and_then(|batch| batch.by_id(row.id))
-                                            .is_some_and(|entry| entry.found.is_some());
+                                    let update_audited = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
+                                        && self.update_batch.as_ref().is_some_and(|batch| {
+                                            (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
+                                                && batch.has_match_for_game(row.id)
+                                        });
                                     let display_name: std::borrow::Cow<'_, str> = if update_audited {
-                                        std::borrow::Cow::Owned(format!("↑  {}", row.title_name))
+                                        std::borrow::Cow::Owned(format!("{}  {}", if self.folder_filter == "MISSING_DLCS" { "+" } else { "↑" }, row.title_name))
                                     } else {
                                         std::borrow::Cow::Borrowed(row.title_name.as_str())
                                     };

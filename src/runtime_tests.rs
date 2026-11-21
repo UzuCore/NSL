@@ -68,6 +68,191 @@ fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
 }
 
 #[test]
+fn missing_dlc_audit_is_per_title_id_and_toolbar_is_visible() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut base = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let number = u64::from_str_radix(&base.title_id, 16).unwrap() & !0x1fff;
+    let id1 = format!("{:016X}", number | 0x1001);
+    let id2 = format!("{:016X}", number | 0x1002);
+    base.missing_dlcs = vec![
+        (id1.clone(), "Extra One".into()),
+        (id2.clone(), "Extra Two".into()),
+    ];
+    let matching = catalog::CatalogItem {
+        title: "Extra DLC collection".into(),
+        title_id: Some(id1.clone()),
+        topic_id: "12345".into(),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let batch = update_batch::new_dlc_batch(std::slice::from_ref(&base), &[matching], &id2);
+    assert_eq!(batch.kind, update_batch::BatchKind::Dlc);
+    assert_eq!(batch.rows.len(), 1, "excluded DLC is skipped independently");
+    assert_eq!(batch.rows[0].dlc_id.as_deref(), Some(id1.as_str()));
+    assert_eq!(batch.rows[0].candidates, vec![0]);
+    app.rows = vec![base];
+    app.rows_generation += 1;
+    app.folder_filter = "MISSING_DLCS".into();
+    app.kind_filter = "base".into();
+    app.update_batch = Some(batch);
+    app.update_batch.as_mut().unwrap().running = false;
+    let ctx = run_app_ticks(&mut app, 2);
+    let rect = ctx.data_mut(|data| {
+        data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_update_batch_toolbar"))
+    });
+    assert!(rect.is_some_and(|rect| rect.width() > 100.0 && rect.height() > 0.0));
+}
+
+#[test]
+fn two_missing_dlcs_reuse_one_catalog_torrent_preview() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    let id1 = format!("{:016X}", base | 0x1001);
+    let id2 = format!("{:016X}", base | 0x1002);
+    game.missing_dlcs = vec![(id1.clone(), "One".into()), (id2.clone(), "Two".into())];
+    let catalog = catalog::CatalogItem {
+        title: "DLC bundle".into(),
+        title_id: Some(game.title_id.clone()),
+        topic_id: "123".into(),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let mut batch = update_batch::new_dlc_batch(&[game], std::slice::from_ref(&catalog), "");
+    let (request, sender, _cancelled) = torrent::synthetic_preview_request();
+    batch.rows[0].next_candidate = 1;
+    batch.active = Some((0, request));
+    sender
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![
+                torrent::TorrentFileEntry {
+                    index: 0,
+                    path: format!("DLC [{id1}][v0].nsp").into(),
+                    size: 120,
+                },
+                torrent::TorrentFileEntry {
+                    index: 1,
+                    path: format!("DLC [{id2}][v0].nsp").into(),
+                    size: 180,
+                },
+            ],
+            torrent_bytes: vec![11, 22, 33],
+        }))
+        .unwrap();
+    batch.tick(&[catalog], None);
+    assert!(!batch.running);
+    assert_eq!(batch.eligible(), 2);
+    assert_eq!(batch.preview_cache.len(), 1);
+    let first = &batch.rows[0].found.as_ref().unwrap().torrent_bytes;
+    let second = &batch.rows[1].found.as_ref().unwrap().torrent_bytes;
+    assert!(
+        Arc::ptr_eq(first, second),
+        "the preview payload should be shared"
+    );
+    assert_eq!(
+        app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0, 1]],
+        "two DLCs in the same torrent must be one selected-files transfer"
+    );
+    batch.rows[1].found.as_mut().unwrap().release.magnet =
+        "magnet:?xt=urn:btih:ABCD&tr=udp://different-tracker".into();
+    assert_eq!(
+        app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0, 1]],
+        "same infohash with different tracker URLs must still be grouped"
+    );
+    batch.rows[1].found.as_mut().unwrap().release.magnet = "magnet:?xt=urn:btih:EFGH".into();
+    assert_eq!(
+        app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0], vec![1]],
+        "different torrent hashes must not share a transfer"
+    );
+    batch.rows[1].found.as_mut().unwrap().release.magnet = "magnet:?xt=urn:btih:ABCD".into();
+    batch.rows[1].checked = false;
+    assert_eq!(
+        app::update_batch::grouped_batch_downloads(&batch),
+        vec![vec![0]],
+        "unchecked DLC must not be downloaded"
+    );
+    for row in &mut batch.rows {
+        row.job = Some(update_batch::UpdateBatchJob {
+            key: "t-group".into(),
+            directory: app.base_dir.join("downloads").join("batch-group"),
+            output: app
+                .base_dir
+                .join("downloads")
+                .join("batch-group")
+                .join("dlc.nsp"),
+            expected_version: 0,
+            expected_file_size: 120,
+            original_size: 500,
+            transfer_finished: false,
+            recovering_since: None,
+            status: update_batch::UpdateBatchJobStatus::Queued,
+            verifying: None,
+            merge_control: None,
+        });
+    }
+    app.update_batch = Some(batch);
+    app.handle_missing_update_completion("t-group", &Ok(()));
+    for row in &app.update_batch.as_ref().unwrap().rows {
+        let job = row.job.as_ref().unwrap();
+        assert!(
+            job.transfer_finished,
+            "every DLC sharing one torrent must complete"
+        );
+        assert_eq!(job.status, update_batch::UpdateBatchJobStatus::Queued);
+    }
+}
+
+#[test]
+fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    game.missing_dlcs = vec![
+        (format!("{:016X}", base | 0x1001), "One".into()),
+        (format!("{:016X}", base | 0x1002), "Two".into()),
+    ];
+    let mut batch = update_batch::new_dlc_batch(&[game], &[], "");
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        Some(None)
+    );
+    let prior_output = app.base_dir.join("[NSL DLC] prior.nsz");
+    batch.rows[0].job = Some(update_batch::UpdateBatchJob {
+        key: "t5".into(),
+        directory: app.base_dir.join("downloads").join("safe"),
+        output: app.base_dir.join("downloads").join("safe").join("dlc.nsp"),
+        expected_version: 0,
+        expected_file_size: 50,
+        original_size: 100,
+        transfer_finished: true,
+        recovering_since: None,
+        status: update_batch::UpdateBatchJobStatus::Queued,
+        verifying: None,
+        merge_control: None,
+    });
+    assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
+    batch.rows[0].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Failed("no input".into());
+    assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
+    batch.rows[0].job.as_mut().unwrap().status =
+        update_batch::UpdateBatchJobStatus::Merged(prior_output.clone());
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        Some(Some(prior_output))
+    );
+}
+
+#[test]
 fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merge() {
     let (mut app, dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -76,9 +261,11 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
     let folder = app.base_dir.join("downloads").join("batch-restore-QA");
     let output = folder.join("game/update.nsz");
     let batch = update_batch::UpdateBatch {
+        kind: update_batch::BatchKind::Update,
         rows: vec![update_batch::UpdateBatchRow {
             library_id: 25,
             title_id: "0100D2C0115B6000".into(),
+            dlc_id: None,
             name: "QA title".into(),
             installed_version: 65536,
             latest_version: 196608,
@@ -107,6 +294,7 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
         cursor: 1,
         active: None,
         confirm_queue: false,
+        preview_cache: Default::default(),
     };
     update_manifest::save(&app.base_dir, &batch).unwrap();
     app.update_batch = update_manifest::load(&app.base_dir).unwrap();

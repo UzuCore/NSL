@@ -127,6 +127,9 @@ pub(crate) fn batch_job_progress<'a>(
 /// For DLCs of one base game, finish previously queued packages first and
 /// feed the last published result into the next merge. Otherwise each DLC
 /// would be merged against the original and the final file would lose DLCs.
+/// Reference implementation retained for unit and real-content QA; the live
+/// GUI uses cumulative_dlc_inputs() to avoid repeated prefix scans.
+#[cfg(test)]
 pub(crate) fn cumulative_dlc_input(
     batch: &update_batch::UpdateBatch,
     index: usize,
@@ -143,12 +146,50 @@ pub(crate) fn cumulative_dlc_input(
         if let Some(job) = &earlier.job {
             match &job.status {
                 update_batch::UpdateBatchJobStatus::Merged(path) => latest = Some(path.clone()),
-                update_batch::UpdateBatchJobStatus::Verified => {}
-                _ => return None, // Incomplete or failed earlier DLC must not be bypassed.
+                // A verified-but-unpublished package is NOT an installed DLC.
+                // The next DLC must never merge against the original while a
+                // predecessor is waiting to publish its cumulative output.
+                _ => return None, // Incomplete, verified or failed predecessor.
             }
+        } else if earlier.checked && earlier.found.is_some() {
+            // An earlier selected DLC may not have been admitted due to disk
+            // shortage or a temporary torrent failure. Bypassing it would
+            // make the later DLC's output appear complete without it.
+            return None;
         }
     }
     Some(latest)
+}
+
+/// Calculate the entire batch's per-original cumulative predecessors in one
+/// forward pass. Calling cumulative_dlc_input() for *every* ready row can be
+/// quadratic when thousands of DLCs share one game and the first unfinished
+/// merge is near the middle. The UI checks the ready queue every frame.
+pub(crate) fn cumulative_dlc_inputs(
+    batch: &update_batch::UpdateBatch,
+) -> Vec<Option<Option<PathBuf>>> {
+    if batch.kind == update_batch::BatchKind::Update {
+        return vec![Some(None); batch.rows.len()];
+    }
+    let mut prior_by_game: HashMap<(&str, &Path), Option<Option<PathBuf>>> = HashMap::new();
+    let mut inputs = Vec::with_capacity(batch.rows.len());
+    for row in &batch.rows {
+        let game = (row.title_id.as_str(), row.original_path.as_path());
+        let predecessor = prior_by_game.get(&game).cloned().unwrap_or(Some(None));
+        inputs.push(predecessor.clone());
+        let next = match &row.job {
+            Some(job) => match (&predecessor, &job.status) {
+                (Some(_), update_batch::UpdateBatchJobStatus::Merged(path)) => {
+                    Some(Some(path.clone()))
+                }
+                _ => None, // Failure is sticky for all following DLCs.
+            },
+            None if row.checked && row.found.is_some() => None,
+            None => predecessor,
+        };
+        prior_by_game.insert(game, next);
+    }
+    inputs
 }
 
 /// Only after the last selected DLC for one game has been merged may its
@@ -615,11 +656,22 @@ impl NslApp {
             .filter(|row| row.job.as_ref().is_some_and(|job| job.verifying.is_some()))
             .count();
         let mut available = MAX_PARALLEL_UPDATE_MERGES.saturating_sub(active_merges);
+        let cumulative = if batch.kind == update_batch::BatchKind::Dlc
+            && available > 0
+            && !verify_rows.is_empty()
+        {
+            Some(cumulative_dlc_inputs(batch))
+        } else {
+            None
+        };
         for index in verify_rows {
             if available == 0 {
                 break;
             }
-            let Some(cumulative_input) = cumulative_dlc_input(batch, index) else {
+            let Some(cumulative_input) = cumulative
+                .as_ref()
+                .map_or(Some(None), |inputs| inputs[index].clone())
+            else {
                 continue;
             };
             spawn_batch_merge(

@@ -442,3 +442,228 @@ fn isolated_stage13_real_two_dlc_cumulative_nsz_wrapper() -> Result<()> {
         started.elapsed().as_secs_f64());
     Ok(())
 }
+
+/// Stage 26: prove the real two-DLC cumulative merge is also safe across the
+/// production batch journal's stop/restart boundary and intermediate-output
+/// retirement. All game inputs are read-only; the game and downloaded DLC
+/// packages used by the engine are copies inside an auto-cleaned QA root.
+#[test]
+#[ignore = "requires Stage13 read-only NSZ+DLC fixtures, isolated 16GiB QA and prod.keys"]
+fn stage26_real_two_dlc_batch_cancel_restart_and_cleanup() -> Result<()> {
+    use crate::update_batch::{
+        BatchKind, UpdateBatch, UpdateBatchJob, UpdateBatchJobStatus, UpdateBatchRow,
+    };
+
+    let (source, dlc_dir, qa_root) = fixture()?;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    anyhow::ensure!(fs2::available_space(&qa_root)? >= 16 * GIB);
+    anyhow::ensure!(fs2::available_space(std::env::temp_dir())? >= 16 * GIB);
+    let started = Instant::now();
+    let private = tempfile::Builder::new()
+        .prefix("stage26-dlc-batch-")
+        .tempdir_in(&qa_root)?;
+    let keys = scanner::prod_keys().context("read-only prod.keys missing")?;
+    let (base, prior_cnmts, candidates) = choose_missing(&source, &dlc_dir, private.path(), &keys)?;
+    anyhow::ensure!(
+        candidates.len() >= 2,
+        "two distinct real missing DLCs required"
+    );
+    let candidates = &candidates[..2];
+    anyhow::ensure!(candidates[0].0 != candidates[1].0);
+    let source_sha = sha256_file(&source)?;
+    let dlc_shas = candidates
+        .iter()
+        .map(|(_, _, input)| sha256_file(input))
+        .collect::<Result<Vec<_>>>()?;
+    let game = private.path().join("source-game.nsz");
+    fs::copy(&source, &game)?;
+    anyhow::ensure!(sha256_file(&game)? == source_sha);
+    let game_size = fs::metadata(&game)?.len();
+    let app_root = private.path().join("private-app-state");
+    fs::create_dir_all(app_root.join("downloads"))?;
+
+    let mut rows = Vec::new();
+    for (index, (dlc_id, version, input)) in candidates.iter().enumerate() {
+        let folder = app_root
+            .join("downloads")
+            .join(format!("stage26-package-{index}"));
+        fs::create_dir_all(&folder)?;
+        let downloaded = folder.join(format!("{dlc_id}.nsp"));
+        fs::copy(input, &downloaded)?;
+        anyhow::ensure!(sha256_file(&downloaded)? == dlc_shas[index]);
+        // This runs the production input-path and trusted native/header CNMT
+        // verification, not filename-based verification.
+        crate::update_batch::verify_downloaded_dlc(
+            &app_root,
+            &downloaded,
+            &base,
+            dlc_id,
+            i64::from(*version),
+        )?;
+        rows.push(UpdateBatchRow {
+            library_id: 26,
+            title_id: base.clone(),
+            dlc_id: Some(dlc_id.clone()),
+            name: format!("Stage26 verified DLC {}", index + 1),
+            installed_version: -1,
+            latest_version: 0,
+            original_path: game.clone(),
+            original_type: "nsz".into(),
+            candidates: Vec::new(),
+            next_candidate: 0,
+            found: None,
+            checked: false,
+            failure: None,
+            job: Some(UpdateBatchJob {
+                key: format!("stage26-torrent-{index}"),
+                directory: folder,
+                output: downloaded,
+                expected_version: i64::from(*version),
+                expected_file_size: fs::metadata(input)?.len(),
+                original_size: game_size,
+                transfer_finished: true,
+                recovering_since: None,
+                status: UpdateBatchJobStatus::Queued,
+                verifying: None,
+                merge_control: None,
+            }),
+        });
+    }
+    let mut batch = UpdateBatch {
+        kind: BatchKind::Dlc,
+        rows,
+        running: false,
+        cursor: 2,
+        active: None,
+        confirm_queue: false,
+        preview_cache: Default::default(),
+        preview_cache_bytes: 0,
+    };
+    crate::update_manifest::save(&app_root, &batch)?;
+    anyhow::ensure!(crate::update_manifest::load(&app_root)?.is_some());
+
+    let (first_id, first_version, _) = &candidates[0];
+    let first_package = batch.rows[0]
+        .job
+        .as_ref()
+        .context("missing downloaded first DLC")?
+        .output
+        .clone();
+    let first_output = merge_or_recover_dlc_controlled(
+        &game,
+        &first_package,
+        &base,
+        first_id,
+        i64::from(*first_version),
+        &MergeControl::default(),
+    )?;
+    anyhow::ensure!(first_output.is_file());
+    anyhow::ensure!(
+        first_output == expected_dlc_output(&game, &base, first_id, i64::from(*first_version))?
+    );
+    let first_cnmts = discovered(&first_output, &private.path().join("first-meta"), &keys)?;
+    validate_dlc_cnmts(&first_cnmts, &base, first_id, i64::from(*first_version))?;
+    ensure_existing_content_preserved(&prior_cnmts, &first_cnmts)?;
+    batch.rows[0].job.as_mut().unwrap().status = UpdateBatchJobStatus::Merged(first_output.clone());
+    crate::update_manifest::save(&app_root, &batch)?;
+
+    // Simulate a cancel at the boundary between two real DLC publications;
+    // cancellation must not create the second output or harm the first.
+    let (second_id, second_version, _) = &candidates[1];
+    let second_package = batch.rows[1].job.as_ref().unwrap().output.clone();
+    let expected_second = expected_dlc_output(&game, &base, second_id, i64::from(*second_version))?;
+    let published_before_cancel = sha256_file(&first_output)?;
+    let control = MergeControl::default();
+    control.request_cancel();
+    anyhow::ensure!(
+        merge_or_recover_dlc_controlled(
+            &first_output,
+            &second_package,
+            &base,
+            second_id,
+            i64::from(*second_version),
+            &control,
+        )
+        .is_err(),
+        "cancelled second merge unexpectedly succeeded"
+    );
+    anyhow::ensure!(!expected_second.exists());
+    anyhow::ensure!(sha256_file(&first_output)? == published_before_cancel);
+
+    // Simulated app exit and restart: reload from the real durable JSON,
+    // resolve the first DLC as the next input and resume the queued second.
+    drop(batch);
+    let mut restored = crate::update_manifest::load(&app_root)?
+        .context("Stage26 durable batch did not survive restart")?;
+    let resume_from = crate::app::update_batch::cumulative_dlc_input(&restored, 1)
+        .context("second DLC blocked despite completed predecessor")?
+        .context("first DLC publication lost during restart")?;
+    anyhow::ensure!(resume_from == first_output);
+    anyhow::ensure!(restored.rows[1]
+        .job
+        .as_ref()
+        .is_some_and(|job| job.transfer_finished && job.status == UpdateBatchJobStatus::Queued));
+    let final_output = merge_or_recover_dlc_controlled(
+        &resume_from,
+        &second_package,
+        &base,
+        second_id,
+        i64::from(*second_version),
+        &MergeControl::default(),
+    )?;
+    anyhow::ensure!(final_output == expected_second && final_output.is_file());
+    let final_index = nsrp_core::formats::pfs0::Pfs0Index::parse(&final_output)?;
+    anyhow::ensure!(
+        final_index
+            .entries
+            .iter()
+            .any(|entry| entry.name.ends_with(".ncz")),
+        "cumulative output must remain genuinely compressed NSZ"
+    );
+    let final_cnmts = discovered(&final_output, &private.path().join("final-meta"), &keys)?;
+    validate_dlc_cnmts(&final_cnmts, &base, first_id, i64::from(*first_version))?;
+    validate_dlc_cnmts(&final_cnmts, &base, second_id, i64::from(*second_version))?;
+    ensure_existing_content_preserved(&prior_cnmts, &final_cnmts)?;
+    ensure_existing_content_preserved(&first_cnmts, &final_cnmts)?;
+    let final_sha = sha256_file(&final_output)?;
+    restored.rows[1].job.as_mut().unwrap().status =
+        UpdateBatchJobStatus::Merged(final_output.clone());
+    crate::update_manifest::save(&app_root, &restored)?;
+
+    // Real production finalization: save a crash-safe redirect BEFORE
+    // retiring the first NSL output. Never delete downloaded NSPs or source.
+    let retired =
+        crate::app::update_batch::consolidate_finished_dlc_outputs(&app_root, &mut restored)?;
+    anyhow::ensure!(retired == 1, "one prior NSL result should be retired");
+    anyhow::ensure!(!first_output.exists());
+    anyhow::ensure!(final_output.is_file() && sha256_file(&final_output)? == final_sha);
+    let durable = crate::update_manifest::load(&app_root)?
+        .context("final two-DLC journal missing after cleanup")?;
+    anyhow::ensure!(durable.rows.iter().all(|row| {
+        row.job
+            .as_ref()
+            .is_some_and(|job| job.status == UpdateBatchJobStatus::Merged(final_output.clone()))
+    }));
+    anyhow::ensure!(
+        crate::app::update_batch::consolidate_finished_dlc_outputs(&app_root, &mut restored)? == 0,
+        "repeated finalization must be idempotent"
+    );
+    anyhow::ensure!(sha256_file(&source)? == source_sha);
+    anyhow::ensure!(sha256_file(&game)? == source_sha);
+    for (index, (_, _, source_dlc)) in candidates.iter().enumerate() {
+        anyhow::ensure!(sha256_file(source_dlc)? == dlc_shas[index]);
+        anyhow::ensure!(
+            sha256_file(&durable.rows[index].job.as_ref().unwrap().output)? == dlc_shas[index],
+            "downloaded DLC inputs must never be cleanup targets"
+        );
+    }
+    println!(
+        "STAGE26_REAL_TWO_DLC_BATCH_RESTART_PASS dlcs=2 base={} initial_cnmts={} final_cnmts={} final_bytes={} cancelled_before_second=true journal_restored=true retired_intermediate=1 compressed_nsz=true original_sha_unchanged=true elapsed_s={:.2}",
+        base,
+        prior_cnmts.len(),
+        final_cnmts.len(),
+        fs::metadata(&final_output)?.len(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}

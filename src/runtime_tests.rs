@@ -476,6 +476,12 @@ fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
     batch.rows[0].job.as_mut().unwrap().status =
         update_batch::UpdateBatchJobStatus::Failed("no input".into());
     assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
+    batch.rows[0].job.as_mut().unwrap().status = update_batch::UpdateBatchJobStatus::Verified;
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        None,
+        "a verified but unpublished DLC must block later cumulative merges"
+    );
     batch.rows[0].job.as_mut().unwrap().status =
         update_batch::UpdateBatchJobStatus::Merged(prior_output.clone());
     assert_eq!(
@@ -500,6 +506,100 @@ fn dlc_merges_wait_for_prior_package_and_use_latest_published_result() {
     );
     batch.rows[1].original_path = own_path;
     assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
+}
+
+#[test]
+fn stage26_three_thousand_dlc_predecessors_are_linear_and_fail_closed() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    game.missing_dlcs = (0..3000)
+        .map(|i| (format!("{:016X}", base | (0x1000 + i)), format!("DLC {i}")))
+        .collect();
+    let mut batch = update_batch::new_dlc_batch(&[game], &[], "");
+    assert_eq!(batch.rows.len(), 3000);
+    let folder = app.base_dir.join("downloads").join("stage26-linear");
+    for (i, row) in batch.rows.iter_mut().enumerate() {
+        row.job = Some(update_batch::UpdateBatchJob {
+            key: format!("t{i}"),
+            directory: folder.clone(),
+            output: folder.join(format!("dlc{i}.nsp")),
+            expected_version: 0,
+            expected_file_size: 100,
+            original_size: 200,
+            transfer_finished: true,
+            recovering_since: None,
+            status: if i < 1500 {
+                update_batch::UpdateBatchJobStatus::Merged(
+                    app.base_dir.join(format!("[NSL DLC] {i}.nsz")),
+                )
+            } else if i == 1500 {
+                update_batch::UpdateBatchJobStatus::Verified
+            } else {
+                update_batch::UpdateBatchJobStatus::Queued
+            },
+            verifying: None,
+            merge_control: None,
+        });
+    }
+    let began = std::time::Instant::now();
+    let inputs = app::update_batch::cumulative_dlc_inputs(&batch);
+    let elapsed = began.elapsed();
+    assert_eq!(inputs.len(), 3000);
+    assert_eq!(inputs[0], Some(None));
+    assert_eq!(
+        inputs[1500],
+        Some(Some(app.base_dir.join("[NSL DLC] 1499.nsz")))
+    );
+    assert_eq!(
+        inputs[1501], None,
+        "verified-but-unpublished DLC blocks subsequent work"
+    );
+    assert_eq!(
+        inputs[2999], None,
+        "the block must remain sticky until retry"
+    );
+    for index in [0, 1, 1499, 1500, 1501, 2000, 2999] {
+        assert_eq!(
+            inputs[index],
+            app::update_batch::cumulative_dlc_input(&batch, index),
+            "bulk and single-row predecessor logic disagree at row {index}"
+        );
+    }
+    // A selected DLC without a queued torrent must block later DLCs;
+    // otherwise disk-capacity rejection could silently skip it in a merge.
+    batch.rows[0].job = None;
+    batch.rows[0].found = Some(update_batch::UpdateBatchMatch {
+        release: catalog::CatalogItem {
+            title: "pending earlier DLC".into(),
+            magnet: "magnet:?xt=urn:btih:DEADBEEF".into(),
+            ..Default::default()
+        },
+        file: torrent::TorrentFileEntry {
+            index: 0,
+            path: "pending.nsp".into(),
+            size: 100,
+        },
+        version: 0,
+        torrent_bytes: Arc::new(vec![1]),
+    });
+    assert_eq!(app::update_batch::cumulative_dlc_input(&batch, 1), None);
+    assert_eq!(app::update_batch::cumulative_dlc_inputs(&batch)[1], None);
+    batch.rows[0].checked = false;
+    assert_eq!(
+        app::update_batch::cumulative_dlc_input(&batch, 1),
+        Some(None)
+    );
+    assert_eq!(
+        app::update_batch::cumulative_dlc_inputs(&batch)[1],
+        Some(None)
+    );
+    eprintln!(
+        "STAGE26_DLC_LINEAR_PASS rows=3000 elapsed_ms={} fail_closed_pending=true verified_blocked=true",
+        elapsed.as_millis()
+    );
 }
 
 #[test]

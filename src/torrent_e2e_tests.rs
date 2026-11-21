@@ -672,6 +672,169 @@ fn transfer_pause_restart_resume_delete_preserves_other_files() {
     drop(tracker);
 }
 
+/// Real byte transfers with a deterministic test-only terminal watcher fault.
+/// Unlike a peer outage, retry must reattach NSL's completion observer.
+#[test]
+#[ignore = "loopback-only 6 MiB generated torrent, terminal watcher retry and cancellation"]
+fn stage19_terminal_watcher_failure_retry_duplicate_and_cancel_e2e() {
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..6 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(97).wrapping_add((i / 8192) as u32) as u8)
+        .collect::<Vec<_>>();
+    let seed_file = seed_dir.join("stage19.bin");
+    std::fs::write(&seed_file, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_file, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+
+    let key = engine
+        .start_download(
+            "stage19 terminal failure",
+            &magnet,
+            PathBuf::from("recovery"),
+        )
+        .unwrap();
+    let (_, before) = wait_for(&engine, Duration::from_secs(30), |id, p| {
+        id == key && p.progress_bytes > 256 * 1024 && !p.finished
+    });
+    engine.inject_terminal_watcher_failure(&key).unwrap();
+    let mut saw_failure_event = false;
+    let started = Instant::now();
+    let failure = loop {
+        let (jobs, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Download {
+                key: id,
+                result: Err(_),
+            } = notice
+            {
+                if id == key {
+                    saw_failure_event = true;
+                }
+            }
+        }
+        if saw_failure_event {
+            if let Some((_, progress)) = jobs.iter().find(|(id, p)| *id == key && p.error.is_some())
+            {
+                break progress.clone();
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "terminal fault was not observed: {jobs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(failure
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("STAGE19_TEST_TERMINAL_WATCHER_FAILURE"));
+    assert!(failure.progress_bytes >= before.progress_bytes);
+    assert!(retryable_failed_transfer(&failure));
+    eprintln!("STAGE19_TERMINAL_ERROR_BYTES={}", failure.progress_bytes);
+
+    // Both commands are queued before completion; one must be rejected.
+    engine.retry(&key);
+    engine.retry(&key);
+    let mut accepted = 0_usize;
+    let mut rejected = 0_usize;
+    let started = Instant::now();
+    let completed = loop {
+        let (jobs, notices) = engine.poll();
+        for notice in notices {
+            match notice {
+                EngineNotice::Command {
+                    key: id,
+                    action: "retry",
+                    result,
+                } if id == key => {
+                    if result.is_ok() {
+                        accepted += 1;
+                    } else {
+                        rejected += 1;
+                    }
+                }
+                EngineNotice::Download { key: id, result } if id == key => {
+                    assert!(result.is_ok(), "recovered job failed: {result:?}");
+                }
+                _ => {}
+            }
+        }
+        if let Some((_, progress)) = jobs.iter().find(|(id, p)| *id == key && p.finished) {
+            if accepted + rejected >= 2 {
+                break progress.clone();
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(65),
+            "retry timed out: notices={accepted}/{rejected} jobs={jobs:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!((accepted, rejected), (1, 1));
+    assert_eq!(completed.total_bytes, data.len() as u64);
+    let output = client_dir.join("recovery").join("stage19.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    while engine.poll().0.iter().any(|(id, _)| id == &key) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+
+    // Fail another job then cancel immediately following retry. It must not
+    // resurrect a removed row or destroy the previous completed payload.
+    let next = engine
+        .start_download("stage19 cancel race", &magnet, PathBuf::from("cancel-race"))
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(25), |id, p| {
+        id == next && p.progress_bytes >= 256 * 1024 && !p.finished
+    });
+    engine.inject_terminal_watcher_failure(&next).unwrap();
+    let mut saw_failed_event = false;
+    let started = Instant::now();
+    loop {
+        let (jobs, events) = engine.poll();
+        saw_failed_event |= events
+            .iter()
+            .any(|e| matches!(e, EngineNotice::Download {key: id, result: Err(_)} if *id == next));
+        if saw_failed_event && jobs.iter().any(|(id, p)| *id == next && p.error.is_some()) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "second terminal failure not observed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    engine.retry(&next);
+    engine.cancel(&next, false);
+    let started = Instant::now();
+    while engine.poll().0.iter().any(|(id, _)| id == &next) {
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "retry+cancel left a stuck queue row"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        engine.poll().0.iter().all(|(id, _)| id != &next),
+        "cancelled retry resurrected"
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE19_TERMINAL_RETRY_CANCEL_PASS bytes={} retry_ok=1 duplicate_rejected=1 cancelled_not_resurrected=true", data.len());
+    drop(engine);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
 /// Longer loopback-only transfer with a real seeder interruption. The pause
 /// models a disconnected/unavailable peer without changing any user network
 /// adapters or touching any non-test torrent process or directory.

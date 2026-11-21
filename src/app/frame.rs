@@ -626,7 +626,19 @@ impl NslApp {
                             result,
                         } => {
                             if let Err(error) = result {
-                                self.status = format!("다운로드 {action} 명령 실패: {error}");
+                                if action == "retry" && error.contains("이미 복구 중") {
+                                    // A rapid double click was safely deduplicated;
+                                    // do not overwrite the successful retry status.
+                                    continue;
+                                }
+                                let action_name = match action {
+                                    "pause" => "일시정지",
+                                    "resume" => "재개",
+                                    "retry" => "재시도",
+                                    "remove" => "삭제",
+                                    _ => action,
+                                };
+                                self.status = format!("다운로드 {action_name} 실패: {error}");
                                 let _ = self
                                     .log_sender
                                     .send(format!("다운로드 명령 실패 ({key}): {error}"));

@@ -18,6 +18,16 @@ use std::{
     time::Duration,
 };
 
+// Test-only deterministic terminal watcher failure: it leaves librqbit's
+// paused/resumable payload intact and exercises NSL's retry/cancel lifecycle.
+// It does not claim to simulate a real librqbit storage error.
+#[cfg(test)]
+fn simulated_terminal_faults() -> &'static Mutex<std::collections::HashSet<(PathBuf, String)>> {
+    static FAULTS: std::sync::OnceLock<Mutex<std::collections::HashSet<(PathBuf, String)>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 /// One tracked download. The engine thread updates its fields; the UI reads
 /// them without blocking.
 #[derive(Clone, Debug, Default)]
@@ -463,6 +473,19 @@ async fn retry_failed_torrent(
         }
         active.insert(key.clone(), cancel.clone());
     }
+    // Delete may race with the queued retry before the storage is re-opened.
+    // If the command is cancelled, do not touch a removed torrent handle.
+    if cancel.load(Ordering::Acquire) {
+        if let Ok(mut active) = cancels.lock() {
+            if active
+                .get(&key)
+                .is_some_and(|flag| Arc::ptr_eq(flag, &cancel))
+            {
+                active.remove(&key);
+            }
+        }
+        return Err("취소한 다운로드는 재시도할 수 없습니다".into());
+    }
     if let Err(error) = session.unpause(&handle).await {
         if let Ok(mut active) = cancels.lock() {
             active.remove(&key);
@@ -470,6 +493,14 @@ async fn retry_failed_torrent(
         return Err(format!("다운로드 재연결 실패: {error:#}"));
     }
     if cancel.load(Ordering::Relaxed) {
+        if let Ok(mut active) = cancels.lock() {
+            if active
+                .get(&key)
+                .is_some_and(|flag| Arc::ptr_eq(flag, &cancel))
+            {
+                active.remove(&key);
+            }
+        }
         return Err("취소된 다운로드는 재시도할 수 없습니다".into());
     }
     let updated = progress.lock().ok().is_some_and(|mut map| {
@@ -574,6 +605,27 @@ async fn watch_torrent(
             // needs its session id to delete persistence and optional files.
             return None;
         }
+        #[cfg(test)]
+        if simulated_terminal_faults().lock().is_ok_and(|mut faults| {
+            faults.remove(&(handle.output_folder().to_path_buf(), key.clone()))
+        }) {
+            // Pause the real torrent so already verified pieces are retained;
+            // deliberately end only the NSL watcher with a terminal failure.
+            let error = "STAGE19_TEST_TERMINAL_WATCHER_FAILURE".to_owned();
+            let _ = session.pause(&handle).await;
+            if let Ok(mut map) = progress.lock() {
+                if let Some(row) = map.get_mut(&key) {
+                    row.error = Some(error.clone());
+                    row.paused = false;
+                    row.state = "실패".into();
+                    row.download_speed_bps = 0;
+                }
+            }
+            if let Ok(mut map) = cancels.lock() {
+                map.remove(&key);
+            }
+            return Some(Err(error));
+        }
         let stats = handle.stats();
         let paused = handle.is_paused();
         // rqbit's own speed estimator uses a moving average, which reads much
@@ -636,7 +688,11 @@ async fn watch_torrent(
         let completed = update.finished;
         let error = update.error.clone();
         if let Ok(mut map) = progress.lock() {
-            map.insert(key.clone(), update);
+            // A successful Cancel can remove the row while this watcher is
+            // awaiting its next sample. Never resurrect a deleted transfer.
+            if !cancel.load(Ordering::Acquire) {
+                map.insert(key.clone(), update);
+            }
         }
         if completed || error.is_some() {
             // Release the file locks so emulators can open the freshly
@@ -854,6 +910,23 @@ impl TorrentEngine {
             done_rx: Mutex::new(done_rx),
             counter: Arc::new(AtomicU64::new(1)),
         })
+    }
+
+    #[cfg(test)]
+    fn inject_terminal_watcher_failure(&self, key: &str) -> Result<()> {
+        let output = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(key).cloned())
+            .filter(|job| !job.finished && job.error.is_none() && job.progress_bytes > 0)
+            .and_then(|job| job.output_folder)
+            .context("Stage 19 fault injection requires a live partially downloaded torrent")?;
+        simulated_terminal_faults()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Stage 19 test fault map unavailable"))?
+            .insert((output, key.to_owned()));
+        Ok(())
     }
 
     /// Queue a magnet for download. Returns the progress key.

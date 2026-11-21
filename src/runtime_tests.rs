@@ -98,6 +98,66 @@ fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
 }
 
 #[test]
+fn stage24_insufficient_batch_space_does_not_enqueue_or_change_original() {
+    let (mut app, _temp) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut base = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let source = app.base_dir.join("stage24-untouched-original.nsz");
+    let sentinel = b"the original game is read-only to this quota test";
+    std::fs::write(&source, sentinel).unwrap();
+    base.path = source.to_string_lossy().into_owned();
+    base.update_version = 65_536;
+    base.latest_version = 196_608;
+    let catalog = catalog::CatalogItem {
+        title: "Stage24 patch candidate".into(),
+        title_id: Some(base.title_id.clone()),
+        topic_id: "240001".into(),
+        magnet: "magnet:?xt=urn:btih:ABCDEF".into(),
+        ..Default::default()
+    };
+    let mut batch = update_batch::new_update_batch(&[base], std::slice::from_ref(&catalog), "");
+    assert_eq!(batch.rows.len(), 1);
+    batch.running = false;
+    batch.rows[0].found = Some(update_batch::UpdateBatchMatch {
+        release: catalog,
+        file: torrent::TorrentFileEntry {
+            index: 0,
+            path: "Stage24 [0100D2C0115B6800][v196608].nsp".into(),
+            size: 32 * 1024 * 1024,
+        },
+        version: 196_608,
+        torrent_bytes: Arc::new(vec![1, 2, 3]),
+    });
+    assert!(app.torrent_engine.is_some());
+    app.update_batch = Some(batch);
+    app.queue_missing_updates_with_capacity(10 * 1024 * 1024);
+    let batch = app.update_batch.as_ref().unwrap();
+    assert!(batch.rows[0].job.is_none(), "no torrent may be queued");
+    assert!(batch.rows[0]
+        .failure
+        .as_deref()
+        .unwrap()
+        .contains("저장 공간 부족"));
+    assert!(app.status.contains("저장 공간 부족"), "{}", app.status);
+    assert_eq!(std::fs::read(&source).unwrap(), sentinel);
+    assert!(
+        !app.base_dir
+            .join("downloads")
+            .read_dir()
+            .unwrap()
+            .any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("batch-")
+            }),
+        "a disk-shortage refusal must not create an output folder"
+    );
+}
+
+#[test]
 fn missing_dlc_audit_is_per_title_id_and_toolbar_is_visible() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -177,6 +237,7 @@ fn two_missing_dlcs_reuse_one_catalog_torrent_preview() {
     assert!(!batch.running);
     assert_eq!(batch.eligible(), 2);
     assert_eq!(batch.preview_cache.len(), 1);
+    assert_eq!(batch.preview_cache_bytes, 3);
     let first = &batch.rows[0].found.as_ref().unwrap().torrent_bytes;
     let second = &batch.rows[1].found.as_ref().unwrap().torrent_bytes;
     assert!(
@@ -601,6 +662,7 @@ fn isolated_real_finished_transfer_restart_runs_native_nsz_merge() -> anyhow::Re
         active: None,
         confirm_queue: false,
         preview_cache: Default::default(),
+        preview_cache_bytes: 0,
     };
     app.update_batch = Some(batch);
     // Actual NSL completion handler persists "all bytes transferred".
@@ -712,6 +774,7 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
         active: None,
         confirm_queue: false,
         preview_cache: Default::default(),
+        preview_cache_bytes: 0,
     };
     update_manifest::save(&app.base_dir, &batch).unwrap();
     app.update_batch = update_manifest::load(&app.base_dir).unwrap();

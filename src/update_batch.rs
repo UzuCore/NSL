@@ -38,6 +38,9 @@ pub(crate) struct UpdateBatch {
     pub(crate) active: Option<(usize, torrent::TorrentPreviewRequest)>,
     pub(crate) confirm_queue: bool,
     pub(crate) preview_cache: HashMap<usize, CachedPreview>,
+    /// Maintain this incrementally: repeated O(n) sums become quadratic
+    /// during large catalog audits with thousands of unique torrents.
+    pub(crate) preview_cache_bytes: usize,
 }
 
 pub(crate) struct UpdateBatchRow {
@@ -130,10 +133,16 @@ pub(crate) fn new_update_batch(
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
     for row in owned {
+        let valid_base = row.title_id.len() == 16
+            && row.title_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && u64::from_str_radix(&row.title_id, 16)
+                .ok()
+                .is_some_and(|id| id & 0x1fff == 0);
         if !row.has_base
+            || !valid_base
             || row.latest_version <= row.version.max(row.update_version)
             || excluded
-                .split(',')
+                .split([',', '\n', ';'])
                 .any(|id| id.trim().eq_ignore_ascii_case(&row.title_id))
             || !seen.insert(row.title_id.to_ascii_uppercase())
         {
@@ -173,6 +182,7 @@ pub(crate) fn new_update_batch(
         active: None,
         confirm_queue: false,
         preview_cache: HashMap::new(),
+        preview_cache_bytes: 0,
     }
 }
 
@@ -253,11 +263,20 @@ pub(crate) fn new_dlc_batch(
         active: None,
         confirm_queue: false,
         preview_cache: HashMap::new(),
+        preview_cache_bytes: 0,
     }
 }
 
-fn patch_file_version(file: &torrent::TorrentFileEntry, patch_id: &str) -> Option<i64> {
-    if file.size == 0 {
+/// Catalog torrent names are untrusted hints, not verified CNMT metadata.
+/// Reject ambiguous declarations rather than picking the first `[...]`
+/// token: a misleading bundle name can contain several Title IDs/versions.
+fn declared_package_identity(file: &torrent::TorrentFileEntry) -> Option<(String, Option<i64>)> {
+    if file.size == 0
+        || !file
+            .path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
         return None;
     }
     let ext = file.path.extension()?.to_str()?;
@@ -268,15 +287,35 @@ fn patch_file_version(file: &torrent::TorrentFileEntry, patch_id: &str) -> Optio
     static IDS: OnceLock<Regex> = OnceLock::new();
     static VERSIONS: OnceLock<Regex> = OnceLock::new();
     let ids = IDS.get_or_init(|| Regex::new(r"(?i)\[([0-9a-f]{16})\]").unwrap());
-    let versions = VERSIONS.get_or_init(|| Regex::new(r"(?i)\[v(\d+)\]").unwrap());
-    if !ids
-        .captures_iter(name)
-        .any(|cap| cap[1].eq_ignore_ascii_case(patch_id))
-    {
+    let versions = VERSIONS.get_or_init(|| Regex::new(r"(?i)\[v([^\]]*)\]").unwrap());
+    let mut ids = ids.captures_iter(name);
+    let id = ids.next()?.get(1)?.as_str().to_ascii_uppercase();
+    if ids.next().is_some() {
         return None;
     }
-    let number: i64 = versions.captures(name)?.get(1)?.as_str().parse().ok()?;
-    (number > 0).then_some(number)
+    let mut versions = versions.captures_iter(name);
+    let version = match versions.next() {
+        Some(capture) => {
+            let digits = capture.get(1)?.as_str();
+            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            Some(digits.parse::<i64>().ok()?)
+        }
+        None => None,
+    };
+    if versions.next().is_some() {
+        return None;
+    }
+    Some((id, version))
+}
+
+fn patch_file_version(file: &torrent::TorrentFileEntry, patch_id: &str) -> Option<i64> {
+    let (declared_id, version) = declared_package_identity(file)?;
+    if !declared_id.eq_ignore_ascii_case(patch_id) {
+        return None;
+    }
+    version.filter(|value| *value > 0)
 }
 
 /// Requires a specific update TitleID and a version >= the game's current
@@ -288,7 +327,13 @@ pub(crate) fn pick_current_patch<'a>(
     installed: i64,
     latest: i64,
 ) -> Option<(&'a torrent::TorrentFileEntry, i64)> {
-    let base = u64::from_str_radix(title_id, 16).ok()? & !0x1fff;
+    if title_id.len() != 16 || !title_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let base = u64::from_str_radix(title_id, 16).ok()?;
+    if base & 0x1fff != 0 {
+        return None;
+    }
     let patch_id = format!("{:016X}", base | 0x800);
     files
         .iter()
@@ -300,33 +345,26 @@ pub(crate) fn pick_current_patch<'a>(
 }
 
 fn dlc_file_version(file: &torrent::TorrentFileEntry, dlc_id: &str) -> Option<i64> {
-    if file.size == 0
-        || !file.path.extension()?.eq_ignore_ascii_case("nsp")
-            && !file.path.extension()?.eq_ignore_ascii_case("nsz")
-    {
+    let (declared_id, version) = declared_package_identity(file)?;
+    if !declared_id.eq_ignore_ascii_case(dlc_id) {
         return None;
     }
-    let filename = file.path.file_name()?.to_str()?;
-    static IDS: OnceLock<Regex> = OnceLock::new();
-    static VERSIONS: OnceLock<Regex> = OnceLock::new();
-    let ids = IDS.get_or_init(|| Regex::new(r"(?i)\[([0-9a-f]{16})\]").unwrap());
-    let versions = VERSIONS.get_or_init(|| Regex::new(r"(?i)\[v(\d+)\]").unwrap());
-    if !ids
-        .captures_iter(filename)
-        .any(|cap| cap[1].eq_ignore_ascii_case(dlc_id))
-    {
-        return None;
-    }
-    match versions.captures(filename) {
-        Some(caps) => caps[1].parse::<i64>().ok().filter(|v| *v >= 0),
-        None => Some(0),
-    }
+    // Many legitimate DLC releases omit `[v0]`; absent means only a
+    // *candidate* version zero and never skips the later real CNMT scan.
+    Some(version.unwrap_or(0))
 }
 
 pub(crate) fn pick_missing_dlc<'a>(
     files: &'a [torrent::TorrentFileEntry],
     dlc_id: &str,
 ) -> Option<(&'a torrent::TorrentFileEntry, i64)> {
+    if dlc_id.len() != 16 || !dlc_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dlc = u64::from_str_radix(dlc_id, 16).ok()?;
+    if dlc & 0x1fff < 0x1000 {
+        return None;
+    }
     files
         .iter()
         .filter_map(|file| dlc_file_version(file, dlc_id).map(|v| (file, v)))
@@ -412,23 +450,28 @@ impl UpdateBatch {
         if let Some((index, result)) = completed {
             match result {
                 Ok(Ok(preview)) => {
-                    let cached_bytes: usize =
-                        self.preview_cache.values().map(|p| p.bytes.len()).sum();
                     let catalog_index =
                         self.rows[index].candidates[self.rows[index].next_candidate - 1];
                     if preview.torrent_bytes.len()
-                        > MAX_CACHED_TORRENT_BYTES.saturating_sub(cached_bytes)
+                        > MAX_CACHED_TORRENT_BYTES.saturating_sub(self.preview_cache_bytes)
                     {
                         self.rows[index].failure =
                             Some("일괄 대조 메타데이터 메모리 한도(128MiB) 초과".into());
                     } else {
-                        self.preview_cache.insert(
+                        let incoming_bytes = preview.torrent_bytes.len();
+                        let old = self.preview_cache.insert(
                             catalog_index,
                             CachedPreview {
                                 files: preview.files,
                                 bytes: Arc::new(preview.torrent_bytes),
                             },
                         );
+                        if let Some(previous) = old {
+                            self.preview_cache_bytes = self
+                                .preview_cache_bytes
+                                .saturating_sub(previous.bytes.len());
+                        }
+                        self.preview_cache_bytes += incoming_bytes;
                         self.apply_preview(index, catalog_index, catalog_items);
                     }
                     self.active = None;
@@ -497,6 +540,36 @@ pub(crate) fn safe_update_output(
     ))
 }
 
+/// Conservative admission control for a batch of selected payloads. The
+/// available space is measured on the actual download drive. Existing
+/// transfers and earlier accepted groups reserve their remaining bytes;
+/// every accepted group leaves at least 64 MiB for filesystem bookkeeping.
+/// This is a preflight, not a substitute for handling live OS write errors.
+pub(crate) fn reserve_batch_download_space(
+    available_bytes: u64,
+    reserved_bytes: u64,
+    requested_bytes: u64,
+) -> Result<u64, String> {
+    const HEADROOM: u64 = 64 * 1024 * 1024;
+    if requested_bytes == 0 {
+        return Err("다운로드할 파일의 크기가 0바이트입니다".into());
+    }
+    let newly_reserved = reserved_bytes
+        .checked_add(requested_bytes)
+        .ok_or_else(|| "선택한 다운로드 크기가 계산 범위를 초과했습니다".to_string())?;
+    let required = newly_reserved
+        .checked_add(HEADROOM)
+        .ok_or_else(|| "다운로드 저장 공간 계산 범위를 초과했습니다".to_string())?;
+    if required > available_bytes {
+        return Err(format!(
+            "다운로드 저장 공간 부족: 최소 {} MiB 필요(진행 중 작업 및 64 MiB 여유 포함), {} MiB 사용 가능",
+            required.div_ceil(1024 * 1024),
+            available_bytes / (1024 * 1024)
+        ));
+    }
+    Ok(newly_reserved)
+}
+
 /// Do not trust a torrent filename, a displayed progress percentage, or a
 /// catalog ID as proof that the payload is the requested patch. Only
 /// independently scanned CNMT metadata can release it for a future merge.
@@ -507,6 +580,16 @@ pub(crate) fn verify_downloaded_patch(
     expected_version: i64,
     installed_version: i64,
 ) -> Result<()> {
+    anyhow::ensure!(
+        base_id.len() == 16 && base_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "게임의 기본 Title ID가 올바른 16자리 16진수가 아닙니다"
+    );
+    let base = u64::from_str_radix(base_id, 16).context("잘못된 게임 타이틀 ID")?;
+    anyhow::ensure!(base & 0x1fff == 0, "기본 게임 Title ID가 아닙니다");
+    anyhow::ensure!(
+        expected_version > 0 && expected_version > installed_version,
+        "다운로드하려는 업데이트 버전이 기존 버전보다 높지 않습니다"
+    );
     let root = base_dir
         .join("downloads")
         .canonicalize()
@@ -524,7 +607,6 @@ pub(crate) fn verify_downloaded_patch(
         .and_then(|n| n.to_str())
         .context("다운로드 파일명이 올바르지 않습니다")?;
     let metadata = scanner::scan_file_hashed(&file, name, scanner::fast_hash(&file)?)?;
-    let base = u64::from_str_radix(base_id, 16).context("잘못된 게임 타이틀 ID")? & !0x1fff;
     let patch_id = format!("{:016X}", base | 0x800);
     let found = metadata.contents.iter().find(|content| {
         content.title_id.as_deref() == Some(patch_id.as_str())
@@ -648,6 +730,102 @@ mod tests {
             0
         );
         assert!(pick_missing_dlc(&files, "0100D2C0115B7003").is_none());
+    }
+
+    #[test]
+    fn stage24_catalog_filename_conflicts_fail_closed_before_queuing() {
+        let patch = "0100D2C0115B6800";
+        let dlc = "0100D2C0115B7001";
+        let wrong = "0100D2C0115B7002";
+        let bad = [
+            format!("Bundle [{patch}][{wrong}][v196608].nsp"),
+            format!("Conflicting versions [{patch}][v196608][v999999].nsp"),
+            format!("Malformed version [{patch}][vunknown].nsp"),
+            format!("Negative version [{patch}][v-1].nsp"),
+            format!("Overflow version [{patch}][v99999999999999999999999999].nsz"),
+            format!("Absent version [{patch}].nsp"),
+            format!("Directory traversal [{patch}][v196608].txt"),
+        ];
+        let mut entries: Vec<_> = bad
+            .iter()
+            .enumerate()
+            .map(|(i, name)| entry(i, name, 100))
+            .collect();
+        entries.push(entry(7, &format!("Untrusted [{patch}][v196608].nsp"), 0));
+        entries.push(entry(8, &format!("Other [{wrong}][v999999].nsp"), 150));
+        assert!(pick_current_patch(&entries, "0100D2C0115B6000", 0, 196608).is_none());
+        assert!(pick_current_patch(&entries, "0100D2C0115B6800", 0, 1).is_none());
+        assert!(pick_current_patch(&entries, "0000000000000000", 0, 1).is_none());
+        let legal = [entry(9, &format!("DLC [{dlc}][v0].nSz"), 123)];
+        assert_eq!(pick_missing_dlc(&legal, dlc).unwrap().1, 0);
+        let ambiguous_dlc = vec![
+            entry(10, &format!("Bundle [{dlc}][{wrong}][v0].nsp"), 100),
+            entry(11, &format!("DLC [{dlc}][v0][v999].nsz"), 100),
+            entry(12, &format!("DLC [{dlc}][vbad].nsp"), 100),
+            entry(13, &format!("DLC [{dlc}][v-1].nsp"), 100),
+            entry(14, &format!("DLC [{dlc}][v18446744073709551616].nsp"), 100),
+            entry(15, &format!("DLC [{dlc}].nca"), 100),
+            entry(16, &format!("../DLC [{dlc}][v0].nsp"), 100),
+        ];
+        assert!(pick_missing_dlc(&ambiguous_dlc, dlc).is_none());
+        assert!(pick_missing_dlc(&ambiguous_dlc, patch).is_none());
+        assert!(pick_missing_dlc(&ambiguous_dlc, "short").is_none());
+    }
+
+    #[test]
+    fn stage24_batch_capacity_accounts_for_prior_jobs_and_overflow() {
+        const MIB: u64 = 1024 * 1024;
+        let free = 256 * MIB;
+        let first = reserve_batch_download_space(free, 0, 100 * MIB).unwrap();
+        assert_eq!(first, 100 * MIB);
+        let second = reserve_batch_download_space(free, first, 90 * MIB).unwrap();
+        assert_eq!(second, 190 * MIB);
+        // Checking each 100 MiB payload against 256 MiB separately would
+        // overcommit the drive after earlier groups were accepted.
+        let error = reserve_batch_download_space(free, second, 4 * MIB).unwrap_err();
+        assert!(error.contains("저장 공간 부족"));
+        assert_eq!(
+            reserve_batch_download_space(64 * MIB, 0, 1),
+            Err("다운로드 저장 공간 부족: 최소 65 MiB 필요(진행 중 작업 및 64 MiB 여유 포함), 64 MiB 사용 가능".into())
+        );
+        assert!(reserve_batch_download_space(free, 0, 0)
+            .unwrap_err()
+            .contains("0바이트"));
+        assert!(reserve_batch_download_space(u64::MAX, u64::MAX, 1)
+            .unwrap_err()
+            .contains("계산 범위"));
+        assert!(reserve_batch_download_space(u64::MAX, 1, u64::MAX - 1)
+            .unwrap_err()
+            .contains("계산 범위"));
+        assert_eq!(
+            reserve_batch_download_space(256 * MIB, 0, 192 * MIB).unwrap(),
+            192 * MIB
+        );
+    }
+
+    #[test]
+    fn stage24_cnmt_preverification_rejects_invalid_base_and_nonnewer_versions() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("downloads").join("not-read.nsp");
+        let bad = ["short", "0100D2C0115B6800", "0100D2C0115B7001"];
+        for raw in bad {
+            let error = verify_downloaded_patch(temp.path(), &missing, raw, 196608, 65536)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Title ID"), "{raw}: {error}");
+        }
+        for (wanted, installed) in [(0, 0), (65536, 65536), (65536, 196608)] {
+            let error = verify_downloaded_patch(
+                temp.path(),
+                &missing,
+                "0100D2C0115B6000",
+                wanted,
+                installed,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("기존 버전보다 높지"), "{error}");
+        }
     }
 
     #[test]

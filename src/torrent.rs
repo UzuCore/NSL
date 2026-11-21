@@ -224,6 +224,7 @@ pub struct TorrentEngine {
 
 fn spawn_engine(
     default_folder: PathBuf,
+    session_root: PathBuf,
     command_rx: mpsc::Receiver<EngineCommand>,
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -237,7 +238,7 @@ fn spawn_engine(
             // Acquire before librqbit has a chance to restore, write, or
             // reconcile session.json. This must outlive the tokio runtime,
             // not merely NSL's initial startup handshake.
-            let _session_guard = match session_lock::SessionLock::acquire(&default_folder) {
+            let _session_guard = match session_lock::SessionLock::acquire(&session_root) {
                 Ok(guard) => guard,
                 Err(error) => {
                     let _ = ready_tx.send(Err(error.clone()));
@@ -258,10 +259,10 @@ fn spawn_engine(
             // Session state lives in the app folder (not inside `downloads`)
             // so the user can wipe the whole download tree without losing
             // resume data, and without seeing dot-folders among game files.
-            let persistence_folder = default_folder
+            let persistence_folder = session_root
                 .parent()
                 .map(|parent| parent.join("torrent-session"))
-                .unwrap_or_else(|| default_folder.join(".rqbit-session"));
+                .unwrap_or_else(|| session_root.join(".rqbit-session"));
             // Stage 23: an interrupted removal must not be restored (or
             // contacted over the network) even briefly. Reconcile the
             // exact-match JSON entries *before* Session::new_with_opts.
@@ -1259,7 +1260,15 @@ impl TorrentEngine {
     }
 
     pub fn new(default_folder: PathBuf) -> Result<Self> {
+        // Production keeps the writable session and lock next to downloads.
+        // The private Stage 24 quota test instead exercises a WSL payload
+        // filesystem with an ordinary NTFS-backed session and lock.
+        Self::new_with_session_root(default_folder.clone(), default_folder)
+    }
+
+    fn new_with_session_root(default_folder: PathBuf, session_root: PathBuf) -> Result<Self> {
         std::fs::create_dir_all(&default_folder)?;
+        std::fs::create_dir_all(&session_root)?;
         let (command_tx, command_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let progress: Arc<Mutex<HashMap<String, TorrentProgress>>> = Arc::default();
@@ -1267,6 +1276,7 @@ impl TorrentEngine {
         let handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>> = Arc::default();
         spawn_engine(
             default_folder,
+            session_root,
             command_rx,
             progress.clone(),
             cancels.clone(),

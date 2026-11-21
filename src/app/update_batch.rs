@@ -636,6 +636,28 @@ impl NslApp {
     }
 
     pub(crate) fn queue_missing_updates(&mut self) {
+        if self.torrent_engine.is_none() {
+            self.status = "토렌트 엔진을 사용할 수 없습니다".into();
+            return;
+        }
+        if self.update_batch.is_none() {
+            return;
+        }
+        let download_root = self.base_dir.join("downloads");
+        let available_bytes = match fs2::available_space(&download_root) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.status = format!("다운로드 드라이브의 여유 공간 확인 실패: {error}");
+                return;
+            }
+        };
+        self.queue_missing_updates_with_capacity(available_bytes);
+    }
+
+    /// Accept the physical free-space reading as an explicit input, allowing
+    /// isolated QA to exercise insufficient-capacity rejection without ever
+    /// filling a user's disk or altering the real filesystem quota.
+    pub(crate) fn queue_missing_updates_with_capacity(&mut self, available_bytes: u64) {
         let Some(engine) = self.torrent_engine.as_deref() else {
             self.status = "토렌트 엔진을 사용할 수 없습니다".into();
             return;
@@ -649,9 +671,34 @@ impl NslApp {
         }
         batch.confirm_queue = false;
         let download_root = self.base_dir.join("downloads");
+        // Reserve remaining bytes of active downloads before admitting any
+        // new batch. Count recovered jobs without an attached runtime row as
+        // well; otherwise a second queue click could overcommit the drive.
+        let live_folders = self
+            .torrent_progress
+            .iter()
+            .filter_map(|(_, progress)| progress.output_folder.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut reserved_bytes = self
+            .torrent_progress
+            .iter()
+            .filter(|(_, progress)| !progress.finished)
+            .fold(0u64, |bytes, (_, progress)| {
+                bytes.saturating_add(progress.total_bytes.saturating_sub(progress.progress_bytes))
+            });
+        for row in &batch.rows {
+            if let Some(job) = row
+                .job
+                .as_ref()
+                .filter(|job| !job.transfer_finished && !live_folders.contains(&job.directory))
+            {
+                reserved_bytes = reserved_bytes.saturating_add(job.expected_file_size);
+            }
+        }
         let mut queued = 0;
         let mut failed = 0;
         let mut torrent_jobs = 0;
+        let mut space_rejections = 0;
         for indices in grouped_batch_downloads(batch) {
             let first = &batch.rows[indices[0]];
             let first_found = first
@@ -707,6 +754,31 @@ impl NslApp {
                 .collect();
             only_files.sort_unstable();
             only_files.dedup();
+            let requested_bytes = only_files.iter().fold(0u64, |sum, selected| {
+                let bytes = ready
+                    .iter()
+                    .find_map(|(index, _)| {
+                        let file = &batch.rows[*index].found.as_ref().unwrap().file;
+                        (file.index == *selected).then_some(file.size)
+                    })
+                    .unwrap_or(0);
+                sum.saturating_add(bytes)
+            });
+            let proposed_reservation = match update_batch::reserve_batch_download_space(
+                available_bytes,
+                reserved_bytes,
+                requested_bytes,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    for (index, _) in ready {
+                        batch.rows[index].failure = Some(error.clone());
+                        failed += 1;
+                        space_rejections += 1;
+                    }
+                    continue;
+                }
+            };
             let first_index = ready[0].0;
             let found = batch.rows[first_index].found.as_ref().unwrap();
             let label = format!(
@@ -732,6 +804,7 @@ impl NslApp {
             );
             match result {
                 Ok(key) => {
+                    reserved_bytes = proposed_reservation;
                     torrent_jobs += 1;
                     for (index, original_size) in ready {
                         let row = &mut batch.rows[index];
@@ -761,11 +834,16 @@ impl NslApp {
             }
         }
         self.status = format!(
-            "{} 다운로드 큐 등록: {queued}개 · 토렌트 {torrent_jobs}건 · 실패 {failed}개",
+            "{} 다운로드 큐 등록: {queued}개 · 토렌트 {torrent_jobs}건 · 실패 {failed}개{}",
             if batch.kind == update_batch::BatchKind::Dlc {
                 "DLC"
             } else {
                 "업데이트"
+            },
+            if space_rejections > 0 {
+                format!(" · 저장 공간 부족 {space_rejections}개")
+            } else {
+                String::new()
             }
         );
         let _ = self

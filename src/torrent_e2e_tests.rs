@@ -470,6 +470,168 @@ fn stage23_corrupt_deletion_journal_fails_closed_without_modifying_session() {
     drop(engine);
 }
 
+/// A real, quota-exhausted filesystem reached over Windows' WSL UNC bridge.
+/// Only runs against a separately created private 4 MiB tmpfs mount. Unlike
+/// an injected failure this performs real librqbit payload writes until the
+/// filesystem returns ENOSPC, then enlarges only this owned mount and retries.
+/// Windows may report Linux ENOSPC as generic os error 31, not Win32 112.
+#[cfg(windows)]
+#[test]
+#[ignore = "requires isolated WSL tmpfs mount and opt-in Stage 24 environment"]
+fn stage24_real_quota_exhaustion_download_retry_exact_bytes() {
+    let Some(win_path) = std::env::var_os("NSL_STAGE24_QUOTA_UNC") else {
+        return;
+    };
+    let linux_root = std::env::var("NSL_STAGE24_QUOTA_LINUX_ROOT").unwrap();
+    let linux_name = linux_root
+        .strip_prefix("/tmp/nsl-stage24-quota-")
+        .expect("refuse to remount anything except an isolated test quota");
+    assert!(
+        !linux_name.is_empty()
+            && linux_name.len() <= 40
+            && linux_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'),
+        "invalid isolated mount name"
+    );
+    let client_root = PathBuf::from(win_path);
+    assert!(
+        client_root
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .starts_with(r"\\wsl.localhost\ubuntu\tmp\nsl-stage24-quota-"),
+        "this test may only write to its temporary WSL memory filesystem"
+    );
+    assert!(client_root.is_dir());
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let payload = (0..12 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(83).wrapping_add((i / 4096) as u32) as u8)
+        .collect::<Vec<_>>();
+    let seed_file = seed_dir.join("stage24-real-enospc.bin");
+    std::fs::write(&seed_file, &payload).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_file, &seed_dir, 2 * 1024 * 1024);
+    let client_dir = client_root.join("client").join("downloads");
+    // WSL's Plan9 UNC bridge does not implement Windows LockFileEx. Preserve
+    // production's real session-lock semantics using a disposable NTFS test
+    // profile, while routing the actual payload file to the quota-limited
+    // memory volume. No user state or user download tree is touched.
+    let local_session_root = temp.path().join("state").join("downloads");
+    let engine =
+        TorrentEngine::new_with_session_root(client_dir.clone(), local_session_root).unwrap();
+    let key = engine
+        .start_download(
+            "stage24 isolated real ENOSPC",
+            &magnet,
+            PathBuf::from("quota"),
+        )
+        .unwrap();
+    let started = Instant::now();
+    let mut failure = None;
+    let mut progressed = 0;
+    while failure.is_none() {
+        let (jobs, notices) = engine.poll();
+        for (id, progress) in jobs {
+            if id == key {
+                progressed = progressed.max(progress.progress_bytes);
+                if progress.error.is_some() {
+                    failure = progress.error;
+                }
+            }
+        }
+        for notice in notices {
+            if let EngineNotice::Download {
+                key: id,
+                result: Err(error),
+            } = notice
+            {
+                if id == key {
+                    eprintln!("STAGE24_REAL_QUOTA_FATAL_NOTICE={error}");
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(35),
+            "private WSL quota did not trigger a real torrent payload-write fault"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let message = failure.unwrap();
+    eprintln!("STAGE24_REAL_QUOTA_FATAL bytes_before_failure={progressed} error={message}");
+    assert!(
+        message.contains("writing") || message.contains("write") || message.contains("os error 31"),
+        "unexpected non-payload failure: {message}"
+    );
+    assert!(
+        progressed < payload.len() as u64,
+        "limited 4 MiB tmpfs unexpectedly stored the entire 12 MiB payload"
+    );
+
+    // Change the quota of ONLY the test-owned WSL mount, not any user drive.
+    let remount = std::process::Command::new("wsl.exe")
+        .args([
+            "-d",
+            "Ubuntu",
+            "-u",
+            "root",
+            "--",
+            "mount",
+            "-o",
+            "remount,size=48m",
+            &linux_root,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        remount.status.success(),
+        "isolated WSL tmpfs remount failed: {}",
+        String::from_utf8_lossy(&remount.stderr)
+    );
+    engine.retry(&key);
+    let accepted_at = Instant::now();
+    let mut accepted = false;
+    while !accepted {
+        let (_, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "retry",
+                result,
+            } = notice
+            {
+                if id == key {
+                    result.expect("real quota exhaustion was not retryable");
+                    accepted = true;
+                }
+            }
+        }
+        assert!(accepted_at.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, complete) = wait_for(&engine, Duration::from_secs(55), |id, progress| {
+        id == key && progress.finished
+    });
+    assert_eq!(complete.progress_bytes, payload.len() as u64);
+    let output = client_dir.join("quota").join("stage24-real-enospc.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    assert_eq!(std::fs::read(&seed_file).unwrap(), payload);
+    engine.cancel(&key, false);
+    let start = Instant::now();
+    while engine.poll().0.iter().any(|(id, _)| id == &key) {
+        assert!(start.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    eprintln!("STAGE24_QUOTA_EXHAUSTION_RECOVERED=PASS bytes={} enlarged_isolated_tmpfs=true retry=true payload_exact=true", payload.len());
+    drop(engine);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
 /// Opt-in public-network transfer of a small CC BY 3.0 subtitle from the
 /// official WebTorrent Sintel test torrent. Never contact a Switch tracker
 /// during QA or download unlicensed games. Verified 20,792-byte metadata
@@ -723,6 +885,7 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
         active: None,
         confirm_queue: false,
         preview_cache: Default::default(),
+        preview_cache_bytes: 0,
     });
     // Invoke the real catalog-to-download queue code, not a synthetic Add.
     app.queue_missing_updates();

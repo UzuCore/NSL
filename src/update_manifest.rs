@@ -242,6 +242,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         active: None,
         confirm_queue: false,
         preview_cache: Default::default(),
+        preview_cache_bytes: 0,
     }))
 }
 
@@ -287,6 +288,7 @@ mod tests {
             active: None,
             confirm_queue: false,
             preview_cache: Default::default(),
+            preview_cache_bytes: 0,
         }
     }
 

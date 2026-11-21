@@ -835,6 +835,384 @@ fn stage19_terminal_watcher_failure_retry_duplicate_and_cancel_e2e() {
     drop(tracker);
 }
 
+/// Failure in the actual librqbit Session::delete API must leave the live
+/// transfer and its persisted resume state usable. The injected missing ID is
+/// one-shot and only affects a generated localhost torrent.
+#[test]
+#[ignore = "localhost-only 6 MiB real transfer, failed session delete and retry"]
+fn stage20_failed_session_delete_preserves_progress_restart_and_files() {
+    let root = tempfile::tempdir().unwrap();
+    let seed_dir = root.path().join("seed");
+    let client_dir = root.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let payload = (0..6 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(101).wrapping_add((i / 4096) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage20.bin");
+    std::fs::write(&source, &payload).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 768 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage20 delete failure",
+            &magnet,
+            PathBuf::from("preserved"),
+        )
+        .unwrap();
+    let (_, first) = wait_for(&engine, Duration::from_secs(30), |id, progress| {
+        id == key && progress.progress_bytes > 256 * 1024 && !progress.finished
+    });
+    engine.inject_session_delete_failure(&key).unwrap();
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    let mut rejected = false;
+    while !rejected {
+        let (jobs, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result: Err(error),
+            } = notice
+            {
+                if id == key {
+                    assert!(error.contains("torrent") || error.contains("토렌트"));
+                    rejected = true;
+                }
+            }
+        }
+        assert!(
+            jobs.iter()
+                .any(|(id, progress)| id == &key && progress.error.is_none()),
+            "a failed session delete removed the still-active torrent row"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(12),
+            "delete fault timeout"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, after) = wait_for(&engine, Duration::from_secs(20), |id, progress| {
+        id == key && progress.progress_bytes > first.progress_bytes + 256 * 1024
+    });
+    eprintln!(
+        "STAGE20_FAILED_DELETE_PRESERVED first={} continued={}",
+        first.progress_bytes, after.progress_bytes
+    );
+
+    // Discard this engine and ensure the failed deletion did not corrupt its
+    // on-disk resume state: the next isolated engine must adopt the transfer.
+    drop(engine);
+    let restored = TorrentEngine::new(client_dir.clone()).unwrap();
+    let (restored_key, complete) = wait_for(&restored, Duration::from_secs(45), |id, progress| {
+        id.starts_with('r') && progress.finished
+    });
+    assert_eq!(complete.progress_bytes, payload.len() as u64);
+    let preserved = client_dir.join("preserved").join("stage20.bin");
+    assert_eq!(std::fs::read(&preserved).unwrap(), payload);
+    restored.cancel(&restored_key, false);
+    let started = Instant::now();
+    while restored.poll().0.iter().any(|(id, _)| id == &restored_key) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&preserved).unwrap(), payload);
+
+    // The delete-with-files choice must also preserve data when the session
+    // delete itself fails, and a second real deletion must remove only the
+    // selected torrent, not the previously dismissed/sibling output.
+    let sentinel = client_dir.parent().unwrap().join("keep.txt");
+    std::fs::write(&sentinel, b"stage20-sentinel").unwrap();
+    let next = restored
+        .start_download(
+            "stage20 file removal",
+            &magnet,
+            PathBuf::from("delete-only"),
+        )
+        .unwrap();
+    wait_for(&restored, Duration::from_secs(25), |id, progress| {
+        id == next && progress.progress_bytes > 256 * 1024 && !progress.finished
+    });
+    restored.inject_session_delete_failure(&next).unwrap();
+    restored.cancel(&next, true);
+    let started = Instant::now();
+    let mut saw_error = false;
+    while !saw_error {
+        let (jobs, notices) = restored.poll();
+        saw_error = notices.iter().any(|notice| {
+            matches!(notice,
+            EngineNotice::Command { key: id, action: "remove", result: Err(_) } if *id == next)
+        });
+        assert!(
+            jobs.iter().any(|(id, _)| id == &next),
+            "failed file delete dropped a live row"
+        );
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (_, finished) = wait_for(&restored, Duration::from_secs(45), |id, p| {
+        id == next && p.finished
+    });
+    assert_eq!(finished.total_bytes, payload.len() as u64);
+    let output = client_dir.join("delete-only").join("stage20.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), payload);
+    restored.cancel(&next, true);
+    let started = Instant::now();
+    while restored.poll().0.iter().any(|(id, _)| id == &next) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !output.exists(),
+        "successful delete-with-files left its test file"
+    );
+    assert_eq!(std::fs::read(&preserved).unwrap(), payload);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"stage20-sentinel");
+    eprintln!(
+        "STAGE20_DELETE_FAILURE_RECOVERY_PASS bytes={} restart_resume=true files_preserved=true selective_delete=true",
+        payload.len()
+    );
+    drop(restored);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// On Windows, an open handle without FILE_SHARE_DELETE prevents unlinking.
+/// librqbit 9.1.0 ignores this per-file failure and returns Ok. The NSL
+/// wrapper must detect the remaining file, report a partial cleanup, and
+/// clear the now-removed session row without erasing unrelated outputs.
+#[cfg(windows)]
+#[test]
+#[ignore = "Windows localhost-only genuine locked-file deletion failure"]
+fn stage20_locked_file_delete_reports_partial_cleanup_without_stranded_session() {
+    let root = tempfile::tempdir().unwrap();
+    let seed_dir = root.path().join("seed");
+    let client_dir = root.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..2 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(73).wrapping_add((i / 1024) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage20-readonly.bin");
+    std::fs::write(&source, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download("stage20 readonly", &magnet, PathBuf::from("readonly"))
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(25), |id, progress| {
+        id == key && progress.finished
+    });
+    let output = client_dir.join("readonly").join("stage20-readonly.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    let sentinel = client_dir.parent().unwrap().join("keep.txt");
+    std::fs::write(&sentinel, b"unmodified").unwrap();
+    // Permit existing readers/writers but deny FILE_SHARE_DELETE on the
+    // disposable downloaded file while this handle stays open.
+    use std::os::windows::fs::OpenOptionsExt;
+    let no_delete_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&output)
+        .expect("failed to open the test-only Windows no-delete sharing guard");
+    engine.cancel(&key, true);
+    let start = Instant::now();
+    let mut failed_delete = false;
+    while !failed_delete {
+        let (jobs, notices) = engine.poll();
+        assert!(
+            jobs.iter().any(|(id, _)| id == &key),
+            "preflight failure removed the resumable download row"
+        );
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = notice
+            {
+                if id == key {
+                    let error = result.expect_err("locked file deletion unexpectedly succeeded");
+                    assert!(
+                        error.contains("잠금 해제 후 다시 삭제하세요"),
+                        "unexpected cleanup result: {error}"
+                    );
+                    failed_delete = true;
+                }
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(12),
+            "preflight delete refusal timed out"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unmodified");
+    // Release the real Windows deletion lock and retry, with no loss of
+    // session metadata or completed pieces before the successful deletion.
+    drop(no_delete_guard);
+    engine.cancel(&key, true);
+    let started = Instant::now();
+    let mut removed = false;
+    while !removed {
+        let (jobs, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = notice
+            {
+                if id == key {
+                    result.expect("unlocked file should be removable");
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            assert!(jobs.iter().all(|(id, _)| id != &key));
+        }
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !output.exists(),
+        "unlocked selected torrent file survived deletion"
+    );
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unmodified");
+    // A successfully removed session must not return after restart.
+    drop(engine);
+    let restarted = TorrentEngine::new(client_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        restarted.poll().0.is_empty(),
+        "deleted session resurrected after restart"
+    );
+    eprintln!(
+        "STAGE20_REAL_FILE_DELETE_LOCK_PASS bytes={} retained_on_failure=true retry_deleted=true no_ghost_row=true sentinel_unchanged=true",
+        data.len()
+    );
+    drop(restarted);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// librqbit can ignore failed session.json flushes after deleting an in-memory
+/// torrent. Hold a genuine Windows no-delete lock on the JSON state to ensure
+/// NSL checks the persistence path BEFORE dropping the resumable session.
+#[cfg(windows)]
+#[test]
+#[ignore = "Windows localhost-only real locked persistence database preflight"]
+fn stage20_locked_persistence_file_preserves_session_until_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let original = (0..2 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(67).wrapping_add((i / 2048) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage20-session-lock.bin");
+    std::fs::write(&source, &original).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage20 persistence lock",
+            &magnet,
+            PathBuf::from("session-locked"),
+        )
+        .unwrap();
+    wait_for(&engine, Duration::from_secs(25), |id, p| {
+        id == key && p.finished
+    });
+    let payload = client_dir
+        .join("session-locked")
+        .join("stage20-session-lock.bin");
+    assert_eq!(std::fs::read(&payload).unwrap(), original);
+    let db = TorrentEngine::session_state_path(&client_dir).join("session.json");
+    let db_before = std::fs::read(&db).unwrap();
+    let no_delete_guard = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0x1 | 0x2)
+        .open(&db)
+        .expect("failed to hold the test-only persistence JSON lock");
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    let mut rejected = false;
+    while !rejected {
+        let (jobs, events) = engine.poll();
+        assert!(
+            jobs.iter().any(|(id, p)| id == &key && p.finished),
+            "failed persistence preflight hid a completed download"
+        );
+        for event in events {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = event
+            {
+                if id == key {
+                    let error = result.expect_err("locked session.json was silently deleted");
+                    assert!(error.contains("세션 기록 파일이 사용 중입니다"), "{error}");
+                    rejected = true;
+                }
+            }
+        }
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read(&db).unwrap(), db_before);
+    assert_eq!(std::fs::read(&payload).unwrap(), original);
+    drop(no_delete_guard);
+    engine.cancel(&key, false);
+    let started = Instant::now();
+    let mut removed = false;
+    while !removed {
+        let (jobs, events) = engine.poll();
+        for event in events {
+            if let EngineNotice::Command {
+                key: id,
+                action: "remove",
+                result,
+            } = event
+            {
+                if id == key {
+                    result.expect("unlocked persistence file should allow deletion");
+                    removed = true;
+                }
+            }
+        }
+        if removed {
+            assert!(jobs.iter().all(|(id, _)| id != &key));
+        }
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(engine);
+    let restored = TorrentEngine::new(client_dir).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        restored.poll().0.is_empty(),
+        "stale torrent restored after session delete"
+    );
+    assert_eq!(std::fs::read(&payload).unwrap(), original);
+    eprintln!(
+        "STAGE20_SESSION_JSON_LOCK_PASS bytes={} failed_delete_preserved=true retry_clean=true no_ghost_session=true",
+        original.len()
+    );
+    drop(restored);
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
 /// Longer loopback-only transfer with a real seeder interruption. The pause
 /// models a disconnected/unavailable peer without changing any user network
 /// adapters or touching any non-test torrent process or directory.

@@ -903,7 +903,10 @@ mod stage14_tests {
         let mut header_overlap = compressed.clone();
         header_overlap[section_offset_at..section_offset_at + 8]
             .copy_from_slice(&0x2000_i64.to_le_bytes());
-        cases.push(("section begins inside NCZ header", header_overlap));
+        cases.push((
+            "section offset disagrees with NCZBLOCK decoded body length",
+            header_overlap,
+        ));
 
         let mut huge_section = compressed.clone();
         huge_section[section_size_at..section_size_at + 8].copy_from_slice(&i64::MAX.to_le_bytes());

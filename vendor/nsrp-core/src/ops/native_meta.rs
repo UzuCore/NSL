@@ -58,15 +58,43 @@ pub fn read_cnmt_from_nca_region(
             _ => continue,
         };
         let mut plaintext = SectionReader::new(&mut file, nca_offset, section, section_key);
-        // SHA-256 PartitionFS sections normally begin with a 0x20-byte
-        // master hash. Synthetic/simple PartitionFS sections may not.
-        for pfs_base in [0u64, 0x20] {
+        // Hierarchical SHA-256 PartitionFS stores its *filesystem* extent in
+        // the decrypted NCA FsHeader HashData, not necessarily at the start
+        // of the encrypted section. The initial region holds hash blocks
+        // and can be much larger than 0x20 bytes.
+        //
+        // NCA FsHeader + 0x08 is HashData. Region 1 (PFS0) offset and size
+        // are HashData + 0x38 and + 0x40 respectively. Reject an explicitly
+        // declared out-of-bounds extent rather than scanning ciphertext for
+        // incidental PFS0 magic.
+        let fs = 0x400 + section.index * 0x200;
+        let header = &info.decrypted_header;
+        let mut offsets = Vec::<(u64, u64)>::new();
+        if header[fs + 2] == 1 && matches!(header[fs + 3], 2 | 5) {
+            let start = u64::from_le_bytes(header[fs + 0x40..fs + 0x48].try_into().unwrap());
+            let len = u64::from_le_bytes(header[fs + 0x48..fs + 0x50].try_into().unwrap());
+            if len != 0 {
+                if start.checked_add(len).is_none_or(|end| end > section.size) {
+                    bail!("NCA PartitionFS region exceeds its declared section");
+                }
+                offsets.push((start, len));
+            }
+        }
+        // Only synthetic/legacy NCAs *without* a declared hierarchy may use
+        // section-start variants. A malformed declared extent must not be
+        // bypassed by an incidental PFS0 signature elsewhere.
+        if offsets.is_empty() {
+            for start in [0u64, 0x20] {
+                if start < section.size {
+                    offsets.push((start, section.size - start));
+                }
+            }
+        }
+        for (pfs_base, pfs_size) in offsets {
             if pfs_base >= section.size {
                 continue;
             }
-            let Ok(pfs) =
-                Pfs0Index::parse_reader(&mut plaintext, pfs_base, section.size - pfs_base)
-            else {
+            let Ok(pfs) = Pfs0Index::parse_reader(&mut plaintext, pfs_base, pfs_size) else {
                 continue;
             };
             let Some(entry) = pfs
@@ -173,7 +201,11 @@ mod tests {
     };
     use std::{collections::HashMap, fs};
 
-    fn verify_native_cnmt_with_pfs_offset(pfs_offset: usize, rights_managed: bool) -> Result<()> {
+    fn verify_native_cnmt_with_pfs_offset(
+        pfs_offset: usize,
+        rights_managed: bool,
+        corrupt_declared_extent: bool,
+    ) -> Result<()> {
         let work = tempfile::tempdir()?;
         let cnmt_data = vec![0x19u8; 0x70];
         let payload = work.path().join("test.cnmt");
@@ -215,6 +247,19 @@ mod tests {
             );
         }
         header[0x404] = 3;
+        if pfs_offset >= 0x200 {
+            // Real hierarchical PartitionFS has its PFS0 data after a hash
+            // region; the on-disk offset is declared in the FsHeader.
+            header[0x402] = 1;
+            header[0x403] = 2;
+            let declared_offset = if corrupt_declared_extent {
+                u64::MAX - 10
+            } else {
+                pfs_offset as u64
+            };
+            header[0x440..0x448].copy_from_slice(&declared_offset.to_le_bytes());
+            header[0x448..0x450].copy_from_slice(&(pfs_bytes.len() as u64).to_le_bytes());
+        }
         header[0x540..0x548].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef]);
         nca_xts_transform(&mut header, keys.prod_key("header_key").unwrap(), true)?;
 
@@ -230,7 +275,19 @@ mod tests {
         bytes.resize(0x200 + section_offset as usize, 0);
         bytes.extend_from_slice(&section);
         fs::write(&output, bytes)?;
-        let got = read_cnmt_from_nca_region(&output, 0x200, section_offset + section_size, &keys)?;
+        let parsed =
+            read_cnmt_from_nca_region(&output, 0x200, section_offset + section_size, &keys);
+        if corrupt_declared_extent {
+            assert!(
+                parsed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds its declared section"),
+                "A malformed declared PFS0 extent must not fall back to a magic scan"
+            );
+            return Ok(());
+        }
+        let got = parsed?;
         assert_eq!(got, cnmt_data);
         if rights_managed {
             let missing_title_key = KeySet {
@@ -253,17 +310,28 @@ mod tests {
 
     #[test]
     fn reads_ctr_encrypted_cnmt_without_external_programs_or_temp_extraction() -> Result<()> {
-        verify_native_cnmt_with_pfs_offset(0, false)
+        verify_native_cnmt_with_pfs_offset(0, false, false)
     }
 
     #[test]
     fn reads_sha256_partitionfs_cnmt_with_master_hash_prefix() -> Result<()> {
-        verify_native_cnmt_with_pfs_offset(0x20, false)
+        verify_native_cnmt_with_pfs_offset(0x20, false, false)
+    }
+
+    #[test]
+    fn reads_sha256_partitionfs_at_header_declared_offset() -> Result<()> {
+        verify_native_cnmt_with_pfs_offset(0x2000, false, false)?;
+        verify_native_cnmt_with_pfs_offset(0x4000, true, false)
+    }
+
+    #[test]
+    fn rejects_malformed_declared_partitionfs_extent_without_legacy_fallback() -> Result<()> {
+        verify_native_cnmt_with_pfs_offset(0x2000, false, true)
     }
 
     #[test]
     fn reads_rights_managed_cnmt_with_key_and_rejects_missing_key() -> Result<()> {
-        verify_native_cnmt_with_pfs_offset(0x20, true)
+        verify_native_cnmt_with_pfs_offset(0x20, true, false)
     }
 
     #[test]

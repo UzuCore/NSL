@@ -46,12 +46,17 @@ pub struct NczBlockHeader {
 
 /// Check the original NCA layout encoded by NCZ crypto spans before any
 /// payload is decoded. Gaps are valid; overlap or arithmetic wrap is not.
+///
+/// NCZ preserves the first 0x4000 NCA bytes verbatim, but the *NCA crypto
+/// section* can begin at 0xC00 and continue into the compressed body. Only
+/// the intersection from 0x4000 onward is encoded. Comparing the first
+/// section start against 0x4000 incorrectly rejects these retail layouts.
 pub fn validated_ncz_body_size(sections: &[NczSection]) -> Result<u64> {
     ensure!(
         !sections.is_empty() && sections.len() <= 4096,
         "NCZ section count is outside the supported range"
     );
-    let mut previous_end = NCZ_HEADER_SIZE as u64;
+    let mut previous_end = 0u64;
     for section in sections {
         ensure!(
             section.size > 0 && section.offset >= previous_end,
@@ -73,6 +78,10 @@ pub fn validated_ncz_body_size(sections: &[NczSection]) -> Result<u64> {
             "NCZ section exceeds the supported NCA size limit"
         );
     }
+    ensure!(
+        previous_end > NCZ_HEADER_SIZE as u64,
+        "NCZ sections do not extend into the compressed NCA body"
+    );
     Ok(previous_end - NCZ_HEADER_SIZE as u64)
 }
 
@@ -272,6 +281,67 @@ fn decode_block_body(data: &[u8], header: &NczHeader, block: &NczBlockHeader) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_one_crypto_section_crossing_raw_ncz_header_but_rejects_true_overlap() -> Result<()> {
+        let section = NczSection {
+            offset: 0xC00,
+            size: 0x18000,
+            crypto_type: ENC_AES_CTR,
+            crypto_key: [0; 16],
+            crypto_counter: [0; 16],
+        };
+        assert_eq!(validated_ncz_body_size(&[section.clone()])?, 0x14C00);
+        let later = NczSection {
+            offset: 0x18000,
+            size: 0x1000,
+            ..section.clone()
+        };
+        assert!(validated_ncz_body_size(&[section.clone(), later]).is_err());
+        let disjoint = NczSection {
+            offset: 0x18C00,
+            size: 0x1000,
+            ..section.clone()
+        };
+        assert_eq!(
+            validated_ncz_body_size(&[section.clone(), disjoint])?,
+            0x15C00
+        );
+        let header_only = NczSection {
+            offset: 0xC00,
+            size: 0x1000,
+            ..section.clone()
+        };
+        assert!(validated_ncz_body_size(&[header_only]).is_err());
+        let over_limit = NczSection {
+            offset: 0xC00,
+            size: u64::MAX,
+            ..section
+        };
+        assert!(validated_ncz_body_size(&[over_limit]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_ncz_reconstructs_a_section_crossing_the_raw_header() -> Result<()> {
+        let raw = vec![0xA5; NCZ_HEADER_SIZE];
+        let body = (0..0x14C00usize)
+            .map(|index| ((index * 97) % 251) as u8)
+            .collect::<Vec<_>>();
+        let nca_section = NczSection {
+            offset: 0xC00,
+            size: 0x18000,
+            crypto_type: ENC_NONE,
+            crypto_key: [0; 16],
+            crypto_counter: [0; 16],
+        };
+        let encoded = build_streaming(&raw, &body, &[nca_section], 3)?;
+        let restored = decompress_to_nca(&encoded)?;
+        assert_eq!(restored.len(), 0x18C00);
+        assert_eq!(&restored[..NCZ_HEADER_SIZE], raw.as_slice());
+        assert_eq!(&restored[NCZ_HEADER_SIZE..], body.as_slice());
+        Ok(())
+    }
 
     #[test]
     fn streaming_ncz_roundtrip_plain() -> Result<()> {

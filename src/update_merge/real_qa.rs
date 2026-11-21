@@ -381,6 +381,7 @@ fn real_package_fast_nsz_equivalence() {
             patch: merge_patch,
             base_id: &base_id,
             version,
+            dlc_id: None,
             work: temp.path(),
             disabled_tool: &tool,
             prod_keys: &prod_keys,

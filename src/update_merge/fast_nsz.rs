@@ -7,7 +7,10 @@
 //! directly as well. Both CNMTs are decoded by the native metadata reader
 //! and the final package is verified by the caller.
 
-use super::{compression_options, validate_selected_cnmts};
+use super::{
+    compression_options, ensure_existing_content_preserved, validate_dlc_cnmts,
+    validate_selected_cnmts,
+};
 use anyhow::{ensure, Context, Result};
 use nsrp_core::{
     formats::{
@@ -75,12 +78,18 @@ impl IndexedSource {
 fn latest_candidates(
     base_id: &str,
     version: i64,
+    dlc_id: Option<&str>,
     base_cnmts: &[CnmtInfo],
     patch_cnmts: &[CnmtInfo],
 ) -> Result<Option<Vec<Candidate>>> {
     let mut by_title = BTreeMap::<String, Candidate>::new();
     for (source, cnmts) in [(0, base_cnmts), (1, patch_cnmts)] {
         for cnmt in cnmts {
+            if source == 1
+                && dlc_id.is_some_and(|wanted| !cnmt.title_id.eq_ignore_ascii_case(wanted))
+            {
+                continue; // Never install unselected DLCs from a multi-DLC patch.
+            }
             if !cnmt::base_title_id(&cnmt.title_id)?.eq_ignore_ascii_case(base_id) {
                 continue;
             }
@@ -118,7 +127,12 @@ fn latest_candidates(
         .iter()
         .map(|item| item.cnmt.clone())
         .collect::<Vec<_>>();
-    validate_selected_cnmts(&cnmts, base_id, version)?;
+    if let Some(dlc_id) = dlc_id {
+        validate_dlc_cnmts(&cnmts, base_id, dlc_id, version)?;
+        ensure_existing_content_preserved(base_cnmts, &cnmts)?;
+    } else {
+        validate_selected_cnmts(&cnmts, base_id, version)?;
+    }
     selected.sort_by_key(|item| {
         (
             match item.cnmt.meta_type {
@@ -271,6 +285,7 @@ pub(super) struct FastNszRequest<'a> {
     pub(super) patch: &'a Path,
     pub(super) base_id: &'a str,
     pub(super) version: i64,
+    pub(super) dlc_id: Option<&'a str>,
     pub(super) work: &'a Path,
     pub(super) disabled_tool: &'a Path,
     pub(super) prod_keys: &'a Path,
@@ -288,6 +303,7 @@ pub(super) fn try_merge_nsz_fast(
         patch,
         base_id,
         version,
+        dlc_id,
         work,
         disabled_tool,
         prod_keys,
@@ -351,8 +367,9 @@ pub(super) fn try_merge_nsz_fast(
         prod_keys,
         cancel,
     )
-    .context("업데이트 NSP/NSZ CNMT 분석 실패")?;
-    let Some(candidates) = latest_candidates(base_id, version, &base_cnmts, &patch_cnmts)? else {
+    .context("추가 패키지 NSP/NSZ CNMT 분석 실패")?;
+    let Some(candidates) = latest_candidates(base_id, version, dlc_id, &base_cnmts, &patch_cnmts)?
+    else {
         return Ok(None);
     };
 
@@ -370,7 +387,7 @@ pub(super) fn try_merge_nsz_fast(
             &mut |_| {},
             &mut |_| {},
         )
-        .context("업데이트 NSP 독립 압축 실패")?;
+        .context("추가 패키지 NSP 독립 압축 실패")?;
         Some(IndexedSource::open(&patch_nsz)?)
     };
     let output = work.join("fast_merged.nsz");
@@ -431,6 +448,50 @@ mod tests {
                 raw: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn dlc_fast_selection_preserves_existing_update_and_dlc_but_excludes_unselected_addons(
+    ) -> Result<()> {
+        let base_id = "0100111122220000";
+        let requested = "0100111122221002";
+        let unselected = "0100111122221003";
+        let make = |id: &str, meta_type: ContentMetaType, version| CnmtInfo {
+            cnmt_nca_name: format!("{id}.cnmt.nca"),
+            title_id: id.to_string(),
+            version,
+            meta_type,
+            required_system_version: 0,
+            contents: vec![],
+            raw: vec![],
+        };
+        let original = vec![
+            make(base_id, ContentMetaType::Base, 0),
+            make("0100111122220800", ContentMetaType::Update, 65536),
+            make("0100111122221001", ContentMetaType::Dlc, 0),
+        ];
+        let additions = vec![
+            make(requested, ContentMetaType::Dlc, 0),
+            make(unselected, ContentMetaType::Dlc, 0),
+        ];
+        let selected = latest_candidates(base_id, 0, Some(requested), &original, &additions)?
+            .context("requested DLC was unexpectedly excluded")?;
+        assert_eq!(selected.len(), 4);
+        assert!(selected
+            .iter()
+            .any(|item| item.source == 1 && item.cnmt.title_id == requested));
+        assert!(!selected.iter().any(|item| item.cnmt.title_id == unselected));
+        assert!(selected
+            .iter()
+            .any(|item| item.cnmt.title_id == "0100111122220800"));
+        assert!(selected
+            .iter()
+            .any(|item| item.cnmt.title_id == "0100111122221001"));
+        assert!(
+            latest_candidates(base_id, 0, Some("0100111122221010"), &original, &additions)?
+                .is_none()
+        );
+        Ok(())
     }
 
     #[test]
@@ -673,6 +734,7 @@ mod tests {
                 patch: &patch_path,
                 base_id,
                 version: 65536,
+                dlc_id: None,
                 work: temp.path(),
                 disabled_tool: &temp.path().join("no_tools.exe"),
                 prod_keys: &temp.path().join("missing_keys"),

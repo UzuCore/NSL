@@ -445,7 +445,10 @@ fn merge_verified_package_target_controlled(
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
-    let fast_candidate = dlc_id.is_none() && is_fast_nsz_candidate(original, patch, format);
+    // The native NSZ passthrough preserves the original NCZ payloads for
+    // both updates and additional DLCs; avoid inflating and recompressing
+    // every already-installed DLC on each cumulative merge.
+    let fast_candidate = is_fast_nsz_candidate(original, patch, format);
     if fast_candidate {
         check_fast_nsz_space(parent, original, patch)?;
     } else {
@@ -469,6 +472,7 @@ fn merge_verified_package_target_controlled(
                 patch,
                 base_id,
                 version: wanted_version,
+                dlc_id,
                 work: work.path(),
                 disabled_tool: &disabled_tool,
                 prod_keys: &prod_keys,
@@ -768,6 +772,10 @@ mod stage10_real_qa;
 #[cfg(test)]
 #[path = "update_merge/stage10_wrapper_qa.rs"]
 mod stage10_wrapper_qa;
+
+#[cfg(test)]
+#[path = "update_merge/stage13_real_dlc_qa.rs"]
+mod stage13_real_dlc_qa;
 
 #[cfg(test)]
 mod tests {

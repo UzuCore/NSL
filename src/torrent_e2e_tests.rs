@@ -193,6 +193,283 @@ fn local_file_seeder(
     (runtime, session, handle, tracker, magnet)
 }
 
+/// Invoked only as a dedicated child test binary by the Stage 23 regression.
+/// This is a true separate Windows process, not a second thread sharing a
+/// process-wide mutex. Running the child without the private environment
+/// marker is a harmless no-op.
+#[test]
+#[ignore = "child-only real process-wide session lock probe"]
+fn stage23_cross_process_session_lock_child() {
+    let Some(folder) = std::env::var_os("NSL_STAGE23_LOCK_CHILD_PROFILE") else {
+        return;
+    };
+    if std::env::var("NSL_STAGE23_LOCK_CHILD_MODE").ok().as_deref() == Some("hold-until-killed") {
+        let engine = TorrentEngine::new(PathBuf::from(folder)).unwrap();
+        let marker = PathBuf::from(std::env::var_os("NSL_STAGE23_LOCK_CHILD_MARKER").unwrap());
+        std::fs::write(marker, b"isolated child engine ready").unwrap();
+        // Only the parent that launched this exact child process kills it.
+        // Direct test execution without the env opt-in never enters this loop.
+        loop {
+            let _ = engine.poll();
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    let expect_busy = std::env::var("NSL_STAGE23_LOCK_CHILD_EXPECT_BUSY").unwrap() == "yes";
+    match TorrentEngine::new(PathBuf::from(folder)) {
+        Ok(engine) => {
+            assert!(
+                !expect_busy,
+                "second process opened the already-locked session"
+            );
+            let _ = engine.poll();
+            drop(engine);
+            eprintln!("STAGE23_CHILD_PROCESS_SESSION_OPEN=PASS");
+        }
+        Err(error) => {
+            assert!(expect_busy, "unrelated child start error: {error:#}");
+            assert!(
+                error.to_string().contains("다른 NSL 인스턴스"),
+                "wrong failure: {error:#}"
+            );
+            eprintln!("STAGE23_CHILD_PROCESS_SESSION_REFUSED=PASS");
+        }
+    }
+}
+
+/// Keep a genuine session running while a distinct test process tries to
+/// initialize the exact same persisted profile. The child must fail before
+/// reading/writing librqbit state; session clearing must fail too. Once the
+/// first process exits, the child may start normally, and the original
+/// downloaded payload remains exact.
+#[test]
+#[ignore = "separate Windows child process and localhost-generated torrent"]
+fn stage23_cross_process_lock_preserves_active_session_and_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..4 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(107).wrapping_add((i / 4096) as u32) as u8)
+        .collect::<Vec<_>>();
+    let source = seed_dir.join("stage23-lock.bin");
+    std::fs::write(&source, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&source, &seed_dir, 768 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download("stage23 cross process", &magnet, PathBuf::from("lock-qa"))
+        .unwrap();
+    let _ = wait_for(&engine, Duration::from_secs(35), |id, p| {
+        id == key && p.progress_bytes >= 256 * 1024
+    });
+    let state = TorrentEngine::session_state_path(&client_dir);
+    let db = state.join("session.json");
+    let started = Instant::now();
+    while !db.is_file() {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&db).unwrap()).unwrap();
+    let assert_same_torrent_identities = || {
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&db).unwrap()).unwrap();
+        let expected = before["torrents"].as_object().unwrap();
+        let actual = after["torrents"].as_object().unwrap();
+        assert_eq!(expected.len(), actual.len());
+        for (id, entry) in expected {
+            let current = actual.get(id).expect("second process replaced a session");
+            assert_eq!(entry["info_hash"], current["info_hash"]);
+            assert_eq!(entry["output_folder"], current["output_folder"]);
+        }
+        // is_paused may legitimately change when the first process finishes
+        // its download; only compare immutable identity fields, not raw JSON.
+    };
+    let exe = std::env::current_exe().unwrap();
+    let run_child = |expected_busy: bool| {
+        let result = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "torrent::localhost_tests::stage23_cross_process_session_lock_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NSL_STAGE23_LOCK_CHILD_PROFILE", &client_dir)
+            .env(
+                "NSL_STAGE23_LOCK_CHILD_EXPECT_BUSY",
+                if expected_busy { "yes" } else { "no" },
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "separate child process failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(if expected_busy {
+                "STAGE23_CHILD_PROCESS_SESSION_REFUSED=PASS"
+            } else {
+                "STAGE23_CHILD_PROCESS_SESSION_OPEN=PASS"
+            }),
+            "child did not report the expected lock outcome: {stderr}"
+        );
+    };
+    run_child(true);
+    assert_same_torrent_identities();
+    let error = TorrentEngine::clear_session_state(&client_dir)
+        .expect_err("settings must not clear an active session owned by another process");
+    assert!(error.to_string().contains("다른 NSL 인스턴스"));
+    assert_same_torrent_identities();
+    eprintln!("STAGE23_CROSS_PROCESS_DENIED=PASS child_no_mutation=true active_clear_denied=true");
+
+    drop(engine);
+    run_child(false);
+    let restored = TorrentEngine::new(client_dir.clone()).unwrap();
+    let (key, final_job) = wait_for(&restored, Duration::from_secs(35), |id, p| {
+        id.starts_with('r') && p.finished
+    });
+    assert_eq!(final_job.progress_bytes, data.len() as u64);
+    let output = client_dir.join("lock-qa").join("stage23-lock.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    restored.cancel(&key, false);
+    let started = Instant::now();
+    while restored.poll().0.iter().any(|(id, _)| id == &key) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(restored);
+    let _ = TorrentEngine::clear_session_state(&client_dir).unwrap();
+    assert!(!state.exists());
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE23_CROSS_PROCESS_RECOVERY=PASS bytes={} child_after_close=true clear_after_close=true payload_unchanged=true", data.len());
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// Abruptly kill only a test child that this test spawned and owns. Windows
+/// must release the process-wide session lock; the next engine then restores
+/// all verified pieces and completes the same local generated payload.
+#[test]
+#[ignore = "kill only owned child test process; localhost generated torrent"]
+fn stage23_owned_child_abrupt_exit_releases_lock_and_restores_data() {
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let seed_dir = temp.path().join("seed");
+    let client_dir = temp.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir).unwrap();
+    let data = (0..5 * 1024 * 1024)
+        .map(|i| (i as u32).wrapping_mul(113).wrapping_add((i / 4096) as u32) as u8)
+        .collect::<Vec<_>>();
+    let seed_path = seed_dir.join("stage23-abrupt.bin");
+    std::fs::write(&seed_path, &data).unwrap();
+    let (runtime, seed_session, _seed_handle, tracker, magnet) =
+        local_file_seeder(&seed_path, &seed_dir, 768 * 1024);
+    let engine = TorrentEngine::new(client_dir.clone()).unwrap();
+    let key = engine
+        .start_download(
+            "stage23 killed child",
+            &magnet,
+            PathBuf::from("child-crash"),
+        )
+        .unwrap();
+    let (_, progress) = wait_for(&engine, Duration::from_secs(30), |id, p| {
+        id == key && p.progress_bytes > 512 * 1024 && !p.finished
+    });
+    assert!(progress.progress_bytes < data.len() as u64);
+    drop(engine);
+
+    let ready = temp.path().join("stage23-child-ready.txt");
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "torrent::localhost_tests::stage23_cross_process_session_lock_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("NSL_STAGE23_LOCK_CHILD_PROFILE", &client_dir)
+        .env("NSL_STAGE23_LOCK_CHILD_MODE", "hold-until-killed")
+        .env("NSL_STAGE23_LOCK_CHILD_MARKER", &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut owned = OwnedChild(child);
+    let started = Instant::now();
+    while !ready.is_file() {
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "test child could not open its isolated session"
+        );
+        assert!(owned.0.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let refused = TorrentEngine::new(client_dir.clone())
+        .err()
+        .expect("concurrent process unexpectedly opened the test session");
+    assert!(refused.to_string().contains("다른 NSL 인스턴스"));
+    owned.0.kill().unwrap();
+    let _ = owned.0.wait().unwrap();
+    eprintln!("STAGE23_OWNED_CHILD_KILLED=PASS lock_prevented_concurrent=true");
+
+    let recovered = TorrentEngine::new(client_dir.clone()).unwrap();
+    let (restored_key, complete) = wait_for(&recovered, Duration::from_secs(40), |id, p| {
+        id.starts_with('r') && p.finished
+    });
+    assert_eq!(complete.progress_bytes, data.len() as u64);
+    let output = client_dir.join("child-crash").join("stage23-abrupt.bin");
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    recovered.cancel(&restored_key, false);
+    let started = Instant::now();
+    while recovered.poll().0.iter().any(|(id, _)| id == &restored_key) {
+        assert!(started.elapsed() < Duration::from_secs(12));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(recovered);
+    assert_eq!(std::fs::read(&output).unwrap(), data);
+    eprintln!("STAGE23_ABRUPT_CHILD_EXIT_RECOVERED=PASS bytes={} owned_child_only=true sha_bytes_exact=true", data.len());
+    drop(seed_session);
+    drop(runtime);
+    drop(tracker);
+}
+
+/// Corrupt deletion journals must stop startup *before* librqbit opens and
+/// restores an existing session, never silently resume an unwanted torrent.
+#[test]
+fn stage23_corrupt_deletion_journal_fails_closed_without_modifying_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let downloads = temp.path().join("downloads");
+    let state = TorrentEngine::session_state_path(&downloads);
+    let journal = state.join("nsl-deletion-intents");
+    std::fs::create_dir_all(&journal).unwrap();
+    let json = state.join("session.json");
+    let before = br#"{"torrents":{},"other_metadata":"preserve"}"#;
+    std::fs::write(&json, before).unwrap();
+    let corrupt_path = journal.join("1-deadbeef.json");
+    std::fs::write(&corrupt_path, b"{invalid-json").unwrap();
+    let error = TorrentEngine::new(downloads.clone())
+        .err()
+        .expect("startup must fail closed on a corrupted delete journal");
+    assert!(error.to_string().contains("삭제 복구"), "{error:#}");
+    assert_eq!(std::fs::read(&json).unwrap(), before);
+    assert_eq!(std::fs::read(&corrupt_path).unwrap(), b"{invalid-json");
+    // Only the deliberately broken disposable test record is removed. The
+    // originally valid profile may now launch without losing its metadata.
+    std::fs::remove_file(&corrupt_path).unwrap();
+    let engine = TorrentEngine::new(downloads).unwrap();
+    assert!(engine.poll().0.is_empty());
+    drop(engine);
+}
+
 /// Opt-in public-network transfer of a small CC BY 3.0 subtitle from the
 /// official WebTorrent Sintel test torrent. Never contact a Switch tracker
 /// during QA or download unlicensed games. Verified 20,792-byte metadata

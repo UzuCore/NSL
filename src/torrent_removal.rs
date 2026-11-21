@@ -73,6 +73,17 @@ fn intent_path(dir: &Path, intent: &RemovalIntent) -> PathBuf {
     dir.join(format!("{}-{}.json", intent.id, intent.info_hash))
 }
 
+fn serialized_entry_matches(value: &serde_json::Value, intent: &RemovalIntent) -> bool {
+    value
+        .get("info_hash")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hash| hash.eq_ignore_ascii_case(&intent.info_hash))
+        && value
+            .get("output_folder")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|folder| Path::new(folder) == intent.output_folder)
+}
+
 /// Write the durable intent *before* attempting librqbit deletion. If a
 /// crash interrupts an in-progress deletion, the next launch will suppress
 /// only an exact-matching restored torrent, and never delete payload bytes.
@@ -143,16 +154,92 @@ pub(super) fn still_persisted(persistence: &Path, intent: &RemovalIntent) -> Res
         .get("torrents")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "토렌트 세션 기록에 torrents 항목이 없습니다".to_string())?;
-    Ok(torrents.get(&intent.id.to_string()).is_some_and(|value| {
-        value
-            .get("info_hash")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|hash| hash.eq_ignore_ascii_case(&intent.info_hash))
-            && value
-                .get("output_folder")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|folder| Path::new(folder) == intent.output_folder)
-    }))
+    Ok(torrents
+        .get(&intent.id.to_string())
+        .is_some_and(|value| serialized_entry_matches(value, intent)))
+}
+
+/// Suppress matching deletion intents BEFORE librqbit restores torrents and
+/// opens network connections. This runs only while NSL holds the exclusive
+/// cross-process session lock; other entries and extra JSON fields survive.
+/// Refuse to start the engine on corrupt JSON or failed atomic replacement,
+/// rather than briefly reviving an unwanted download and mutating files.
+pub(super) fn reconcile_before_restore(persistence: &Path) -> Result<usize, String> {
+    static NEXT_RECOVERY: AtomicU64 = AtomicU64::new(0);
+    let records = pending(persistence)?;
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let path = persistence.join("session.json");
+    let original = match fs::read(&path) {
+        Ok(data) => Some(data),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("토렌트 세션 사전 복구 읽기 실패: {error}")),
+    };
+    let mut removed = 0usize;
+    if let Some(bytes) = original {
+        let mut state: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            format!("토렌트 세션 JSON이 손상되어 사전 복구를 중단했습니다: {error}")
+        })?;
+        let torrents = state
+            .get_mut("torrents")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| "토렌트 세션 JSON에 torrents 객체가 없습니다".to_string())?;
+        for (record, _) in &records {
+            let id = record.id.to_string();
+            if torrents
+                .get(&id)
+                .is_some_and(|value| serialized_entry_matches(value, record))
+            {
+                torrents.remove(&id);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            let temp = persistence.join(format!(
+                ".session-json-recovery-{}-{}.tmp",
+                std::process::id(),
+                NEXT_RECOVERY.fetch_add(1, Ordering::Relaxed)
+            ));
+            let write = (|| -> Result<(), String> {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temp)
+                    .map_err(|error| format!("토렌트 복구 임시 파일 생성 실패: {error}"))?;
+                serde_json::to_writer(&mut file, &state)
+                    .map_err(|error| format!("토렌트 복구 JSON 저장 실패: {error}"))?;
+                file.flush()
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| format!("토렌트 복구 동기화 실패: {error}"))?;
+                drop(file);
+                // Another (non-NSL) process may have modified this JSON even
+                // though our session-level file lock is held. Refuse to
+                // silently overwrite its changes. This is not a guarantee
+                // against a hostile writer racing the following rename.
+                let latest = fs::read(&path)
+                    .map_err(|error| format!("토렌트 복구 원본 재확인 실패: {error}"))?;
+                if latest != bytes {
+                    return Err(
+                        "토렌트 세션이 다른 프로세스에서 변경되어 복구를 중단했습니다".into(),
+                    );
+                }
+                fs::rename(&temp, &path)
+                    .map_err(|error| format!("토렌트 복구 세션 파일 교체 실패: {error}"))
+            })();
+            if write.is_err() {
+                let _ = fs::remove_file(&temp);
+            }
+            write?;
+        }
+    }
+    for (intent, journal_path) in records {
+        if still_persisted(persistence, &intent)? {
+            return Err("토렌트 세션 사전 복구 후에도 삭제 대상이 남아 있습니다".into());
+        }
+        finish(&journal_path)?;
+    }
+    Ok(removed)
 }
 
 pub(super) fn finish(path: &Path) -> Result<(), String> {
@@ -298,5 +385,90 @@ mod tests {
             .path()
             .extension()
             .is_none_or(|ext| ext != "tmp")));
+    }
+
+    #[test]
+    fn stage23_preboot_removes_only_exact_identity_and_keeps_unrelated_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let persistence = temp.path();
+        let exact = intent(3, "aabbcc", persistence);
+        let different_id = intent(4, "ddeeff", persistence);
+        let different_folder = RemovalIntent {
+            id: 9,
+            info_hash: "cafede".into(),
+            output_folder: persistence.join("wrong"),
+        };
+        let originally_unrelated = serde_json::json!({
+            "info_hash": different_id.info_hash,
+            "output_folder": different_id.output_folder,
+            "is_paused": true,
+            "trackers": ["http://127.0.0.1:7654/announce"]
+        });
+        let state = serde_json::json!({
+            "torrents": {
+                "3": {"info_hash": exact.info_hash, "output_folder": exact.output_folder, "is_paused": false},
+                "4": originally_unrelated,
+                "9": {"info_hash": "cafede", "output_folder": persistence.join("keep-this"), "is_paused": true}
+            },
+            "additional_library_field": {"retain": [1, 2, 3]}
+        });
+        fs::write(
+            persistence.join("session.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        begin_intent(persistence, exact.clone()).unwrap();
+        begin_intent(persistence, different_folder.clone()).unwrap();
+        assert_eq!(pending(persistence).unwrap().len(), 2);
+        assert_eq!(reconcile_before_restore(persistence).unwrap(), 1);
+        let actual: serde_json::Value =
+            serde_json::from_slice(&fs::read(persistence.join("session.json")).unwrap()).unwrap();
+        assert!(actual["torrents"].get("3").is_none());
+        assert_eq!(actual["torrents"]["4"], state["torrents"]["4"]);
+        assert_eq!(actual["torrents"]["9"], state["torrents"]["9"]);
+        assert_eq!(
+            actual["additional_library_field"],
+            state["additional_library_field"]
+        );
+        assert!(pending(persistence).unwrap().is_empty());
+        assert_eq!(reconcile_before_restore(persistence).unwrap(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stage23_preboot_atomic_rename_denied_leaves_original_and_retries() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let persistence = temp.path();
+        let exact = intent(5, "aaaabbcc", persistence);
+        let json = persistence.join("session.json");
+        fs::write(
+            &json,
+            serde_json::to_vec(&serde_json::json!({"torrents": {
+                "5": {"info_hash": exact.info_hash, "output_folder": exact.output_folder, "is_paused": true}
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
+        let before = fs::read(&json).unwrap();
+        begin_intent(persistence, exact).unwrap();
+        let guard = OpenOptions::new()
+            .read(true)
+            .share_mode(0x1 | 0x2)
+            .open(&json)
+            .unwrap();
+        let error = reconcile_before_restore(persistence).unwrap_err();
+        assert!(
+            error.contains("교체 실패"),
+            "unexpected preboot rename failure: {error}"
+        );
+        assert_eq!(fs::read(&json).unwrap(), before);
+        assert_eq!(pending(persistence).unwrap().len(), 1);
+        drop(guard);
+        assert_eq!(reconcile_before_restore(persistence).unwrap(), 1);
+        assert!(pending(persistence).unwrap().is_empty());
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&json).unwrap()).unwrap();
+        assert!(after["torrents"].as_object().unwrap().is_empty());
     }
 }

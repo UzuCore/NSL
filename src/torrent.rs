@@ -6,6 +6,8 @@ use librqbit::{
 
 #[path = "torrent_removal.rs"]
 mod removal_journal;
+#[path = "torrent_session_lock.rs"]
+mod session_lock;
 
 /// The handle type as re-exported by the crate root is unavailable in 9.1.0;
 /// mirror its definition here.
@@ -232,6 +234,16 @@ fn spawn_engine(
     std::thread::Builder::new()
         .name("torrent-engine".into())
         .spawn(move || -> anyhow::Result<()> {
+            // Acquire before librqbit has a chance to restore, write, or
+            // reconcile session.json. This must outlive the tokio runtime,
+            // not merely NSL's initial startup handshake.
+            let _session_guard = match session_lock::SessionLock::acquire(&default_folder) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.clone()));
+                    anyhow::bail!(error);
+                }
+            };
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -250,6 +262,15 @@ fn spawn_engine(
                 .parent()
                 .map(|parent| parent.join("torrent-session"))
                 .unwrap_or_else(|| default_folder.join(".rqbit-session"));
+            // Stage 23: an interrupted removal must not be restored (or
+            // contacted over the network) even briefly. Reconcile the
+            // exact-match JSON entries *before* Session::new_with_opts.
+            // Fail closed if the journal is corrupt or atomic replacement
+            // cannot be committed; the process lock remains held throughout.
+            if let Err(error) = removal_journal::reconcile_before_restore(&persistence_folder) {
+                let _ = ready_tx.send(Err(error.clone()));
+                anyhow::bail!(error);
+            }
             #[allow(unused_mut)]
             let mut session_options = SessionOptions {
                 persistence: Some(SessionPersistenceConfig::Json {
@@ -1219,6 +1240,10 @@ impl TorrentEngine {
         if !path.exists() {
             return Ok(0);
         }
+        // A GUI settings action must not delete another NSL process's live
+        // session records, even if no user-visible torrent is currently busy.
+        let _session_guard =
+            session_lock::SessionLock::acquire(default_folder).map_err(anyhow::Error::msg)?;
         let mut freed = 0u64;
         for entry in walkdir::WalkDir::new(&path)
             .into_iter()

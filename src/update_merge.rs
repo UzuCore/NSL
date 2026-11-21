@@ -439,7 +439,7 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
         "이미 병합 결과물이 있습니다: {}",
         destination.display()
     );
-    let parent = destination.parent().context("병합 결과 저장 폴더 없음")?;
+    destination.parent().context("병합 결과 저장 폴더 없음")?;
     // Windows FlushFileBuffers requires a handle opened with write access.
     fs::OpenOptions::new()
         .write(true)
@@ -449,16 +449,30 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
         !cancel.load(Ordering::Relaxed),
         "병합 작업이 중단되었습니다"
     );
-    if fs::hard_link(staged, destination).is_ok() {
+    // Test-only: emulate a filesystem that does not support hardlinks.
+    // The opt-in path check below confines this to a dedicated QA child.
+    #[cfg(test)]
+    let allow_hardlink = !stage29_force_owned_fallback(staged, destination)?;
+    #[cfg(not(test))]
+    let allow_hardlink = true;
+    if allow_hardlink && fs::hard_link(staged, destination).is_ok() {
         return Ok(());
     }
-    // FAT/exFAT and some network shares disallow hardlinks. A same-directory
-    // named temporary file is slower but retains atomic no-clobber semantics.
+    // FAT/exFAT and some network shares disallow hardlinks. Keep the copy
+    // inside the *already owner-tagged* merge workspace, not in the user's
+    // game folder. A hard crash while copying then leaves no unowned
+    // `.nsl-publish-*` beside real games; the ordinary Stage27 retry reaper
+    // can reclaim the entire dead, locked-marker-free work directory.
+    // The work folder is on the destination's own volume (tempdir_in(parent)),
+    // so persist_noclobber still performs an atomic no-overwrite publication.
+    let fallback_parent = staged.parent().context("병합 임시 출력의 상위 폴더 없음")?;
     let mut temp = tempfile::Builder::new()
         .prefix(".nsl-publish-")
-        .tempfile_in(parent)?;
+        .tempfile_in(fallback_parent)?;
     let mut source = File::open(staged)?;
     let mut buffer = vec![0u8; 2 * 1024 * 1024];
+    #[cfg(test)]
+    let mut written = 0u64;
     loop {
         anyhow::ensure!(
             !cancel.load(Ordering::Relaxed),
@@ -469,6 +483,16 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
             break;
         }
         temp.as_file_mut().write_all(&buffer[..count])?;
+        #[cfg(test)]
+        {
+            written += count as u64;
+            stage29_hold_owned_fallback_after_write(
+                staged,
+                destination,
+                written,
+                temp.as_file_mut(),
+            )?;
+        }
     }
     temp.as_file_mut().flush()?;
     temp.as_file_mut().sync_all()?;
@@ -480,6 +504,72 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
         anyhow::anyhow!("기존 병합 파일을 덮어쓰지 않았습니다: {}", error.error)
     })?;
     Ok(())
+}
+
+/// Test-only hardlink-denied / mid-copy failpoint. A child may arm it only
+/// for its exact, directly owned Stage29 scratch and marker. Production code
+/// never observes these environment variables or pauses mid-publication.
+#[cfg(test)]
+fn stage29_qa_owned_fallback_root(staged: &Path, destination: &Path) -> Result<Option<PathBuf>> {
+    let Some(root) = std::env::var_os("NSL_STAGE29_FALLBACK_QA_ROOT") else {
+        return Ok(None);
+    };
+    let root = fs::canonicalize(root)?;
+    let work = fs::canonicalize(
+        staged
+            .parent()
+            .context("Stage29 테스트 임시 파일의 부모 폴더 없음")?,
+    )?;
+    anyhow::ensure!(
+        root.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("stage29-fallback-"))
+            && destination.parent() == Some(root.as_path())
+            && work.parent() == Some(root.as_path())
+            && work
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".nsl-merge-"))
+            // The owner intentionally holds an exclusive whole-file lock;
+            // opening and reading its marker from a *second handle* can
+            // trigger Windows ERROR_LOCK_VIOLATION (33). The child just
+            // created this marker and owns the lock, so check the exact
+            // expected metadata length instead of bypassing that lock.
+            && fs::metadata(work.join(MERGE_WORK_MARKER))?.len()
+                == work_marker_bytes(destination)?.len() as u64,
+        "Stage29 강제 예비 게시 테스트는 소유한 격리 폴더에서만 실행할 수 있습니다"
+    );
+    Ok(Some(root))
+}
+
+#[cfg(test)]
+fn stage29_force_owned_fallback(staged: &Path, destination: &Path) -> Result<bool> {
+    Ok(stage29_qa_owned_fallback_root(staged, destination)?.is_some())
+}
+
+#[cfg(test)]
+fn stage29_hold_owned_fallback_after_write(
+    staged: &Path,
+    destination: &Path,
+    written: u64,
+    temp: &mut File,
+) -> Result<()> {
+    if written < 8 * 1024 * 1024
+        || std::env::var("NSL_STAGE29_ABORT_AFTER_8M").ok().as_deref() != Some("1")
+    {
+        return Ok(());
+    }
+    let root = stage29_qa_owned_fallback_root(staged, destination)?
+        .context("Stage29 복사 중단 시험은 소유한 작업 폴더에서만 가능합니다")?;
+    // Windows FILE_ATTRIBUTE_TEMPORARY may defer data/size visibility until
+    // a flush; force the test's actual 8MiB write to durable storage before
+    // signalling the parent. Production does not pay this per-chunk cost.
+    temp.flush()?;
+    temp.sync_all()?;
+    fs::write(root.join("stage29-fallback-8m.signal"), b"written-in-work")?;
+    loop {
+        std::thread::park();
+    }
 }
 
 /// User-visible merge: preserve the original's format, including native
@@ -935,6 +1025,10 @@ mod stage13_real_dlc_qa;
 #[cfg(test)]
 #[path = "update_merge/stage27_real_crash_qa.rs"]
 mod stage27_real_crash_qa;
+
+#[cfg(test)]
+#[path = "update_merge/stage29_fallback_qa.rs"]
+mod stage29_fallback_qa;
 
 #[cfg(test)]
 mod tests {

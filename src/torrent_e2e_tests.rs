@@ -1202,6 +1202,241 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
     Ok(())
 }
 
+/// Stage29 opt-in: two 512MiB selected files + 32MiB unselected decoy.
+/// True 1GiB native BitTorrent download through loopback-only tracker/seeder
+/// with pause/resume, session restart, and exact per-file streaming SHA-256.
+/// Only reusable 1MiB buffers are used for generation/hash verification.
+/// This is NOT a WAN speed benchmark or full-app GUI memory bound.
+#[test]
+#[ignore = "private 1GiB generated BitTorrent multi-file selected-only E2E"]
+fn stage29_1gib_two_selected_files_pause_restart_exact_sha256() -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use sha2::{Digest, Sha256};
+    use std::io::BufWriter;
+
+    fn streaming_sha(path: &Path) -> anyhow::Result<[u8; 32]> {
+        let mut reader = std::fs::File::open(path)?;
+        let mut h = Sha256::new();
+        // The Windows libtest worker has a small stack. Keep every 1MiB
+        // streaming buffer on the heap, not in a nested stack frame.
+        let mut block = vec![0u8; 1024 * 1024];
+        loop {
+            let count = reader.read(&mut block)?;
+            if count == 0 {
+                break;
+            }
+            h.update(&block[..count]);
+        }
+        Ok(h.finalize().into())
+    }
+
+    let qa_path = std::env::var_os("NSL_STAGE29_TORRENT_QA_ROOT")
+        .context("dedicated Stage29 1GiB torrent QA root not configured")?;
+    let qa = std::fs::canonicalize(qa_path)?;
+    anyhow::ensure!(std::fs::metadata(&qa)?.is_dir());
+    anyhow::ensure!(fs2::available_space(&qa)? > 8 * (1u64 << 30));
+    anyhow::ensure!(
+        qa.file_name().and_then(|name| name.to_str()) == Some("NSL_QA_20261120"),
+        "Stage29 large transfer requires explicit dedicated NSL_QA_20261120 root"
+    );
+    let scratch = tempfile::Builder::new()
+        .prefix("stage29-1gib-torrent-")
+        .tempdir_in(qa)?;
+    let seed = scratch.path().join("seed");
+    let bundle = seed.join("bundle");
+    let downloads = scratch.path().join("client/downloads");
+    for dir in [&bundle, &downloads] {
+        std::fs::create_dir_all(dir)?;
+    }
+    let files = ["selected-a.bin", "selected-b.bin"];
+    let started = Instant::now();
+    let mut input_hashes = Vec::new();
+    let mut reusable = vec![0u8; 1024 * 1024];
+    for (file_index, name) in files.iter().enumerate() {
+        let path = bundle.join(name);
+        let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, std::fs::File::create(&path)?);
+        for (offset, value) in reusable.iter_mut().enumerate() {
+            *value = ((offset as u32).wrapping_mul(73)
+                ^ ((offset >> 9) as u32)
+                ^ (file_index as u32).wrapping_mul(193)) as u8;
+        }
+        for chunk in 0..512u64 {
+            // Deterministic source patterns, one reused data block. Change
+            // both ends and interior so SHA validation catches substitutions.
+            reusable[..8].copy_from_slice(&chunk.to_le_bytes());
+            writer.write_all(&reusable)?;
+        }
+        writer.flush()?;
+        drop(writer);
+        anyhow::ensure!(std::fs::metadata(&path)?.len() == 512 * 1024 * 1024);
+        input_hashes.push(streaming_sha(&path)?);
+    }
+    // Unique payload in this file must NOT be fetched when only the two
+    // selected indices are transferred. A zero-filled placeholder is allowed.
+    let unselected = bundle.join("do-not-download.dat");
+    let mut other = BufWriter::new(std::fs::File::create(&unselected)?);
+    reusable.fill(0xA5);
+    for _ in 0..32 {
+        other.write_all(&reusable)?;
+    }
+    other.flush()?;
+    drop(other);
+    drop(reusable);
+    anyhow::ensure!(std::fs::metadata(&unselected)?.len() == 32 * 1024 * 1024);
+
+    let generated_s = started.elapsed().as_secs_f64();
+    let (runtime, seeder, _handle, tracker, magnet) =
+        local_file_seeder(&bundle, &bundle, 48 * 1024 * 1024);
+    let engine = TorrentEngine::new(downloads.clone())?;
+    let preview = engine.preview_files(&magnet)?;
+    let metadata = preview
+        .receiver
+        .recv_timeout(Duration::from_secs(60))
+        .context("1GiB local torrent preview timed out")?
+        .map_err(anyhow::Error::msg)?;
+    drop(preview);
+    anyhow::ensure!(metadata.files.len() == 3);
+    let mut selected = Vec::new();
+    for name in files {
+        let file = metadata
+            .files
+            .iter()
+            .find(|file| {
+                file.path
+                    .file_name()
+                    .is_some_and(|filename| filename == name)
+            })
+            .context("selected 512MiB fixture file not in preview")?;
+        anyhow::ensure!(file.size == 512 * 1024 * 1024);
+        selected.push(file.index);
+    }
+    let skip_index = metadata
+        .files
+        .iter()
+        .find(|file| {
+            file.path
+                .file_name()
+                .is_some_and(|name| name == "do-not-download.dat")
+        })
+        .context("unselected fixture missing from preview")?
+        .index;
+    anyhow::ensure!(!selected.contains(&skip_index));
+
+    let transfer_start = Instant::now();
+    let key = engine.start_download_selected(
+        "Stage29 synthetic 1GiB selected-only",
+        &magnet,
+        PathBuf::from("selected"),
+        Some(metadata.torrent_bytes),
+        Some(selected),
+    )?;
+    let (_, first) = wait_for(&engine, Duration::from_secs(130), |id, p| {
+        id == key && p.progress_bytes >= 64 * 1024 * 1024 && !p.finished
+    });
+    engine.pause(&key);
+    let (_, paused) = wait_for(&engine, Duration::from_secs(35), |id, p| {
+        id == key && p.paused
+    });
+    anyhow::ensure!(paused.progress_bytes >= first.progress_bytes);
+    engine.resume(&key);
+    let (_, resumed) = wait_for(&engine, Duration::from_secs(50), |id, p| {
+        id == key && !p.paused && p.progress_bytes > paused.progress_bytes
+    });
+    anyhow::ensure!(resumed.progress_bytes < 1024 * 1024 * 1024);
+    let (_, midway) = wait_for(&engine, Duration::from_secs(180), |id, p| {
+        id == key && p.progress_bytes >= 256 * 1024 * 1024 && !p.finished
+    });
+    anyhow::ensure!(midway.progress_bytes < 1024 * 1024 * 1024);
+    drop(engine); // destroy owned client session; keep localhost seeder running
+                  // An in-flight rqbit runtime can outlive the last client handle for a
+                  // few seconds while flushing. Preserve the strict per-session OS lock:
+                  // this in-process test waits until its owned old worker is fully gone.
+    let restart_at = Instant::now();
+    let restored = loop {
+        match TorrentEngine::new(downloads.clone()) {
+            Ok(restored) => break restored,
+            Err(error) if error.to_string().contains("동일 토렌트 세션") => {
+                anyhow::ensure!(
+                    restart_at.elapsed() < Duration::from_secs(100),
+                    "private 1GiB torrent worker did not release its session lock"
+                );
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Err(error) => return Err(error.context("1GiB 세션 복구 실패")),
+        }
+    };
+    let restart_wait_s = restart_at.elapsed().as_secs_f64();
+    let (restored_key, final_progress) = wait_for(&restored, Duration::from_secs(260), |id, p| {
+        id.starts_with('r') && p.finished
+    });
+    anyhow::ensure!(
+        final_progress.progress_bytes >= 1024 * 1024 * 1024,
+        "did not transfer complete 1GiB of selected content"
+    );
+    let transfer_s = transfer_start.elapsed().as_secs_f64();
+    let mut checked = 0u64;
+    for (i, name) in files.iter().enumerate() {
+        let entry = walkdir::WalkDir::new(downloads.join("selected"))
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_type().is_file() && entry.file_name() == *name)
+            .context("selected 512MiB file missing from output")?;
+        anyhow::ensure!(entry.metadata()?.len() == 512 * 1024 * 1024);
+        anyhow::ensure!(
+            streaming_sha(entry.path())? == input_hashes[i],
+            "selected 512MiB file differed from SHA-256 source"
+        );
+        checked += entry.metadata()?.len();
+    }
+    anyhow::ensure!(checked == 1024 * 1024 * 1024);
+    let unexpected = walkdir::WalkDir::new(downloads.join("selected"))
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_type().is_file() && entry.file_name() == "do-not-download.dat");
+    if let Some(entry) = unexpected {
+        // librqbit may reserve an unselected placeholder, but it must not
+        // contain any of the decoy's actual 0xA5 content.
+        let mut reader = std::fs::File::open(entry.path())?;
+        let mut block = vec![0u8; 1024 * 1024];
+        loop {
+            let len = reader.read(&mut block)?;
+            if len == 0 {
+                break;
+            }
+            anyhow::ensure!(
+                !block[..len].contains(&0xA5),
+                "unselected sentinel payload was downloaded unexpectedly"
+            );
+        }
+    }
+    // Cancel the finished session without deleting either completed file.
+    restored.cancel(&restored_key, false);
+    let cancel_start = Instant::now();
+    while restored.poll().0.iter().any(|(id, _)| id == &restored_key) {
+        anyhow::ensure!(cancel_start.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(streaming_sha(&bundle.join(files[0]))? == input_hashes[0]);
+    anyhow::ensure!(streaming_sha(&bundle.join(files[1]))? == input_hashes[1]);
+    println!(
+        "STAGE29_1GIB_SELECTED_TORRENT_PASS bytes={} files=2 pause_resume=true \
+         persisted_restart=true sha256_exact=true unselected_payload_absent=true \
+         generated_s={:.2} transfer_s={:.2} restart_wait_s={:.2} total_s={:.2} \
+         observed_transfer_mib_s={:.2} no_game_data=true",
+        checked,
+        generated_s,
+        transfer_s,
+        restart_wait_s,
+        started.elapsed().as_secs_f64(),
+        checked as f64 / (1024.0 * 1024.0) / transfer_s
+    );
+    drop(restored);
+    drop(seeder);
+    drop(runtime);
+    drop(tracker);
+    Ok(())
+}
+
 /// Stage 27: 256 MiB generated on disk in 1 MiB streaming chunks. Only
 /// localhost peers/tracker, isolated QA root; no game data or external DHT.
 /// The test deliberately checks pause, resumed progress and persisted-session

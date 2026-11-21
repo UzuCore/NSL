@@ -193,6 +193,151 @@ fn local_file_seeder(
     (runtime, session, handle, tracker, magnet)
 }
 
+/// Opt-in public-network transfer of a small CC BY 3.0 subtitle from the
+/// official WebTorrent Sintel test torrent. Never contact a Switch tracker
+/// during QA or download unlicensed games. Verified 20,792-byte metadata
+/// pins the selected subtitle index and prevents silent file substitution.
+#[test]
+#[ignore = "external peer availability required; CC BY 3.0 Sintel subtitle only"]
+fn stage17_public_licensed_sintel_selected_subtitle() -> anyhow::Result<()> {
+    use anyhow::Context;
+    use sha2::Digest;
+    use std::io::Read as _;
+    let qa_root = Path::new("E:\\NSL_QA_20261120");
+    anyhow::ensure!(qa_root.is_dir());
+    let private = tempfile::Builder::new()
+        .prefix("stage17-licensed-public-")
+        .tempdir_in(qa_root)?;
+    let started = Instant::now();
+    let metadata_url = "https://webtorrent.io/torrents/sintel.torrent";
+    let expected_srt_url = "https://webtorrent.io/torrents/Sintel/Sintel.en.srt";
+    let http = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(25))
+        .build();
+    let mut metadata = Vec::new();
+    http.get(metadata_url)
+        .call()
+        .context("CC BY 3.0 source torrent metadata HTTP failure")?
+        .into_reader()
+        .take(128 * 1024)
+        .read_to_end(&mut metadata)?;
+    anyhow::ensure!(metadata.len() == 20_792);
+    let fingerprint = sha2::Sha256::digest(&metadata)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    anyhow::ensure!(
+        fingerprint == "4c8fdad0414b4767546a0f92fe3d660a66edc32471874e7a1cfa97120317b84a",
+        "Creative Commons test torrent changed unexpectedly"
+    );
+    let magnet = "magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10&dn=Sintel&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fexplodie.org%3A6969&tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969";
+    let engine = TorrentEngine::new(private.path().join("downloads"))?;
+    // Prove that the catalog's normal magnet-only preview also works over
+    // public trackers: the official HTTPS .torrent above is a pinned
+    // reference, NOT the source used by the actual picker/download.
+    let request = engine.preview_files(magnet)?;
+    let preview = request
+        .receiver
+        .recv_timeout(Duration::from_secs(45))
+        .context("Public Creative Commons magnet metadata preview timeout")?
+        .map_err(anyhow::Error::msg)?;
+    drop(request);
+    anyhow::ensure!(preview.files.len() == 11);
+    let selected = preview
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("Sintel.en.srt"))
+        .context("Public magnet metadata missing licensed subtitle")?;
+    anyhow::ensure!(selected.index == 1 && selected.size == 1514);
+    anyhow::ensure!(
+        !private
+            .path()
+            .join("downloads")
+            .join("sintel-subtitle")
+            .exists(),
+        "Metadata preview unexpectedly downloaded payload files"
+    );
+    let key = engine.start_download_selected(
+        "Sintel Creative Commons subtitle (QA)",
+        magnet,
+        PathBuf::from("sintel-subtitle"),
+        Some(preview.torrent_bytes),
+        Some(vec![selected.index]),
+    )?;
+    let mut peer_seen = false;
+    let mut seen_bytes = false;
+    let mut final_notice = false;
+    let mut last_status = String::new();
+    while started.elapsed() < Duration::from_secs(85) {
+        let (status, notices) = engine.poll();
+        for (item_key, progress) in status {
+            if item_key != key {
+                continue;
+            }
+            if let Some(error) = progress.error {
+                anyhow::bail!("Licensed public torrent failed: {error}");
+            }
+            peer_seen |=
+                progress.active_seeders.unwrap_or(0) + progress.active_peers.unwrap_or(0) > 0;
+            seen_bytes |= progress.progress_bytes > 0;
+            last_status = format!(
+                "state={} bytes={}/{} finished={} paused={}",
+                progress.state,
+                progress.progress_bytes,
+                progress.total_bytes,
+                progress.finished,
+                progress.paused
+            );
+        }
+        for notice in notices {
+            if let EngineNotice::Download {
+                key: item_key,
+                result,
+            } = notice
+            {
+                if item_key == key {
+                    result.map_err(anyhow::Error::msg)?;
+                    final_notice = true;
+                }
+            }
+        }
+        if final_notice {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        final_notice,
+        "Public CC-BY torrent not completed; last_status={last_status} peer_seen={peer_seen} bytes_seen={seen_bytes}"
+    );
+    let file = walkdir::WalkDir::new(private.path().join("downloads"))
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_type().is_file() && entry.file_name() == "Sintel.en.srt")
+        .context("Selected Sintel subtitle not found in isolated downloaded files")?;
+    let contents = std::fs::read(file.path())?;
+    anyhow::ensure!(contents.len() == 1514, "Unexpected licensed subtitle bytes");
+    let mut authoritative = Vec::new();
+    http.get(expected_srt_url)
+        .call()
+        .context("Official CC-BY subtitle HTTPS reference not available")?
+        .into_reader()
+        .take(16 * 1024)
+        .read_to_end(&mut authoritative)?;
+    anyhow::ensure!(
+        contents == authoritative,
+        "BitTorrent selected subtitle did not match the official HTTPS version"
+    );
+    println!(
+        "STAGE17_PUBLIC_LICENSED_TORRENT_PASS download_bytes={} verified_https_equal=true live_peer_snapshot={} magnet_only_preview=true completion_notice=true elapsed_s={:.2}",
+        contents.len(),
+        peer_seen,
+        started.elapsed().as_secs_f64(),
+    );
+    drop(engine);
+    Ok(())
+}
+
 /// Full production batch pipeline using an authorized game fixture:
 /// real BitTorrent pieces over TCP loopback, verified metadata preview,
 /// selected-file queue, completion notice, crash-journal restoration,

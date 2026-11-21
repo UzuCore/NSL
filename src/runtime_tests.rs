@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn catalog_refresh_moves_verified_state_to_ui_without_reloading_saved_json() {
+    let (mut app, _private) = seeded_app();
+    app.torrent_engine = None;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    app.catalog_result = Some(receiver);
+    sender
+        .send(Ok(catalog::CatalogState {
+            items: vec![catalog::CatalogItem {
+                title: "Already current".into(),
+                title_id: Some("0100D2C0115B6000".into()),
+                magnet: "magnet:?xt=urn:btih:ABC".into(),
+                ..Default::default()
+            }],
+            source_url: catalog::DEFAULT_CATALOG_URL.into(),
+            updated_at: None,
+            etag: Some("\"unit-304\"".into()),
+            not_modified: true,
+        }))
+        .unwrap();
+    // No catalog snapshot is saved in this test, so the UI must take the
+    // already-parsed result directly from the background worker.
+    assert!(catalog::load(&app.base_dir).is_none());
+    run_app_ticks(&mut app, 2);
+    assert_eq!(app.catalog_state.items.len(), 1);
+    assert_eq!(app.catalog_state.items[0].title, "Already current");
+    assert!(app.status.contains("이미 최신"), "status: {}", app.status);
+    assert!(app.catalog_result.is_none());
+}
+
+#[test]
 fn normalizes_windows_scan_paths_for_existing_database_keys() {
     #[cfg(windows)]
     assert_eq!(

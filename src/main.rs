@@ -829,7 +829,7 @@ struct NslApp {
     update_ready: Option<PathBuf>,
     catalog_state: catalog::CatalogState,
     catalog_load_result: Option<Receiver<Option<catalog::CatalogState>>>,
-    catalog_result: Option<Receiver<std::result::Result<usize, String>>>,
+    catalog_result: Option<Receiver<std::result::Result<catalog::CatalogState, String>>>,
     catalog_search: String,
     catalog_search_committed: String,
     catalog_search_cache: Option<String>,

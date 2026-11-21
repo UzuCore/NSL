@@ -22,10 +22,12 @@ impl NslApp {
         let log = self.log_sender.clone();
         std::thread::spawn(move || {
             let result = catalog::download_with_progress(&base_dir, &source_url, Some(&progress))
-                .map(|state| state.items.len())
                 .map_err(|e| e.to_string());
             let _ = log.send(match &result {
-                Ok(count) => format!("✅ 카탈로그 다운로드 · {count}개 항목"),
+                Ok(state) if state.not_modified => {
+                    format!("✅ 카탈로그 이미 최신 · {}개 항목", state.items.len())
+                }
+                Ok(state) => format!("✅ 카탈로그 다운로드 · {}개 항목", state.items.len()),
                 Err(error) => format!("❌ 카탈로그 다운로드 실패 · {error}"),
             });
             let _ = tx.send(result);

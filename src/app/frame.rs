@@ -538,17 +538,22 @@ impl NslApp {
             self.catalog_result = None;
             self.catalog_progress = None;
             match done {
-                Ok(count) => {
-                    self.status = format!("카탈로그 {count}개 항목 준비 완료");
-                    if let Some(state) = catalog::load(&self.base_dir) {
-                        self.catalog_state = state;
-                        self.invalidate_catalog_title_details();
-                        self.catalog_page = 0;
-                        self.catalog_search_cache = None;
-                        self.catalog_matching_indices.clear();
-                        self.catalog_cover_retry_after.clear();
-                        self.catalog_cover_missing.clear();
-                    }
+                Ok(state) => {
+                    self.status = if state.not_modified {
+                        format!("카탈로그 이미 최신 · {}개 항목", state.items.len())
+                    } else {
+                        format!("카탈로그 {}개 항목 준비 완료", state.items.len())
+                    };
+                    // The background worker already parsed and validated the
+                    // state. Move it into the UI without a second JSON read
+                    // or parse, which could block the frame on large catalogs.
+                    self.catalog_state = state;
+                    self.invalidate_catalog_title_details();
+                    self.catalog_page = 0;
+                    self.catalog_search_cache = None;
+                    self.catalog_matching_indices.clear();
+                    self.catalog_cover_retry_after.clear();
+                    self.catalog_cover_missing.clear();
                 }
                 Err(e) => self.status = e,
             }

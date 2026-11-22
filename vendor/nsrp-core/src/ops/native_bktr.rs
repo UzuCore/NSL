@@ -494,9 +494,50 @@ mod tests {
     use crate::formats::ncz_stream::decompress_ncz_region_to_nca;
     use crate::keys::KeySet;
     use crate::ops::container::list_entries;
+    use crate::ops::native_compressed::{
+        CompressedBktrReader, validate_compressed_bktr_layout_after_verified_patch,
+    };
+    use anyhow::Context;
+    use sha2::Digest;
     use std::fs;
     use std::io::{BufWriter, Write};
     use std::sync::atomic::AtomicBool;
+    use std::{collections::BTreeMap, path::Path};
+
+    fn hash_sandbox_files(root: &Path) -> Result<BTreeMap<std::path::PathBuf, (u64, String)>> {
+        let mut result = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        let mut buffer = vec![0u8; 1024 * 1024];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir)? {
+                let path = entry?.path();
+                let meta = fs::symlink_metadata(&path)?;
+                ensure!(
+                    !meta.file_type().is_symlink(),
+                    "Unexpected symlink in sandbox RomFS"
+                );
+                if meta.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                ensure!(meta.is_file(), "Unrecognized sandbox RomFS object");
+                let mut hasher = sha2::Sha256::new();
+                let mut reader = File::open(&path)?;
+                loop {
+                    let n = reader.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..n]);
+                }
+                result.insert(
+                    path.strip_prefix(root)?.to_path_buf(),
+                    (meta.len(), hex::encode(hasher.finalize())),
+                );
+            }
+        }
+        Ok(result)
+    }
 
     #[test]
     fn physical_cursor_reuses_contiguous_reads_and_recovers_after_error() -> Result<()> {
@@ -525,8 +566,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires real compressed BKTR NSZ in a disposable NSRP_ROOT"]
-    fn inspect_real_compressed_bktr_index() -> Result<()> {
+    #[ignore = "requires a real base/patch Program NCZ pair with compressed BKTR metadata in disposable NSRP_ROOT"]
+    fn stage38_real_hashed_bktr_native_libhac_exact_sha() -> Result<()> {
         let root = std::path::PathBuf::from(
             std::env::var_os("NSRP_ROOT")
                 .ok_or_else(|| anyhow::anyhow!("NSRP_ROOT (isolated QA directory) is required"))?,
@@ -625,26 +666,48 @@ mod tests {
             derive_section_key(&update_info, &keys)?,
         )?;
         let levels = u32::from_le_bytes(fs_header[0x14..0x18].try_into()?);
+        ensure!(levels >= 2, "Invalid BKTR RomFS layer count: {levels}");
         let last = 0x18 + (levels as usize - 2) * 0x18;
+        ensure!(
+            last + 8 <= fs_header.len(),
+            "BKTR RomFS layer table exceeds its NCA header"
+        );
         let data_offset = u64::from_le_bytes(fs_header[last..last + 8].try_into()?);
         let table_offset = u64::from_le_bytes(fs_header[0x178..0x180].try_into()?);
         let table_size = u64::from_le_bytes(fs_header[0x180..0x188].try_into()?);
         ensure!(
-            table_size == 0x8000 && table_offset > 0,
-            "Unexpected compression tree"
+            (0x8000..=32 * 1024 * 1024).contains(&table_size)
+                && table_size % 0x4000 == 0
+                && table_offset > 0,
+            "This diagnostic requires bounded compressed BKTR metadata; input offset={table_offset:#x} size={table_size:#x}"
         );
-        reader.seek(SeekFrom::Start(data_offset + table_offset))?;
+        // The production decoder supports both single-leaf and multi-leaf
+        // BucketTrees. Require its complete geometry check instead of
+        // assuming the one 0x8000-byte fixture used in Stage 39.
+        let virtual_size = reader.virtual_size();
+        validate_compressed_bktr_layout_after_verified_patch(fs_header, virtual_size)?;
+        let tree_start = data_offset
+            .checked_add(table_offset)
+            .context("BKTR compression tree offset overflow")?;
+        ensure!(
+            tree_start
+                .checked_add(table_size)
+                .is_some_and(|end| end <= reader.virtual_size()),
+            "BKTR compression tree lies outside the virtual RomFS"
+        );
+        reader.seek(SeekFrom::Start(tree_start))?;
         let mut table = vec![0u8; table_size as usize];
         reader.read_exact(&mut table)?;
         eprintln!(
-            "COMPRESSED_BKTR_INDEX virtual_size={:#x} data_offset={:#x} table_offset={:#x} root_header={} leaf_header={}",
+            "COMPRESSED_BKTR_INDEX virtual_size={:#x} data_offset={:#x} table_offset={:#x} table_bytes={:#x} root_header={} leaf_header={}",
             reader.virtual_size(),
             data_offset,
             table_offset,
+            table_size,
             hex::encode(&table[..0x40]),
             hex::encode(&table[0x4000..0x4040])
         );
-        for i in 0..2 {
+        for i in 0..2.min((table_size as usize - 0x4010) / 0x18) {
             let at = 0x4010 + i * 0x18;
             eprintln!(
                 "COMPRESSED_BKTR_ENTRY index={} virtual={:#x} physical={:#x} type={} physical_size={:#x} reserved={}",
@@ -655,6 +718,201 @@ mod tests {
                 u32::from_le_bytes(table[at + 20..at + 24].try_into()?),
                 hex::encode(&table[at + 17..at + 20]),
             );
+        }
+        // Validate the complete compressed lookup and actual raw LZ4 data
+        // from the independently decrypted BKTR overlay. Reading at three
+        // widely separated locations exercises its seek/mapping logic while
+        // avoiding a full game extraction or any writes outside scratch.
+        let mut compressed =
+            CompressedBktrReader::open_from_verified_bktr(reader, fs_header, virtual_size)?;
+        let logical = compressed.logical_size();
+        ensure!(logical > 0, "Real compressed BKTR reports an empty RomFS");
+        for offset in [0, logical / 2, logical.saturating_sub(512)] {
+            let take = (logical - offset).min(512) as usize;
+            let mut probe = vec![0u8; take];
+            compressed.seek(SeekFrom::Start(offset))?;
+            compressed.read_exact(&mut probe)?;
+            eprintln!(
+                "STAGE40_COMPRESSED_BKTR_READ offset={offset:#x} bytes={take} sha256={}",
+                hex::encode(sha2::Sha256::digest(&probe)),
+            );
+        }
+        eprintln!(
+            "STAGE40_COMPRESSED_BKTR_VARIANT_PASS tree_bytes={table_size} logical_bytes={logical}"
+        );
+        if fs_header[5] == 1 {
+            ensure!(
+                CompressedBktrReader::open(
+                    std::io::Cursor::new(Vec::<u8>::new()),
+                    fs_header,
+                    virtual_size,
+                )
+                .is_err(),
+                "Unauthenticated raw reader unexpectedly accepted metadata-hashed BKTR"
+            );
+            let mut modified = fs_header.to_vec();
+            modified[0x1b0] ^= 1;
+            ensure!(
+                BktrVirtualReader::open(
+                    &base,
+                    &update,
+                    base_section,
+                    patch_section,
+                    &modified,
+                    (base_section.encryption_type == 3)
+                        .then(|| derive_section_key(&base_info, &keys))
+                        .transpose()?,
+                    derive_section_key(&update_info, &keys)?,
+                )
+                .is_err(),
+                "Forged authenticated metadata digest must fail"
+            );
+            modified = fs_header.to_vec();
+            modified[0x190..0x194].copy_from_slice(&u32::MAX.to_le_bytes());
+            ensure!(
+                BktrVirtualReader::open(
+                    &base,
+                    &update,
+                    base_section,
+                    patch_section,
+                    &modified,
+                    (base_section.encryption_type == 3)
+                        .then(|| derive_section_key(&base_info, &keys))
+                        .transpose()?,
+                    derive_section_key(&update_info, &keys)?,
+                )
+                .is_err(),
+                "Invalid compressed BucketTree entry count must fail before access"
+            );
+            eprintln!(
+                "STAGE41_HASHED_BKTR_TAMPER_REJECT_PASS sha256=1 invalid_index=1 unauthenticated_open=1"
+            );
+        }
+        if std::env::var_os("NSRP_STAGE41_VERIFY_ROMS").is_some() {
+            // The native extractor is never permitted to write outside the
+            // uniquely owned sandbox. This exercises ALL compressed blocks,
+            // not only the three probes in the earlier diagnostic.
+            let reference_executable = std::env::var_os("NSRP_STAGE41_HACTOOLNET_REFERENCE");
+            let reference_out = scratch.path().join("libhac");
+            let reference_first = reference_executable.is_some()
+                && std::env::var("NSRP_STAGE52_BKTR_ORDER").ok().as_deref() == Some("libhac_first");
+            let run_reference = || -> Result<u128> {
+                let executable = reference_executable
+                    .as_ref()
+                    .context("Independent LibHac executable missing")?;
+                let started = std::time::Instant::now();
+                let process = std::process::Command::new(executable)
+                    .arg("--disablekeywarns")
+                    .arg("--suppresskeys")
+                    .arg("--enablehash")
+                    .arg("--keyset")
+                    .arg(root.join("prod.keys"))
+                    .arg("--titlekeys")
+                    .arg(root.join("title.keys"))
+                    .arg("--basenca")
+                    .arg(&base)
+                    .arg("--romfsdir")
+                    .arg(&reference_out)
+                    .arg(&update)
+                    .output()?;
+                let elapsed_ms = started.elapsed().as_millis();
+                ensure!(
+                    process.status.success(),
+                    "Independent LibHac extraction failed: {}",
+                    String::from_utf8_lossy(&process.stderr)
+                );
+                Ok(elapsed_ms)
+            };
+            let reference_ms_before_native = if reference_first {
+                Some(run_reference()?)
+            } else {
+                None
+            };
+            let native_out = scratch.path().join("native");
+            let native_start = std::time::Instant::now();
+            let stats = crate::ops::native_fs::unpack_patched_nca(
+                &update,
+                &base,
+                &native_out,
+                &keys,
+                &AtomicBool::new(false),
+                true,
+                false,
+            )?;
+            let native_extract_ms = native_start.elapsed().as_millis();
+            // NativeFsStats writes a named "romfs" child. LibHac's
+            // --romfsdir writes its files directly at the requested path.
+            // Compare relative game paths, not these wrapper directories.
+            let native_files = hash_sandbox_files(&native_out.join("romfs"))?;
+            ensure!(
+                stats.romfs_files == native_files.len() && !native_files.is_empty(),
+                "Native authenticated compressed BKTR extraction file count mismatch"
+            );
+            eprintln!(
+                "STAGE41_NATIVE_HASHED_BKTR_FULL_EXTRACT_PASS files={} tree_bytes={table_size}",
+                native_files.len()
+            );
+            if reference_executable.is_some() {
+                let libhac_extract_ms = if let Some(time) = reference_ms_before_native {
+                    time
+                } else {
+                    run_reference()?
+                };
+                let reference_files = hash_sandbox_files(&reference_out)?;
+                eprintln!(
+                    "STAGE41_BKTR_INDEPENDENT_FILE_COUNTS native={} libhac={}",
+                    native_files.len(),
+                    reference_files.len()
+                );
+                if native_files != reference_files {
+                    for (name, value) in native_files
+                        .iter()
+                        .filter(|(name, value)| reference_files.get(*name) != Some(*value))
+                        .take(5)
+                    {
+                        eprintln!(
+                            "STAGE41_BKTR_DIFF native_path={} native={:?} reference={:?}",
+                            name.display(),
+                            value,
+                            reference_files.get(name)
+                        );
+                    }
+                    for (name, value) in reference_files
+                        .iter()
+                        .filter(|(name, _)| !native_files.contains_key(*name))
+                        .take(5)
+                    {
+                        eprintln!(
+                            "STAGE41_BKTR_EXTRA_REFERENCE path={} value={:?}",
+                            name.display(),
+                            value,
+                        );
+                    }
+                }
+                ensure!(
+                    reference_files == native_files,
+                    "Native BKTR files differ in names, sizes or SHA-256 from independent LibHac extraction"
+                );
+                eprintln!(
+                    "STAGE41_NATIVE_BKTR_LIBHAC_EXACT_SHA_MATCH files={} tree_bytes={table_size}",
+                    native_files.len()
+                );
+                let order = if reference_first {
+                    "libhac_then_native"
+                } else {
+                    "native_then_libhac"
+                };
+                eprintln!(
+                    "STAGE51_BKTR_EXTRACT_TIMING native_ms={native_extract_ms} libhac_ms={libhac_extract_ms} files={} tree_bytes={table_size} order={order} cache=uncontrolled hashes_outside_times",
+                    native_files.len()
+                );
+                eprintln!(
+                    "STAGE52_BKTR_BENCH_ORDER native_ms={native_extract_ms} libhac_ms={libhac_extract_ms} order={order} native_sort={} native_workers={} files={} tree_bytes={table_size}",
+                    std::env::var("NSRP_BKTR_BENCH_IO_ORDER").unwrap_or_else(|_| "tree".to_owned()),
+                    std::env::var("NSRP_BKTR_BENCH_WORKERS").unwrap_or_else(|_| "auto".to_owned()),
+                    native_files.len()
+                );
+            }
         }
         Ok(())
     }

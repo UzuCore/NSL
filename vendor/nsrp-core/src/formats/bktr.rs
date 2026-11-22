@@ -103,9 +103,29 @@ pub fn verify_patch_metadata_integrity<R: Read + Seek>(
     if fs[5] == 0 && trailer.iter().all(|&byte| byte == 0) {
         return Ok(false);
     }
+    // Authenticated BKTR can also contain an independent compressed RomFS
+    // BucketTree descriptor at 0x178..0x1a0. Verify its bounded geometry
+    // instead of treating that legitimate region as reserved metadata.
+    // The original SHA and every IVFC lookup block are still checked below.
+    let compressed = &fs[0x178..0x1a0];
+    let has_compression = compressed.iter().any(|&byte| byte != 0);
+    let compression_supported = !has_compression
+        || (LittleEndian::read_u64(&fs[0x178..0x180]) > 0
+            && (0x8000..=32 * 1024 * 1024).contains(&LittleEndian::read_u64(&fs[0x180..0x188]))
+            && &fs[0x188..0x18c] == b"BKTR"
+            && LittleEndian::read_u32(&fs[0x18c..0x190]) == 1
+            && (1..=1_000_000).contains(&LittleEndian::read_u32(&fs[0x190..0x194]))
+            && fs[0x194..0x1a0].iter().all(|&byte| byte == 0)
+            && {
+                let count = LittleEndian::read_u32(&fs[0x190..0x194]) as usize;
+                let leaves = count.div_ceil((NODE_SIZE - 0x10) / 0x18);
+                (1 + leaves).checked_mul(NODE_SIZE)
+                    == usize::try_from(LittleEndian::read_u64(&fs[0x180..0x188])).ok()
+            });
     ensure!(
         (fs[2], fs[3], fs[4], fs[5]) == (0, 3, 4, 1)
-            && fs[0x148..0x1a0].iter().all(|&byte| byte == 0)
+            && fs[0x148..0x178].iter().all(|&byte| byte == 0)
+            && compression_supported
             && fs[0x1d0..0x200].iter().all(|&byte| byte == 0),
         "BKTR metadata hash type or other storage extension is unsupported"
     );

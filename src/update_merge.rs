@@ -17,6 +17,7 @@ use nsrp_core::{
         xcz::{self, XczOptions},
     },
 };
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File},
     io::{Read, Write},
@@ -429,6 +430,31 @@ fn reap_dead_merge_workspaces(parent: &Path, destination: &Path) -> Result<usize
     Ok(removed)
 }
 
+fn fingerprint_publish_file(path: &Path, cancel: &AtomicBool) -> Result<(u64, [u8; 32])> {
+    let mut input = File::open(path)?;
+    let expected = input.metadata()?.len();
+    let mut total = 0u64;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        anyhow::ensure!(
+            !cancel.load(Ordering::Relaxed),
+            "publish fingerprint cancelled"
+        );
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .context("publish fingerprint overflow")?;
+        anyhow::ensure!(total <= expected, "publish source grew while hashing");
+        digest.update(&buffer[..read]);
+    }
+    anyhow::ensure!(total == expected, "publish source shortened while hashing");
+    Ok((total, digest.finalize().into()))
+}
+
 fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicBool) -> Result<()> {
     anyhow::ensure!(
         !cancel.load(Ordering::Relaxed),
@@ -466,11 +492,14 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
     // The work folder is on the destination's own volume (tempdir_in(parent)),
     // so persist_noclobber still performs an atomic no-overwrite publication.
     let fallback_parent = staged.parent().context("병합 임시 출력의 상위 폴더 없음")?;
+    let (expected_bytes, expected_hash) = fingerprint_publish_file(staged, cancel)?;
     let mut temp = tempfile::Builder::new()
         .prefix(".nsl-publish-")
         .tempfile_in(fallback_parent)?;
     let mut source = File::open(staged)?;
     let mut buffer = vec![0u8; 2 * 1024 * 1024];
+    let mut copied_bytes = 0u64;
+    let mut copied_digest = Sha256::new();
     #[cfg(test)]
     let mut written = 0u64;
     loop {
@@ -482,6 +511,14 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
         if count == 0 {
             break;
         }
+        copied_bytes = copied_bytes
+            .checked_add(count as u64)
+            .context("publish copy overflow")?;
+        anyhow::ensure!(
+            copied_bytes <= expected_bytes,
+            "publish source grew during copy"
+        );
+        copied_digest.update(&buffer[..count]);
         temp.as_file_mut().write_all(&buffer[..count])?;
         #[cfg(test)]
         {
@@ -496,6 +533,15 @@ fn publish_without_overwrite(staged: &Path, destination: &Path, cancel: &AtomicB
     }
     temp.as_file_mut().flush()?;
     temp.as_file_mut().sync_all()?;
+    anyhow::ensure!(
+        copied_bytes == expected_bytes && copied_digest.finalize().as_slice() == expected_hash,
+        "publish source changed while copying; refusing output"
+    );
+    let (staged_bytes, staged_hash) = fingerprint_publish_file(temp.path(), cancel)?;
+    anyhow::ensure!(
+        staged_bytes == expected_bytes && staged_hash == expected_hash,
+        "publish staged copy SHA-256 mismatch; refusing output"
+    );
     anyhow::ensure!(
         !cancel.load(Ordering::Relaxed),
         "병합 작업이 중단되었습니다"

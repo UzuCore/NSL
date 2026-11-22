@@ -26,6 +26,7 @@
 # Torrent downloads and resume state
 /downloads/
 /torrent-session/
+/.nsl-torrent-session.lock
 
 # QA screenshots and archived GUI evidence are local-only
 /docs/screenshots/

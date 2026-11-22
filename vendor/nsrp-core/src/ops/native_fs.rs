@@ -248,7 +248,8 @@ pub fn unpack_patched_nca(
                 // The raw BKTR overlay contains the compressed physical
                 // image. CompressionStorage maps the final IVFC data level
                 // into the *logical* RomFS, so use its independent size.
-                let mut compressed = CompressedBktrReader::open(reader, fs, virtual_size)?;
+                let mut compressed =
+                    CompressedBktrReader::open_from_verified_bktr(reader, fs, virtual_size)?;
                 let logical = compressed.logical_size();
                 let compressed_index = compressed.shared_index(virtual_size);
                 stats.romfs_files += extract_romfs_parallel(
@@ -264,7 +265,7 @@ pub fn unpack_patched_nca(
                             .as_deref()
                             == Some("reparse")
                         {
-                            CompressedBktrReader::open(overlay, fs, virtual_size)
+                            CompressedBktrReader::open_from_verified_bktr(overlay, fs, virtual_size)
                         } else {
                             CompressedBktrReader::open_shared(
                                 overlay,

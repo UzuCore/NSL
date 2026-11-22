@@ -120,12 +120,39 @@ pub(crate) fn validate_compressed_bktr_layout(
     fs: &[u8],
     physical_virtual_size: u64,
 ) -> Result<CompressedBktrLayout> {
+    validate_compressed_bktr_layout_inner(fs, physical_virtual_size, false)
+}
+
+/// Use only after BktrVirtualReader::open has authenticated the patch's
+/// metadata SHA and its entire lookup-table IVFC hash hierarchy.
+pub(crate) fn validate_compressed_bktr_layout_after_verified_patch(
+    fs: &[u8],
+    physical_virtual_size: u64,
+) -> Result<CompressedBktrLayout> {
+    validate_compressed_bktr_layout_inner(fs, physical_virtual_size, true)
+}
+
+fn validate_compressed_bktr_layout_inner(
+    fs: &[u8],
+    physical_virtual_size: u64,
+    verified_patch_metadata: bool,
+) -> Result<CompressedBktrLayout> {
+    ensure!(fs.len() == 0x200, "compressed BKTR header truncated");
+    let metadata_supported = match fs[5] {
+        0 => fs[0x1a0..0x200].iter().all(|&b| b == 0),
+        1 if verified_patch_metadata => {
+            u64::from_le_bytes(fs[0x1a8..0x1b0].try_into()?) == 0xe8
+                && fs[0x1b0..0x1d0].iter().any(|&b| b != 0)
+                && fs[0x1d0..0x200].iter().all(|&b| b == 0)
+        }
+        _ => false,
+    };
     ensure!(
-        fs.len() == 0x200
-            && (fs[2], fs[3], fs[4], fs[5]) == (0, 3, 4, 0)
+        (fs[2], fs[3], fs[4]) == (0, 3, 4)
+            && metadata_supported
             && &fs[8..12] == b"IVFC"
             && fs[0x148..0x178].iter().all(|&b| b == 0)
-            && fs[0x1a0..0x200].iter().all(|&b| b == 0),
+            && fs[0x194..0x1a0].iter().all(|&b| b == 0),
         "unsupported compressed BKTR filesystem"
     );
     let levels = read_u32(fs, 0x14)?;
@@ -187,9 +214,23 @@ impl<R: Read + Seek> CompressedBktrReader<R> {
         }
     }
 
-    pub(crate) fn open(mut source: R, fs: &[u8], physical_virtual_size: u64) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open(source: R, fs: &[u8], physical_virtual_size: u64) -> Result<Self> {
+        Self::open_with_verified_patch(source, fs, physical_virtual_size, false)
+    }
+
+    fn open_with_verified_patch(
+        mut source: R,
+        fs: &[u8],
+        physical_virtual_size: u64,
+        verified_patch_metadata: bool,
+    ) -> Result<Self> {
         let started = Instant::now();
-        let layout = validate_compressed_bktr_layout(fs, physical_virtual_size)?;
+        let layout = if verified_patch_metadata {
+            validate_compressed_bktr_layout_after_verified_patch(fs, physical_virtual_size)?
+        } else {
+            validate_compressed_bktr_layout(fs, physical_virtual_size)?
+        };
         let data_offset = layout.data_offset;
         let index_offset = layout.index_offset;
         let count = layout.entry_count;
@@ -345,6 +386,18 @@ impl<R: Read + Seek> CompressedBktrReader<R> {
             "compressed BKTR source virtual size changed after index validation"
         );
         Ok(Self::from_index(source, shared, Duration::ZERO))
+    }
+}
+
+impl CompressedBktrReader<super::native_bktr::BktrVirtualReader> {
+    /// Authenticated patch readers are constructed only after verifying
+    /// the metadata SHA and the complete IVFC lookup-table hash chain.
+    pub(crate) fn open_from_verified_bktr(
+        source: super::native_bktr::BktrVirtualReader,
+        fs: &[u8],
+        physical_virtual_size: u64,
+    ) -> Result<Self> {
+        Self::open_with_verified_patch(source, fs, physical_virtual_size, true)
     }
 }
 
@@ -558,6 +611,34 @@ mod tests {
         let mut malformed = plain;
         malformed[0x194] = 1;
         assert!(validate_compressed_bktr_layout(&malformed, 0xa000).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stage37_authenticated_bktr_layout_requires_verified_path_and_exact_bounds() -> Result<()> {
+        let (plain, data) = synthetic();
+        let mut authenticated = plain.clone();
+        authenticated[5] = 1;
+        authenticated[0x1a8..0x1b0].copy_from_slice(&0xe8u64.to_le_bytes());
+        authenticated[0x1b0] = 0x42;
+        assert!(validate_compressed_bktr_layout(&authenticated, 0xa000).is_err());
+        assert!(CompressedBktrReader::open(Cursor::new(data), &authenticated, 0xa000).is_err());
+        let layout = validate_compressed_bktr_layout_after_verified_patch(&authenticated, 0xa000)?;
+        assert_eq!(layout.index_bytes, 0x8000);
+
+        let mut invalid = authenticated.clone();
+        invalid[0x1a8..0x1b0].copy_from_slice(&0xe7u64.to_le_bytes());
+        assert!(validate_compressed_bktr_layout_after_verified_patch(&invalid, 0xa000).is_err());
+        invalid = authenticated.clone();
+        invalid[0x1d0] = 1;
+        assert!(validate_compressed_bktr_layout_after_verified_patch(&invalid, 0xa000).is_err());
+        invalid = authenticated.clone();
+        invalid[0x194] = 1;
+        assert!(validate_compressed_bktr_layout_after_verified_patch(&invalid, 0xa000).is_err());
+        invalid = authenticated;
+        invalid[5] = 2;
+        assert!(validate_compressed_bktr_layout_after_verified_patch(&invalid, 0xa000).is_err());
+        assert!(validate_compressed_bktr_layout(&plain, 0xa000).is_ok());
         Ok(())
     }
 

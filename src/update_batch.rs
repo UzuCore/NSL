@@ -209,7 +209,7 @@ pub(crate) fn new_update_batch(
             candidates,
             next_candidate: 0,
             found: None,
-            checked: row.verified_base,
+            checked: true,
             failure: None,
             job: None,
         });
@@ -310,7 +310,7 @@ pub(crate) fn new_dlc_batch(
                 candidates,
                 next_candidate: 0,
                 found: None,
-                checked: game.verified_base,
+                checked: true,
                 failure: None,
                 job: None,
             });
@@ -349,29 +349,54 @@ fn declared_package_identity(file: &torrent::TorrentFileEntry) -> Option<(String
         return None;
     }
     let name = file.path.file_name()?.to_str()?;
-    static IDS: OnceLock<Regex> = OnceLock::new();
+    let stem = name.rsplit_once('.').map(|(stem, _)| stem)?;
+    // TorrentShopNX accepts 16-hex Title IDs in parentheses and directly in
+    // filenames, not just [ID]. A strict boundary check rejects substrings of
+    // unrelated hashes and bundles declaring multiple different Title IDs.
+    let bytes = stem.as_bytes();
+    let mut found_id = None;
+    for start in 0..bytes.len().saturating_sub(15) {
+        let chunk = &bytes[start..start + 16];
+        if !chunk.iter().all(u8::is_ascii_hexdigit)
+            || (start > 0 && bytes[start - 1].is_ascii_hexdigit())
+            || (start + 16 < bytes.len() && bytes[start + 16].is_ascii_hexdigit())
+        {
+            continue;
+        }
+        let id = std::str::from_utf8(chunk).ok()?.to_ascii_uppercase();
+        if !id.starts_with("01") {
+            continue;
+        }
+        if found_id.is_some() {
+            // A multi-title bundle must be resolved from file contents by a
+            // later authenticated scan, never assigned to one game by guess.
+            return None;
+        }
+        found_id = Some(id);
+    }
+    let id = found_id?;
     static VERSIONS: OnceLock<Regex> = OnceLock::new();
-    let ids = IDS.get_or_init(|| Regex::new(r"(?i)\[([0-9a-f]{16})\]").unwrap());
-    let versions = VERSIONS.get_or_init(|| Regex::new(r"(?i)\[v([^\]]*)\]").unwrap());
-    let mut ids = ids.captures_iter(name);
-    let id = ids.next()?.get(1)?.as_str().to_ascii_uppercase();
-    if ids.next().is_some() {
+    static BRACKET_VERSIONS: OnceLock<Regex> = OnceLock::new();
+    let versions = VERSIONS.get_or_init(|| Regex::new(r"(?i)(?:\[|\(|_|\s)v([0-9]+)").unwrap());
+    let bracket_versions =
+        BRACKET_VERSIONS.get_or_init(|| Regex::new(r"(?i)[\[(]v([^\])]*)[\])]").unwrap());
+    let matches = versions.captures_iter(stem).collect::<Vec<_>>();
+    if matches.len() > 1 {
         return None;
     }
-    let mut versions = versions.captures_iter(name);
-    let version = match versions.next() {
-        Some(capture) => {
-            let digits = capture.get(1)?.as_str();
-            if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-                return None;
-            }
-            Some(digits.parse::<i64>().ok()?)
-        }
+    // A malformed explicit bracketed version must not be ignored as version 0.
+    if bracket_versions.captures_iter(stem).any(|c| {
+        c.get(1).is_some_and(|m| {
+            let value = m.as_str();
+            value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    }) {
+        return None;
+    }
+    let version = match matches.first() {
+        Some(capture) => Some(capture.get(1)?.as_str().parse::<i64>().ok()?),
         None => None,
     };
-    if versions.next().is_some() {
-        return None;
-    }
     Some((id, version))
 }
 
@@ -475,18 +500,16 @@ impl UpdateBatch {
         }
     }
 
+    /// A confirmed torrent file-list candidate can be downloaded regardless
+    /// of legacy library source; downloaded payload and original must still
+    /// pass the independent CNMT merge preflight before any output is written.
     pub(crate) fn eligible(&self) -> usize {
-        self.rows
-            .iter()
-            .filter(|row| row.merge_permitted && row.found.is_some())
-            .count()
+        self.rows.iter().filter(|row| row.found.is_some()).count()
     }
     pub(crate) fn chosen(&self) -> usize {
         self.rows
             .iter()
-            .filter(|row| {
-                row.merge_permitted && row.checked && row.found.is_some() && row.job.is_none()
-            })
+            .filter(|row| row.checked && row.found.is_some() && row.job.is_none())
             .count()
     }
     pub(crate) fn pending_catalog_count(&self) -> usize {
@@ -527,7 +550,7 @@ impl UpdateBatch {
     pub(crate) fn has_match_for_game(&self, id: i64) -> bool {
         self.rows
             .iter()
-            .any(|row| row.library_id == id && row.merge_permitted && row.found.is_some())
+            .any(|row| row.library_id == id && row.found.is_some())
     }
     pub(crate) fn progress(&self) -> (usize, usize) {
         let total = self.rows.len();
@@ -882,6 +905,37 @@ pub(crate) fn verify_downloaded_dlc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stage46_torrentshopnx_compatible_title_and_version_filename_forms() {
+        let entry = |name: &str| torrent::TorrentFileEntry {
+            index: 0,
+            path: PathBuf::from(name),
+            size: 4096,
+        };
+        let patch = "0100D2C0115B6800";
+        for name in [
+            "Patch (0100D2C0115B6800) (v196608).nsp",
+            "Patch 0100D2C0115B6800_v196608.nsz",
+            "Patch [0100D2C0115B6800][v196608].nsp",
+            "Patch 0100D2C0115B6800 v196608.nsp",
+        ] {
+            let file = entry(name);
+            assert_eq!(patch_file_version(&file, patch), Some(196608), "{name}");
+        }
+        let dlc = entry("DLC (0100D2C0115B7001).nsz");
+        assert_eq!(dlc_file_version(&dlc, "0100D2C0115B7001"), Some(0));
+        for name in [
+            "Wrong 0100D2C0115B6800 and 0100D2C0115B7800 v196608.nsp",
+            "Wrong BAD0100D2C0115B6800 v196608.nsp",
+            "Wrong [0100D2C0115B6800][vxyz].nsp",
+            "Wrong [0100D2C0115B6800][v196608][v131072].nsp",
+            "Wrong [0100D2C0115B6800][v196608].txt",
+        ] {
+            let file = entry(name);
+            assert_eq!(patch_file_version(&file, patch), None, "{name}");
+        }
+    }
+
     use super::*;
 
     fn entry(index: usize, name: &str, size: u64) -> torrent::TorrentFileEntry {

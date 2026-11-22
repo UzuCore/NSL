@@ -46,7 +46,99 @@ fn normalizes_windows_scan_paths_for_existing_database_keys() {
 }
 
 #[test]
-fn stage41_untrusted_library_base_is_never_queued_for_update_or_dlc() {
+#[ignore = "explicit opt-in: metadata-only live peer probe on 8 catalog magnets with isolated session"]
+fn stage46_live_metadata_probe_only_isolated() {
+    let sample_path = std::env::var("NSL_STAGE46_PUBLIC_METADATA_SAMPLE").unwrap();
+    let raw = std::fs::read(sample_path).unwrap();
+    let sample: Vec<serde_json::Value> = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(sample.len(), 8);
+    let isolated = tempfile::tempdir().unwrap();
+    let downloads = isolated.path().join("metadata-only");
+    let engine = torrent::TorrentEngine::new(downloads.clone()).unwrap();
+    let start = std::time::Instant::now();
+    let mut metadata_ok = 0usize;
+    let mut unavailable = 0usize;
+    let mut entries = 0usize;
+    let mut update_candidates = 0usize;
+    let mut dlc_candidates = 0usize;
+    for group in sample.chunks(4) {
+        let requests = group
+            .iter()
+            .map(|item| {
+                let magnet = item["magnet"].as_str().unwrap();
+                engine.preview_files_with_timeout(magnet, 25).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (item, request) in group.iter().zip(requests) {
+            match request
+                .receiver
+                .recv_timeout(std::time::Duration::from_secs(31))
+            {
+                Ok(Ok(preview)) => {
+                    metadata_ok += 1;
+                    entries += preview.files.len();
+                    let base = item["base"].as_str().unwrap();
+                    if item["kind"] == "update" {
+                        let installed = item["installed"].as_i64().unwrap();
+                        if update_batch::pick_current_patch(&preview.files, base, installed, 0)
+                            .is_some()
+                        {
+                            update_candidates += 1;
+                        }
+                    } else if let Some(dlcs) = item["missing_dlcs"].as_array() {
+                        for dlc in dlcs {
+                            if update_batch::pick_missing_dlc(&preview.files, dlc.as_str().unwrap())
+                                .is_some()
+                            {
+                                dlc_candidates += 1;
+                            }
+                        }
+                    }
+                }
+                _ => unavailable += 1,
+            }
+        }
+    }
+    assert_eq!(metadata_ok + unavailable, sample.len());
+    println!("STAGE46_LIVE_METADATA_ONLY sample={} metadata_ok={metadata_ok} unavailable={unavailable} entries={entries} update_file_candidates={update_candidates} dlc_file_candidates={dlc_candidates} elapsed_s={:.2} payload_downloads=0", sample.len(),start.elapsed().as_secs_f64());
+    assert!(
+        !downloads.join("downloads").exists(),
+        "metadata-only must never materialize game payloads"
+    );
+}
+
+#[test]
+fn stage46_download_candidate_cannot_merge_without_real_cnmt_and_cannot_touch_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.nsz");
+    let incoming = dir.path().join("candidate.nsp");
+    let original_bytes = b"unverified legacy original kept byte-identical";
+    let candidate_bytes = b"untrusted torrent file name is not package CNMT";
+    std::fs::write(&original, original_bytes).unwrap();
+    std::fs::write(&incoming, candidate_bytes).unwrap();
+    let control = update_merge::MergeControl::default();
+    assert!(
+        update_merge::merge_or_recover_existing_controlled(
+            &original,
+            &incoming,
+            "0100D2C0115B6000",
+            196_608,
+            &control
+        )
+        .is_err(),
+        "a downloaded file-list candidate must not authorize a merge"
+    );
+    assert_eq!(std::fs::read(&original).unwrap(), original_bytes);
+    assert_eq!(std::fs::read(&incoming).unwrap(), candidate_bytes);
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        2,
+        "no merged output or scratch file may be written before CNMT preflight"
+    );
+}
+
+#[test]
+fn stage46_legacy_base_catalog_hint_is_not_downloadable_without_a_file_match() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
     wait_for_rows(&mut app, &ctx);
@@ -88,13 +180,13 @@ fn stage41_untrusted_library_base_is_never_queued_for_update_or_dlc() {
         "untrusted originals may be metadata-probed"
     );
     assert!(!updates.rows[0].merge_permitted);
-    assert!(!updates.rows[0].checked);
+    assert!(updates.rows[0].checked);
     assert_eq!(updates.eligible(), 0);
     assert_eq!(updates.chosen(), 0);
     let dlcs = update_batch::new_dlc_batch(&[game], &[candidate], "");
     assert_eq!(dlcs.rows.len(), 1);
     assert!(!dlcs.rows[0].merge_permitted);
-    assert!(!dlcs.rows[0].checked);
+    assert!(dlcs.rows[0].checked);
     assert_eq!(dlcs.pending_dlc_id_count(), 1);
     assert_eq!(dlcs.chosen(), 0);
 }
@@ -537,7 +629,7 @@ fn stage44_release_with_newer_known_update_is_probed_before_newer_topic() {
 }
 
 #[test]
-fn stage44_unverified_dlc_can_probe_real_file_ids_without_queuing() {
+fn stage46_legacy_base_dlc_file_ids_can_be_download_candidates() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
     wait_for_rows(&mut app, &ctx);
@@ -564,7 +656,7 @@ fn stage44_unverified_dlc_can_probe_real_file_ids_without_queuing() {
     assert!(batch
         .rows
         .iter()
-        .all(|row| !row.merge_permitted && !row.checked));
+        .all(|row| !row.merge_permitted && row.checked));
     let (request, sender, _cancelled) = torrent::synthetic_preview_request();
     batch.rows[0].next_candidate = 1;
     batch.active = Some((0, request));
@@ -594,18 +686,25 @@ fn stage44_unverified_dlc_can_probe_real_file_ids_without_queuing() {
     assert!(!batch.running);
     assert_eq!(batch.file_candidate_count(), 2);
     assert_eq!(batch.unverified_file_candidate_count(), 2);
-    assert_eq!(batch.eligible(), 0);
-    assert_eq!(batch.chosen(), 0);
+    assert_eq!(batch.eligible(), 2);
+    assert_eq!(batch.chosen(), 2);
     assert_eq!(batch.preview_cache.len(), 1);
     for row in &mut batch.rows {
         row.checked = true;
     }
-    assert!(app::update_batch::grouped_batch_downloads(&batch).is_empty());
-    assert!(app::update_batch::checked_group_selection(&batch, &[(0, 100)]).is_err());
+    assert_eq!(app::update_batch::grouped_batch_downloads(&batch).len(), 1);
+    let (indices, bytes) =
+        app::update_batch::checked_group_selection(&batch, &[(0, 100), (1, 140)]).unwrap();
+    assert_eq!(indices, vec![0, 1]);
+    assert_eq!(bytes, 240);
+    assert!(
+        batch.rows.iter().all(|row| !row.merge_permitted),
+        "downloading file-name candidates must never grant merge trust"
+    );
 }
 
 #[test]
-fn stage44_unverified_partial_update_can_be_probed_but_never_downloaded() {
+fn stage46_legacy_base_newer_update_can_be_download_candidate() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
     wait_for_rows(&mut app, &ctx);
@@ -643,11 +742,18 @@ fn stage44_unverified_partial_update_can_be_probed_but_never_downloaded() {
     assert!(batch.rows[0].found.is_some());
     assert_eq!(batch.rows[0].found.as_ref().unwrap().version, 196608);
     assert_eq!(batch.unverified_file_candidate_count(), 1);
-    assert_eq!(batch.eligible(), 0);
+    assert_eq!(batch.eligible(), 1);
     batch.rows[0].checked = true;
-    assert_eq!(batch.chosen(), 0);
-    assert!(app::update_batch::grouped_batch_downloads(&batch).is_empty());
-    assert!(app::update_batch::checked_group_selection(&batch, &[(0, 2048)]).is_err());
+    assert_eq!(batch.chosen(), 1);
+    assert_eq!(app::update_batch::grouped_batch_downloads(&batch).len(), 1);
+    assert_eq!(
+        app::update_batch::checked_group_selection(&batch, &[(0, 2048)]).unwrap(),
+        (vec![0], 2048)
+    );
+    assert!(
+        !batch.rows[0].merge_permitted,
+        "download must not promote unverified original CNMT"
+    );
 }
 
 #[test]

@@ -543,6 +543,24 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn stage36_authenticated_bktr_metadata_cannot_bypass_unverified_reader() -> Result<()> {
+        let (plain, data) = synthetic();
+        assert!(validate_compressed_bktr_layout(&plain, 0xa000).is_ok());
+        let mut authenticated = plain.clone();
+        authenticated[5] = 1;
+        authenticated[0x1a8..0x1b0].copy_from_slice(&0xe8u64.to_le_bytes());
+        authenticated[0x1b0] = 0x42;
+        // The new NSRP format uses a separate IVFC chain. Until the full
+        // authenticated-patch call chain is ported, never silently trust it.
+        assert!(validate_compressed_bktr_layout(&authenticated, 0xa000).is_err());
+        assert!(CompressedBktrReader::open(Cursor::new(data), &authenticated, 0xa000).is_err());
+        let mut malformed = plain;
+        malformed[0x194] = 1;
+        assert!(validate_compressed_bktr_layout(&malformed, 0xa000).is_err());
+        Ok(())
+    }
+
     fn synthetic() -> (Vec<u8>, Vec<u8>) {
         let mut fs = vec![0u8; 0x200];
         fs[2..6].copy_from_slice(&[0, 3, 4, 0]);

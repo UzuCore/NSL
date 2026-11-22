@@ -58,6 +58,17 @@ impl Hfs0Index {
         if count == 0 || count > 16_384 || string_size > 64 * 1024 * 1024 {
             bail!("비정상 HFS0 헤더");
         }
+        // Refuse impossible archive headers before allocating attacker-
+        // controlled entry and string tables. The caller's file_size is the
+        // absolute end of the containing archive, not a relative length.
+        let header_end = base
+            .checked_add(16)
+            .and_then(|value| value.checked_add(u64::from(count) * 64))
+            .and_then(|value| value.checked_add(u64::from(string_size)))
+            .context("HFS0 header range overflow")?;
+        if header_end > file_size {
+            bail!("HFS0 header exceeds container bounds");
+        }
         let mut raw = vec![0u8; count as usize * 64];
         reader.read_exact(&mut raw)?;
         let mut strings = vec![0u8; string_size as usize];
@@ -72,9 +83,10 @@ impl Hfs0Index {
             let mut size = c.read_u64::<LittleEndian>()?;
             let string_offset = c.read_u32::<LittleEndian>()? as usize;
             let hash_target_size = c.read_u32::<LittleEndian>()?;
+            // Entry bytes 0x18..0x1f are reserved. SHA-256 starts at 0x20.
+            let _reserved = c.read_u64::<LittleEndian>()?;
             let mut hash = [0u8; 32];
             c.read_exact(&mut hash)?;
-            let _reserved = c.read_u64::<LittleEndian>()?;
             if string_offset >= strings.len() {
                 bail!("HFS0 문자열 오프셋 오류");
             }
@@ -351,8 +363,8 @@ where
         out.write_u64::<LittleEndian>(lengths[index])?;
         out.write_u32::<LittleEndian>(string_offsets[index])?;
         out.write_u32::<LittleEndian>(hash_lengths[index])?;
-        out.write_all(&hashes[index])?;
         out.write_u64::<LittleEndian>(0)?;
+        out.write_all(&hashes[index])?;
     }
     out.seek(SeekFrom::Start(end))?;
     Ok(end - header_begin)
@@ -468,8 +480,8 @@ pub fn build_from_paths_layout_cancelled(
         out.write_u64::<LittleEndian>(sizes[i])?;
         out.write_u32::<LittleEndian>(string_offsets[i])?;
         out.write_u32::<LittleEndian>(sizes[i].min(0x200) as u32)?;
-        out.write_all(&hashes[i])?;
         out.write_u64::<LittleEndian>(0)?;
+        out.write_all(&hashes[i])?;
     }
     out.write_all(&strings)?;
     let mut buf = vec![0u8; 4 * 1024 * 1024];
@@ -532,6 +544,150 @@ fn validate_name(name: &str) -> Result<()> {
 mod streaming_tests {
     use super::*;
     use std::fs::OpenOptions;
+
+    /// Only a user-owned, temporary NTFS sparse fixture is accepted here.
+    /// No 36 GiB allocation, scan, or user-library modification is needed.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires isolated Stage36 NTFS sparse fixture created by scripts/qa_stage36_sparse_hfs0.ps1"]
+    fn stage36_real_ntfs_sparse_36gib_hfs0() -> Result<()> {
+        use std::os::windows::fs::MetadataExt;
+        let path = PathBuf::from(
+            std::env::var_os("NSL_STAGE36_SPARSE_XCI")
+                .context("Stage36 QA sparse fixture path must be provided")?,
+        );
+        let qa = Path::new(r"E:\NSL_QA_20261120");
+        let parent = path.parent().context("missing sparse fixture parent")?;
+        anyhow::ensure!(
+            parent.starts_with(qa)
+                && parent
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("stage36-sparse-hfs0-"))
+                && path
+                    .file_name()
+                    .is_some_and(|name| name == "sparse_36gib.xci"),
+            "refusing sparse input outside the owned Stage36 QA fixture"
+        );
+        let meta = fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            meta.is_file() && !meta.file_type().is_symlink(),
+            "sparse fixture must be a real regular file"
+        );
+        anyhow::ensure!(
+            meta.file_attributes() & 0x200 != 0,
+            "NTFS sparse flag missing"
+        );
+        anyhow::ensure!(meta.len() == (36u64 << 30), "incorrect 36 GiB logical size");
+        let index = find_xci_root(&path)?;
+        assert_eq!(index.base, 512);
+        assert_eq!(index.data_start, 600);
+        let entry = index
+            .entry("big.nca")
+            .context("missing sparse HFS0 entry")?;
+        assert_eq!(entry.offset, 34u64 << 30);
+        assert_eq!(entry.size, 1u64 << 20);
+        let absolute = index.data_start + entry.offset;
+        assert!(absolute > u64::from(u32::MAX));
+        assert_eq!(
+            collect_leaf_entries(&path, false)?,
+            vec![("big.nca".to_owned(), absolute, 1u64 << 20)]
+        );
+        let mut file = File::open(&path)?;
+        file.seek(SeekFrom::Start(absolute))?;
+        let mut marker = [0; 15];
+        file.read_exact(&mut marker)?;
+        assert_eq!(&marker, b"STAGE36_SPARSE!");
+        file.seek(SeekFrom::Start(absolute + (1 << 20) - 4))?;
+        let mut tail = [0; 4];
+        file.read_exact(&mut tail)?;
+        assert_eq!(&tail, b"TAIL");
+        assert!(Hfs0Index::parse_at(&mut file, 512, absolute + (1 << 20) - 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stage36_virtual_36gib_hfs0_bounds_and_overflow() -> Result<()> {
+        // 36 GiB is advertised but never allocated or scanned.
+        let offset = 34u64 << 30;
+        let payload = 24u64 << 20;
+        let logical_size = 36u64 << 30;
+        let mut header = Vec::new();
+        header.extend_from_slice(b"HFS0");
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&10u32.to_le_bytes());
+        header.extend_from_slice(&0u32.to_le_bytes());
+        let mut entry = [0u8; 64];
+        entry[..8].copy_from_slice(&offset.to_le_bytes());
+        entry[8..16].copy_from_slice(&payload.to_le_bytes());
+        header.extend_from_slice(&entry);
+        header.extend_from_slice(b"large.nca\0");
+        let data_start = header.len() as u64;
+
+        let parsed = Hfs0Index::parse_at(&mut io::Cursor::new(&header), 0, logical_size)?;
+        assert_eq!(parsed.data_start, data_start);
+        assert_eq!(parsed.entries[0].name, "large.nca");
+        assert_eq!(parsed.entries[0].offset, offset);
+        assert_eq!(parsed.entries[0].size, payload);
+        assert!(
+            Hfs0Index::parse_at(
+                &mut io::Cursor::new(&header),
+                0,
+                data_start + offset + payload - 1,
+            )
+            .is_err()
+        );
+
+        // Rejected before the large, untrusted string-table allocation.
+        assert!(Hfs0Index::parse_at(&mut io::Cursor::new(&header), 0, data_start - 1,).is_err());
+        header[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(Hfs0Index::parse_at(&mut io::Cursor::new(&header), 0, u64::MAX).is_err());
+        assert!(Hfs0Index::parse_at(&mut io::Cursor::new(&header), u64::MAX, u64::MAX).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn stage36_hfs0_digest_at_standard_entry_offset() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let payload = vec![0x71u8; 0x500];
+        let source = temp.path().join("part.nca");
+        fs::write(&source, &payload)?;
+        let expected = Sha256::digest(&payload[..0x200]);
+        let staged = temp.path().join("staged.hfs0");
+        build_from_paths_layout(
+            &[("part.nca".to_owned(), source.clone())],
+            &staged,
+            0x200,
+            1,
+        )?;
+        let mut streaming = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp.path().join("streaming.hfs0"))?;
+        let names = vec!["part.nca".to_owned()];
+        build_to_stream(
+            &names,
+            &mut streaming,
+            0x200,
+            1,
+            &AtomicBool::new(false),
+            |_, output| {
+                output.write_all(&payload)?;
+                Ok(())
+            },
+        )?;
+        for archive in [staged, temp.path().join("streaming.hfs0")] {
+            let bytes = fs::read(&archive)?;
+            assert_eq!(&bytes[16 + 24..16 + 32], &[0u8; 8]);
+            assert_eq!(&bytes[16 + 32..16 + 64], expected.as_slice());
+            let mut file = File::open(&archive)?;
+            let index = Hfs0Index::parse_at(&mut file, 0, bytes.len() as u64)?;
+            assert_eq!(index.entries[0].hash, expected.as_slice());
+            assert_eq!(index.entries[0].hash_target_size, 0x200);
+        }
+        Ok(())
+    }
 
     fn readwrite(path: &Path) -> Result<File> {
         Ok(OpenOptions::new()

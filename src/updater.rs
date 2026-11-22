@@ -199,6 +199,10 @@ fn trusted_release_url(raw: &str) -> bool {
     })
 }
 
+fn release_can_offer_update(compatible_release: bool, download_url: Option<&str>) -> bool {
+    compatible_release && download_url.is_some_and(trusted_release_url)
+}
+
 fn http_agent(timeout: Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout(timeout).build()
 }
@@ -266,7 +270,9 @@ pub fn check_latest() -> Result<ReleaseInfo> {
         .find(|asset| asset.name.eq_ignore_ascii_case(RELEASE_ASSET))
         .map(|asset| asset.browser_download_url.clone())
         .filter(|url| trusted_release_url(url));
-    let is_newer = compatible_release
+    // Do not offer an automatic update unless the published release contains
+    // an explicitly trusted, installable ZIP asset. Keep metadata visible.
+    let is_newer = release_can_offer_update(compatible_release, download_url.as_deref())
         && commit_is_newer(
             &release_commit,
             build_commit(),
@@ -548,6 +554,18 @@ mod tests {
         assert!(valid_commit(&"a".repeat(40)));
         assert!(!valid_commit("2.0.1"));
         assert_eq!(short_commit(&"a".repeat(40)), "aaaaaaa");
+    }
+
+    #[test]
+    fn release_without_verified_zip_never_offers_update() {
+        let zip = "https://github.com/UzuCore/NSL/releases/download/build-20261120-173343-KST-r23/nsl-win64.zip";
+        assert!(release_can_offer_update(true, Some(zip)));
+        assert!(!release_can_offer_update(true, None));
+        assert!(!release_can_offer_update(
+            true,
+            Some("https://example.org/nsl-win64.zip")
+        ));
+        assert!(!release_can_offer_update(false, Some(zip)));
     }
 
     #[test]

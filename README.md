@@ -4,9 +4,9 @@
 
 **[최신 버전 다운로드](https://github.com/UzuCore/NSL/releases/latest)** · **[전체 릴리스](https://github.com/UzuCore/NSL/releases)** · **[수동 빌드 실행](https://github.com/UzuCore/NSL/actions/workflows/windows-build.yml)**
 
-> **개발 현황 (2026-11-20, KST)**
+> **Release and development status (checked 2026-11-23 KST)**
 >
-> 최신 기능 배포본은 **[Stage 20 / r22](https://github.com/UzuCore/NSL/releases/tag/build-20261120-072438-KST-r22)**이며, 소스 기준 커밋은 `d09c91a`입니다. 현재 `main`에는 이후 작업인 **[P2 앱 모듈화 (`af04b32`)](https://github.com/UzuCore/NSL/commit/af04b322921f34c5b06a49f0aed1e28c50326a7b)**와 **NSRP 참고 PFS0/HFS0 롬 컨테이너 파서 통합**이 추가되어 있습니다. **이후 소스는 컴파일·런타임 검증 및 새 릴리스 빌드 전 상태**이므로, 최신 다운로드 파일과 최신 소스가 동일한 커밋이라고 간주하지 마세요. **빌드와 배포는 사용자 수동 실행 전용**입니다.
+> **Latest public GitHub Release:** [r23, published 2026-11-20](https://github.com/UzuCore/NSL/releases/tag/build-20261120-173343-KST-r23), commit `1a10531`. **Development source:** Stage 40 (2026-11-23), tracked on the `main` branch; see commit history for its exact revision. Local `target/release/nsl.exe` is a separate developer build, NOT the public ZIP. New `main` commits do not automatically publish a release; the app updater only consumes published GitHub Releases. A newly merged, signed XCI/XCZ Eden boot, real NTFS error 112, SMB interruption and physical power loss still require independent verification.
 
 ## 주요 기능
 
@@ -68,6 +68,8 @@
 
 ## 개발·검증 현황
 
+**Historical results below (Stage 20/P2):** these are preserved as past QA evidence, not current Release or latest local test numbers. The local `docs/qa` and handoff records document subsequent Stage 40 work.
+
 | 기준 | 상태 |
 | --- | --- |
 | Stage 20 기능 구현 | **완료** — 파일 선택 트리, 다운로드 UI, 삭제 확인창, 시드·피어 표시 |
@@ -86,9 +88,9 @@
 | 토렌트 목록 조회 상태 표시 | **실제 메타데이터 조회 요청이 있을 때만** 진행 중 표시; 준비 완료·오류·`Esc`·취소 뒤 하단 상태 표시줄에 이전 진행 중 문구가 남지 않음 |
 | 미보유 업데이트 일괄 대조·병합 | 전용 탭에서 타이틀 ID·실제 토렌트 파일 버전 검증, 아이콘/목록 표시, 선택 일괄 다운로드 큐, CNMT 검증 후 NSRP 네이티브 병합·**원본 형식(NSP/NSZ/XCI/XCZ) 출력**, 실패 시 원본 보존. 재시작 작업 복원·검증 완료 파일 병합 재시도 추가. 압축 병합의 실제 게임 E2E 검증은 남음 |
 | NSRP 네이티브 엔진 단독 검수 | **100 PASS / 2 ignored / 0 FAIL** — HFS0/PFS0·BKTR·NCZ/XCZ 스트리밍 왕복·출력 원자성 등 벤더 모듈 테스트 통과 |
-| 현재 GitHub 공식 최신 배포본 | **r22 (`d09c91a`)** — P2 모듈화는 아직 미포함 |
+| Public GitHub Release (checked 2026-11-23) | **r23 (`1a10531`)**. Not the same as the newer Stage 40 developer build. |
 
-**위 Stage 20 결과는 기존 r22의 검수 기록**이며 최신 Rust 소스의 로컬 검수 결과는 별도로 표시했습니다. 공식 GitHub r22에는 P2 이후 변경 사항이 아직 포함되지 않았지만 `target\release\nsl.exe`는 최신 소스로 로컬 갱신합니다. 2026-11-20 이전의 과거 GitHub 릴리스·태그·빌드 기록은 정리되었고, 이날 생성된 배포본은 유지되어 있습니다.
+**Historical note:** The Stage 20 and early P2 rows above are archived verification history. Latest public release is r23; newer locally validated source is tracked in the local QA/handoff. The public release ZIP is not automatically rebuilt when `main` changes.
 
 남은 검증 과제는 **실제 GUI 마우스·키보드 조작**, 외부 네트워크 장애·물리적 디스크 부족·기기 분리, 대용량 NCZ의 동일 조건 릴리스 성능 비교, 전체 라이브러리 스캔 성능의 반복 측정 및 XCI/XCZ 특수 형식 호환성 확대입니다. localhost 격리 복구 테스트를 실제 인터넷 연결 품질 보증으로 해석하거나 검증하지 않은 성능 향상률을 보장하지 않습니다.
 

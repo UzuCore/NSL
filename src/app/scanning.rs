@@ -18,6 +18,70 @@ fn unchanged_scan_metadata(
             .is_some_and(|(old, current)| old.is_finite() && old == current)
 }
 
+/// Legacy scanner sources remain display-only until the current scanner
+/// independently reads a Base CNMT from the file itself.
+fn needs_legacy_cnmt_revalidation(record: &database::FileRecord) -> bool {
+    record
+        .contents
+        .iter()
+        .any(|item| item.content_type == "base")
+        && !record.contents.iter().any(|item| {
+            item.content_type == "base"
+                && matches!(
+                    item.source.as_str(),
+                    "header_cnmt" | "header_native" | "header_native_card"
+                )
+                && item.title_id.as_deref().is_some_and(|id| {
+                    id.len() == 16
+                        && u64::from_str_radix(id, 16)
+                            .ok()
+                            .is_some_and(|value| value & 0x1fff == 0)
+                })
+        })
+}
+
+/// Preserve old displayed metadata on unsupported crypto/layout; only decoded
+/// CNMT of the same Base ID may promote previously unverified records.
+fn validated_legacy_replacement(
+    old: &database::FileRecord,
+    scanned: scanner::ScanResult,
+) -> Option<database::FileRecord> {
+    let original_bases = old
+        .contents
+        .iter()
+        .filter(|item| item.content_type == "base")
+        .filter_map(|item| item.title_id.as_deref())
+        .collect::<Vec<_>>();
+    if original_bases.is_empty()
+        || !scanned.contents.iter().any(|item| {
+            item.content_type == "base"
+                && matches!(
+                    item.source.as_str(),
+                    "header_cnmt" | "header_native" | "header_native_card"
+                )
+                && item.title_id.as_deref().is_some_and(|id| {
+                    original_bases
+                        .iter()
+                        .any(|old_id| old_id.eq_ignore_ascii_case(id))
+                })
+        })
+    {
+        return None;
+    }
+    let mut upgraded = old.clone();
+    upgraded.contents = scanned.contents;
+    if !scanned.nacp_ko.is_empty() {
+        upgraded.nacp_ko = scanned.nacp_ko;
+    }
+    if !scanned.nacp_en.is_empty() {
+        upgraded.nacp_en = scanned.nacp_en;
+    }
+    if !scanned.nacp_ja.is_empty() {
+        upgraded.nacp_ja = scanned.nacp_ja;
+    }
+    Some(upgraded)
+}
+
 impl NslApp {
     pub(crate) fn start_reload(&mut self) {
         if self.reload_result.is_some() {
@@ -224,7 +288,8 @@ impl NslApp {
                                     old.mtime,
                                     meta.len() as i64,
                                     mtime,
-                                ) {
+                                ) && !needs_legacy_cnmt_revalidation(old)
+                                {
                                     skipped += 1;
                                     continue;
                                 }
@@ -277,6 +342,39 @@ impl NslApp {
                                 let same_metadata = cached_records.get(path).is_some_and(|old| {
                                     unchanged_scan_metadata(old.size, old.mtime, *size, *mtime)
                                 });
+                                // Re-decode legacy content even if size/mtime is unchanged.
+                                // Reuse the prior hash; the metadata reader does not need
+                                // a full-file copy or a new hash for unchanged inputs.
+                                let legacy_candidate = incremental
+                                    && !force_reanalyze
+                                    && same_metadata
+                                    && cached_record.is_some_and(needs_legacy_cnmt_revalidation);
+                                if legacy_candidate {
+                                    let old = cached_record.unwrap();
+                                    let result = if cancel.load(Ordering::Relaxed) {
+                                        (None, false)
+                                    } else {
+                                        scanner::scan_file_hashed(
+                                            source,
+                                            filename,
+                                            old.fast_hash.clone(),
+                                        )
+                                        .ok()
+                                        .and_then(|scanned| {
+                                            validated_legacy_replacement(old, scanned)
+                                        })
+                                        .map_or((None, true), |record| (Some(record), false))
+                                    };
+                                    progress.completed.fetch_add(1, Ordering::Relaxed);
+                                    if result.0.is_some() {
+                                        let _ = log.send(format!("CNMT 재검증 성공 · {filename}"));
+                                    } else if !cancel.load(Ordering::Relaxed) {
+                                        let _ = log.send(format!(
+                                            "CNMT 재검증 보류 (기존 기록 유지) · {filename}"
+                                        ));
+                                    }
+                                    return result;
+                                }
                                 // A record written before the NACP version column
                                 // existed has an empty version that a plain cache
                                 // hit would keep forever, so re-read those once.
@@ -423,7 +521,78 @@ impl NslApp {
 
 #[cfg(test)]
 mod metadata_cache_tests {
-    use super::unchanged_scan_metadata;
+    use super::{
+        needs_legacy_cnmt_revalidation, unchanged_scan_metadata, validated_legacy_replacement,
+    };
+    use crate::{database, scanner};
+
+    #[test]
+    fn stage42_legacy_cnmt_revalidation_requires_matching_decoded_base() {
+        let make_content = |id: &str, source: &str, kind: &str| scanner::Content {
+            title_id: Some(id.to_string()),
+            content_type: kind.to_string(),
+            source: source.to_string(),
+            version: 0,
+        };
+        let base_id = "0100D2C0115B6000";
+        let other_id = "0100AABBCCDDE000";
+        let old = database::FileRecord {
+            path: "C:/Games/renamed_without_title_id.nsp".into(),
+            filename: "renamed_without_title_id.nsp".into(),
+            size: 1234,
+            mtime: Some(123.5),
+            file_type: "nsp".into(),
+            scan_folder: "C:/Games".into(),
+            fast_hash: "original-hash".into(),
+            nacp_ko: "old-name".into(),
+            nacp_en: String::new(),
+            nacp_ja: String::new(),
+            contents: vec![make_content(base_id, "header_hactool", "base")],
+        };
+        assert!(needs_legacy_cnmt_revalidation(&old));
+        let scan = |content: scanner::Content| scanner::ScanResult {
+            fast_hash: "ignored-scan-hash".into(),
+            contents: vec![content],
+            nacp_ko: String::new(),
+            nacp_en: "verified".into(),
+            nacp_ja: String::new(),
+        };
+        assert!(validated_legacy_replacement(
+            &old,
+            scan(make_content(base_id, "filename", "base"))
+        )
+        .is_none());
+        assert!(validated_legacy_replacement(
+            &old,
+            scan(make_content(other_id, "header_native", "base"))
+        )
+        .is_none());
+        assert!(validated_legacy_replacement(
+            &old,
+            scan(make_content(base_id, "header_ticket", "base"))
+        )
+        .is_none());
+        assert!(validated_legacy_replacement(
+            &old,
+            scan(make_content(base_id, "header_native", "update"))
+        )
+        .is_none());
+        let upgraded = validated_legacy_replacement(
+            &old,
+            scan(make_content(base_id, "header_native", "base")),
+        )
+        .unwrap();
+        assert_eq!(upgraded.path, old.path);
+        assert_eq!(upgraded.fast_hash, old.fast_hash);
+        assert_eq!(upgraded.mtime, old.mtime);
+        assert_eq!(upgraded.size, old.size);
+        assert_eq!(upgraded.nacp_ko, "old-name");
+        assert_eq!(upgraded.nacp_en, "verified");
+        assert!(!needs_legacy_cnmt_revalidation(&upgraded));
+        let mut no_base = old;
+        no_base.contents.clear();
+        assert!(!needs_legacy_cnmt_revalidation(&no_base));
+    }
 
     #[test]
     fn subsecond_timestamp_changes_require_fast_hash_verification() {

@@ -250,6 +250,103 @@ fn validate_selected_cnmts(cnmts: &[CnmtInfo], base_id: &str, required_version: 
     Ok(())
 }
 
+/// Verify both input containers from decoded CNMT before any large merge I/O.
+/// Never infer identity or version from user-controlled filenames or paths.
+fn validate_input_cnmts(
+    original: &[CnmtInfo],
+    incoming: &[CnmtInfo],
+    base_id: &str,
+    dlc_id: Option<&str>,
+    required_version: i64,
+) -> Result<()> {
+    let base = cnmt::base_title_id(base_id)?;
+    anyhow::ensure!(
+        original.iter().any(|item| {
+            item.meta_type == ContentMetaType::Base && item.title_id.eq_ignore_ascii_case(&base)
+        }),
+        "원본 파일에 요청한 게임의 Base CNMT가 없습니다"
+    );
+    let (wanted_id, wanted_type) = if let Some(dlc_id) = dlc_id {
+        anyhow::ensure!(
+            cnmt::base_title_id(dlc_id)? == base,
+            "DLC가 다른 게임에 속합니다"
+        );
+        (dlc_id.to_ascii_uppercase(), ContentMetaType::Dlc)
+    } else {
+        let id = format!("{:016X}", u64::from_str_radix(&base, 16)? | 0x800);
+        (id, ContentMetaType::Update)
+    };
+    let selected: Vec<_> = incoming
+        .iter()
+        .filter(|item| {
+            item.title_id.eq_ignore_ascii_case(&wanted_id) && item.meta_type == wanted_type
+        })
+        .collect();
+    anyhow::ensure!(
+        selected.len() == 1 && i64::from(selected[0].version) >= required_version,
+        "선택한 업데이트/DLC의 CNMT ID, 종류 또는 버전이 일치하지 않습니다"
+    );
+    anyhow::ensure!(
+        incoming.iter().all(|item| {
+            item.title_id.eq_ignore_ascii_case(&wanted_id) && item.meta_type == wanted_type
+        }),
+        "패치 파일에 다른 게임 또는 다른 종류의 CNMT가 포함되어 있습니다"
+    );
+    let prior = original
+        .iter()
+        .filter(|item| {
+            item.title_id.eq_ignore_ascii_case(&wanted_id) && item.meta_type == wanted_type
+        })
+        .map(|item| item.version)
+        .max();
+    anyhow::ensure!(
+        prior.is_none_or(|version| selected[0].version > version),
+        "기존 콘텐츠보다 새로운 버전이 아닙니다"
+    );
+    Ok(())
+}
+
+fn preflight_input_cnmts(
+    original: &Path,
+    patch: &Path,
+    base_id: &str,
+    dlc_id: Option<&str>,
+    required_version: i64,
+    control: &MergeControl,
+) -> Result<()> {
+    control.ensure_running()?;
+    let prod_keys = scanner::prod_keys().context("CNMT 검사에 필요한 키 파일이 없습니다")?;
+    let workspace = tempfile::Builder::new()
+        .prefix("nsl-cnmt-preflight-")
+        .tempdir()?;
+    let disabled_tool = workspace.path().join("_nsl_external_tool_disabled.exe");
+    let (_, original_cnmts, _) = cnmt::discover_game_metadata(
+        original,
+        &workspace.path().join("original"),
+        &disabled_tool,
+        &prod_keys,
+        &control.cancelled,
+    )
+    .context("원본 CNMT를 읽을 수 없어 병합을 중단합니다")?;
+    control.ensure_running()?;
+    let (_, patch_cnmts, _) = cnmt::discover_game_metadata(
+        patch,
+        &workspace.path().join("patch"),
+        &disabled_tool,
+        &prod_keys,
+        &control.cancelled,
+    )
+    .context("업데이트 CNMT를 읽을 수 없어 병합을 중단합니다")?;
+    control.ensure_running()?;
+    validate_input_cnmts(
+        &original_cnmts,
+        &patch_cnmts,
+        base_id,
+        dlc_id,
+        required_version,
+    )
+}
+
 fn compression_options() -> CompressOptions {
     CompressOptions {
         level: DEFAULT_ZSTD_LEVEL,
@@ -687,6 +784,10 @@ fn merge_verified_package_target_controlled(
         !destination.exists(),
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
+    // Fail closed on mismatched, unreadable, stale or mixed CNMT inputs
+    // before allocating merge output, cleaning workspaces or copying NCAs.
+    control.stage("입력 파일 CNMT 호환성 검증");
+    preflight_input_cnmts(original, patch, base_id, dlc_id, wanted_version, control)?;
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
     // Only a dead, locked-marker-free workspace for this exact destination
     // may be reclaimed. Do this before the free-space preflight: a crashed
@@ -1245,6 +1346,125 @@ mod tests {
             validate_selected_cnmts(&[base, patch.clone(), patch], "0100D2C0115B6000", 196608)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stage41_input_cnmt_preflight_fails_closed_on_wrong_or_stale_content() {
+        let item = |title: &str, kind: ContentMetaType, version: u32| CnmtInfo {
+            cnmt_nca_name: format!("{title}.cnmt.nca"),
+            title_id: title.to_string(),
+            version,
+            meta_type: kind,
+            required_system_version: 0,
+            contents: vec![],
+            raw: vec![],
+        };
+        let base_id = "0100D2C0115B6000";
+        let patch_id = "0100D2C0115B6800";
+        let base = item(base_id, ContentMetaType::Base, 0);
+        let patch = item(patch_id, ContentMetaType::Update, 196608);
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&patch),
+            base_id,
+            None,
+            196608
+        )
+        .is_ok());
+        assert!(
+            validate_input_cnmts(&[], std::slice::from_ref(&patch), base_id, None, 196608).is_err()
+        );
+        assert!(
+            validate_input_cnmts(std::slice::from_ref(&base), &[], base_id, None, 196608).is_err()
+        );
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            &[patch.clone(), patch.clone()],
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            &[
+                patch.clone(),
+                item("0100D2C0115B7001", ContentMetaType::Dlc, 0)
+            ],
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            &[item("0100D2C0115B8800", ContentMetaType::Update, 196608)],
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            &[item(patch_id, ContentMetaType::Base, 196608)],
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&patch),
+            base_id,
+            None,
+            262144
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            &[base.clone(), patch.clone()],
+            std::slice::from_ref(&patch),
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            &[
+                base.clone(),
+                item(patch_id, ContentMetaType::Update, 262144)
+            ],
+            std::slice::from_ref(&patch),
+            base_id,
+            None,
+            196608
+        )
+        .is_err());
+        let dlc_id = "0100D2C0115B7001";
+        let dlc = item(dlc_id, ContentMetaType::Dlc, 0);
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&dlc),
+            base_id,
+            Some(dlc_id),
+            0
+        )
+        .is_ok());
+        assert!(validate_input_cnmts(
+            std::slice::from_ref(&base),
+            std::slice::from_ref(&dlc),
+            base_id,
+            Some("0100D2C0115BA001"),
+            0
+        )
+        .is_err());
+        assert!(validate_input_cnmts(
+            &[base, dlc.clone()],
+            std::slice::from_ref(&dlc),
+            base_id,
+            Some(dlc_id),
+            0
+        )
+        .is_err());
     }
 
     #[test]

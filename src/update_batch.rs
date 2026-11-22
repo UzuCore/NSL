@@ -139,6 +139,7 @@ pub(crate) fn new_update_batch(
                 .ok()
                 .is_some_and(|id| id & 0x1fff == 0);
         if !row.has_base
+            || !row.verified_base
             || !valid_base
             || row.latest_version <= row.version.max(row.update_version)
             || excluded
@@ -201,7 +202,7 @@ pub(crate) fn new_dlc_batch(
     }
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
-    for game in owned.iter().filter(|row| row.has_base) {
+    for game in owned.iter().filter(|row| row.has_base && row.verified_base) {
         let base = game.title_id.to_ascii_uppercase();
         let Ok(base_num) = u64::from_str_radix(&base, 16) else {
             continue;

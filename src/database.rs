@@ -61,6 +61,8 @@ pub struct GameFile {
     pub title_name: String,
     pub version: i64,
     pub has_base: bool,
+    /// Only decoded CNMT metadata can authorize a batch merge candidate.
+    pub verified_base: bool,
     pub has_update: bool,
     pub update_version: i64,
     pub latest_version: i64,
@@ -97,6 +99,7 @@ struct Content {
     title_id: Option<String>,
     version: i64,
     kind: String,
+    source: String,
 }
 #[derive(Default)]
 struct Group {
@@ -354,7 +357,7 @@ impl Database {
 
     pub fn files(&self, name_mode: &str) -> Result<Vec<GameFile>> {
         let conn = self.connect()?;
-        let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
+        let mut stmt = conn.prepare("SELECT gf.id,gf.path,gf.filename,gf.size,COALESCE(gf.file_type,''),COALESCE(gf.nacp_ko,''),COALESCE(gf.nacp_en,''),COALESCE(gf.nacp_ja,''),fc.title_id,COALESCE(fc.version,0),COALESCE(fc.content_type,'unknown'),COALESCE(fc.source,'none') FROM game_files gf LEFT JOIN file_contents fc ON gf.path=fc.path ORDER BY gf.path")?;
         let raw = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -369,6 +372,7 @@ impl Database {
                     title_id: r.get(8)?,
                     version: r.get(9)?,
                     kind: r.get(10)?,
+                    source: r.get(11)?,
                 },
             ))
         })?;
@@ -472,6 +476,16 @@ impl Database {
             let t = titles.get(&base).cloned().unwrap_or_default();
             let g = groups.get(&base);
             let has_base = cs.iter().any(|c| c.kind == "base");
+            // A filename, ticket, inferred base, or legacy cache record is
+            // display-only and must never authorize an automatic merge.
+            let verified_base = cs.iter().any(|c| {
+                c.kind == "base"
+                    && matches!(
+                        c.source.as_str(),
+                        "header_cnmt" | "header_native" | "header_native_card"
+                    )
+                    && c.title_id.as_deref() == Some(base.as_str())
+            });
             let has_update =
                 cs.iter().any(|c| c.kind == "update") || g.map(|x| x.has_update).unwrap_or(false);
             let update_version = cs
@@ -556,6 +570,7 @@ impl Database {
                 title_name,
                 version,
                 has_base,
+                verified_base,
                 has_update,
                 update_version,
                 latest_version: t.version,
@@ -1085,6 +1100,47 @@ mod tests {
         assert!(ids.contains("0100D2C0115B6000"));
         assert!(ids.contains("0100D2C0115B6800"));
         assert_eq!(db.cached_file_records().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stage41_library_requires_decoded_cnmt_for_automatic_merge_eligibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(dir.path().join("library.db")).unwrap();
+        db.init().unwrap();
+        let base_id = "0100D2C0115B6000";
+        db.load_titles(&[title(base_id, "Catalog Game", 196608)])
+            .unwrap();
+        for (source, should_verify) in [
+            ("filename", false),
+            ("derived_base", false),
+            ("header_ticket", false),
+            ("header_xml", false),
+            ("none", false),
+            ("header_cnmt", true),
+            ("header_native", true),
+            ("header_native_card", true),
+        ] {
+            let mut record = file_record(
+                &format!("C:/Games/{source}.xci"),
+                &format!("Spoofed [{base_id}][v999999].xci"),
+                vec![content(base_id, 0, "base")],
+            );
+            record.contents[0].source = source.into();
+            db.upsert_files(&[record]).unwrap();
+            let rows = db.files("db").unwrap();
+            let row = rows
+                .iter()
+                .find(|item| item.path.ends_with(&format!("{source}.xci")))
+                .unwrap();
+            assert!(
+                row.has_base,
+                "untrusted records may still be displayed: {source}"
+            );
+            assert_eq!(
+                row.verified_base, should_verify,
+                "provenance source={source}"
+            );
+        }
     }
 
     #[test]

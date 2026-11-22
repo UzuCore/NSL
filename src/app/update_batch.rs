@@ -516,6 +516,16 @@ impl NslApp {
             batch.rows.len(),
             eligible
         );
+        let withheld = self
+            .rows
+            .iter()
+            .filter(|row| row.has_base && !row.verified_base)
+            .count();
+        if withheld != 0 {
+            self.status.push_str(&format!(
+                " | CNMT 출처 미검증 원본 {withheld}개 자동 처리 제외 (라이브러리 재스캔 필요)"
+            ));
+        }
         self.update_batch = Some(batch);
     }
 

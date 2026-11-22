@@ -46,6 +46,51 @@ fn normalizes_windows_scan_paths_for_existing_database_keys() {
 }
 
 #[test]
+fn stage41_untrusted_library_base_is_never_queued_for_update_or_dlc() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    assert!(
+        game.verified_base,
+        "test fixture must have decoded CNMT provenance"
+    );
+    game.latest_version = 196_608;
+    game.update_version = 65_536;
+    game.missing_dlcs = vec![("0100D2C0115B7002".to_owned(), "DLC".to_owned())];
+    let candidate = catalog::CatalogItem {
+        title: "Matching release".into(),
+        title_id: Some(game.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABC".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        update_batch::new_update_batch(&[game.clone()], std::slice::from_ref(&candidate), "")
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(
+        update_batch::new_dlc_batch(&[game.clone()], std::slice::from_ref(&candidate), "")
+            .rows
+            .len(),
+        1
+    );
+    // Filename/ticket/derived-base entries remain visible in the library,
+    // but can never become automatic batch merge authorization.
+    game.verified_base = false;
+    assert!(game.has_base);
+    assert!(
+        update_batch::new_update_batch(&[game.clone()], std::slice::from_ref(&candidate), "")
+            .rows
+            .is_empty()
+    );
+    assert!(update_batch::new_dlc_batch(&[game], &[candidate], "")
+        .rows
+        .is_empty());
+}
+
+#[test]
 fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);

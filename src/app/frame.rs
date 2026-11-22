@@ -1749,9 +1749,9 @@ impl NslApp {
                                                             ));
                                                         });
                                                     });
-                                                let pending_catalog = self.folder_filter == "MISSING_UPDATES"
+                                                let pending_catalog = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
                                                     && self.update_batch.as_ref().is_some_and(|batch| {
-                                                        batch.kind == update_batch::BatchKind::Update
+                                                        batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update }
                                                             && batch.has_pending_catalog_hint_for_game(row.id)
                                                     });
                                                 if pending_catalog {
@@ -1974,9 +1974,9 @@ impl NslApp {
                                             (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
                                                 && batch.has_match_for_game(row.id)
                                         });
-                                    let catalog_pending = self.folder_filter == "MISSING_UPDATES"
+                                    let catalog_pending = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
                                         && self.update_batch.as_ref().is_some_and(|batch| {
-                                            batch.kind == update_batch::BatchKind::Update
+                                            batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update }
                                                 && batch.has_pending_catalog_hint_for_game(row.id)
                                         });
                                     let display_name: std::borrow::Cow<'_, str> = if catalog_pending {

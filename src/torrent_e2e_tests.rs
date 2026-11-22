@@ -706,6 +706,7 @@ fn stage25_two_games_one_torrent_selected_files_and_originals_preserved() -> any
         assert_eq!(file.size, bytes.len() as u64);
         rows.push(crate::update_batch::UpdateBatchRow {
             library_id: 2500 + index as i64,
+            merge_permitted: true,
             title_id: ids[index].to_string(),
             dlc_id: None,
             name: format!("Stage25 game {index}"),
@@ -1057,6 +1058,7 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
         kind: crate::update_batch::BatchKind::Update,
         rows: vec![crate::update_batch::UpdateBatchRow {
             library_id: 16,
+            merge_permitted: true,
             title_id: base_id.clone(),
             dlc_id: None,
             name: "Stage16 localhost-only Horror Tale 2 update".into(),

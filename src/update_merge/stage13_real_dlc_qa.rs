@@ -502,6 +502,7 @@ fn stage26_real_two_dlc_batch_cancel_restart_and_cleanup() -> Result<()> {
         )?;
         rows.push(UpdateBatchRow {
             library_id: 26,
+            merge_permitted: true,
             title_id: base.clone(),
             dlc_id: Some(dlc_id.clone()),
             name: format!("Stage26 verified DLC {}", index + 1),

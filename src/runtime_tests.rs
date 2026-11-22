@@ -80,14 +80,23 @@ fn stage41_untrusted_library_base_is_never_queued_for_update_or_dlc() {
     // but can never become automatic batch merge authorization.
     game.verified_base = false;
     assert!(game.has_base);
-    assert!(
-        update_batch::new_update_batch(&[game.clone()], std::slice::from_ref(&candidate), "")
-            .rows
-            .is_empty()
+    let updates =
+        update_batch::new_update_batch(&[game.clone()], std::slice::from_ref(&candidate), "");
+    assert_eq!(
+        updates.rows.len(),
+        1,
+        "untrusted originals may be metadata-probed"
     );
-    assert!(update_batch::new_dlc_batch(&[game], &[candidate], "")
-        .rows
-        .is_empty());
+    assert!(!updates.rows[0].merge_permitted);
+    assert!(!updates.rows[0].checked);
+    assert_eq!(updates.eligible(), 0);
+    assert_eq!(updates.chosen(), 0);
+    let dlcs = update_batch::new_dlc_batch(&[game], &[candidate], "");
+    assert_eq!(dlcs.rows.len(), 1);
+    assert!(!dlcs.rows[0].merge_permitted);
+    assert!(!dlcs.rows[0].checked);
+    assert_eq!(dlcs.pending_dlc_id_count(), 1);
+    assert_eq!(dlcs.chosen(), 0);
 }
 
 #[test]
@@ -119,7 +128,8 @@ fn stage43_catalog_hints_do_not_authorize_unverified_game_downloads() {
         "",
     );
     assert_eq!(batch.rows.len(), 1);
-    assert_eq!(batch.catalog_hint_count(), 2);
+    assert_eq!(batch.catalog_hint_count(), 1);
+    assert!(batch.rows.iter().all(|row| row.merge_permitted));
     assert_eq!(batch.pending_catalog_count(), 1);
     assert!(batch.has_pending_catalog_hint_for_game(pending.id));
     assert!(!batch.has_pending_catalog_hint_for_game(verified.id));
@@ -285,6 +295,154 @@ fn missing_dlc_audit_is_per_title_id_and_toolbar_is_visible() {
         data.get_temp::<egui::Rect>(egui::Id::new("nsl_test_update_batch_toolbar"))
     });
     assert!(rect.is_some_and(|rect| rect.width() > 100.0 && rect.height() > 0.0));
+}
+
+#[test]
+fn stage44_release_with_newer_known_update_is_probed_before_newer_topic() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut base = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    base.latest_version = 262144;
+    base.update_version = 65536;
+    let older = catalog::CatalogItem {
+        title: base.title_name.clone(),
+        title_id: Some(base.title_id.clone()),
+        update_version: Some(65536),
+        topic_id: "9999999".into(),
+        magnet: "magnet:?xt=urn:btih:AAAA".into(),
+        ..Default::default()
+    };
+    let newer = catalog::CatalogItem {
+        title: base.title_name.clone(),
+        title_id: Some(base.title_id.clone()),
+        update_version: Some(196608),
+        topic_id: "1000".into(),
+        magnet: "magnet:?xt=urn:btih:BBBB".into(),
+        ..Default::default()
+    };
+    let batch = update_batch::new_update_batch(&[base], &[older, newer], "");
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.rows[0].candidates, vec![1, 0]);
+    let old_json = serde_json::to_value(catalog::CatalogItem::default()).unwrap();
+    assert!(
+        !old_json.as_object().unwrap().contains_key("update_version"),
+        "legacy catalog snapshot digests must stay stable"
+    );
+}
+
+#[test]
+fn stage44_unverified_dlc_can_probe_real_file_ids_without_queuing() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|r| r.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap() & !0x1fff;
+    let first = format!("{:016X}", base | 0x1001);
+    let second = format!("{:016X}", base | 0x1002);
+    game.missing_dlcs = vec![
+        (first.clone(), "First".into()),
+        (second.clone(), "Second".into()),
+    ];
+    game.verified_base = false;
+    let catalog = catalog::CatalogItem {
+        title: "A bundle containing multiple DLCs".into(),
+        title_id: Some(game.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let mut batch = update_batch::new_dlc_batch(&[game], std::slice::from_ref(&catalog), "");
+    assert_eq!(batch.rows.len(), 2);
+    assert_eq!(batch.pending_catalog_count(), 1);
+    assert_eq!(batch.pending_dlc_id_count(), 2);
+    assert_eq!(batch.catalog_hint_count(), 2);
+    assert!(batch
+        .rows
+        .iter()
+        .all(|row| !row.merge_permitted && !row.checked));
+    let (request, sender, _cancelled) = torrent::synthetic_preview_request();
+    batch.rows[0].next_candidate = 1;
+    batch.active = Some((0, request));
+    sender
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![
+                torrent::TorrentFileEntry {
+                    index: 0,
+                    path: format!("DLC [{first}][v0].nsp").into(),
+                    size: 100,
+                },
+                torrent::TorrentFileEntry {
+                    index: 1,
+                    path: format!("DLC [{second}][v0].nsz").into(),
+                    size: 140,
+                },
+                torrent::TorrentFileEntry {
+                    index: 2,
+                    path: format!("Wrong [{base:016X}][v0].nsp").into(),
+                    size: 100,
+                },
+            ],
+            torrent_bytes: vec![1, 2, 3],
+        }))
+        .unwrap();
+    batch.tick(&[catalog], None);
+    assert!(!batch.running);
+    assert_eq!(batch.file_candidate_count(), 2);
+    assert_eq!(batch.unverified_file_candidate_count(), 2);
+    assert_eq!(batch.eligible(), 0);
+    assert_eq!(batch.chosen(), 0);
+    assert_eq!(batch.preview_cache.len(), 1);
+    for row in &mut batch.rows {
+        row.checked = true;
+    }
+    assert!(app::update_batch::grouped_batch_downloads(&batch).is_empty());
+    assert!(app::update_batch::checked_group_selection(&batch, &[(0, 100)]).is_err());
+}
+
+#[test]
+fn stage44_unverified_partial_update_can_be_probed_but_never_downloaded() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|r| r.has_base).unwrap().clone();
+    game.verified_base = false;
+    game.update_version = 65_536;
+    game.latest_version = 262_144;
+    let patch = format!(
+        "{:016X}",
+        u64::from_str_radix(&game.title_id, 16).unwrap() | 0x800
+    );
+    let catalog = catalog::CatalogItem {
+        title: "Patch bundle".into(),
+        title_id: Some(game.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let mut batch = update_batch::new_update_batch(&[game], std::slice::from_ref(&catalog), "");
+    assert_eq!(batch.rows.len(), 1);
+    assert!(!batch.rows[0].merge_permitted);
+    let (request, sender, _cancelled) = torrent::synthetic_preview_request();
+    batch.rows[0].next_candidate = 1;
+    batch.active = Some((0, request));
+    sender
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: format!("Patch [{patch}][v196608].nsp").into(),
+                size: 2048,
+            }],
+            torrent_bytes: vec![1, 2, 3],
+        }))
+        .unwrap();
+    batch.tick(&[catalog], None);
+    assert!(batch.rows[0].found.is_some());
+    assert_eq!(batch.rows[0].found.as_ref().unwrap().version, 196608);
+    assert_eq!(batch.unverified_file_candidate_count(), 1);
+    assert_eq!(batch.eligible(), 0);
+    batch.rows[0].checked = true;
+    assert_eq!(batch.chosen(), 0);
+    assert!(app::update_batch::grouped_batch_downloads(&batch).is_empty());
+    assert!(app::update_batch::checked_group_selection(&batch, &[(0, 2048)]).is_err());
 }
 
 #[test]
@@ -475,6 +633,7 @@ fn stage25_ten_thousand_catalog_matches_group_in_one_pass() {
         let base_id = format!("{:016X}", 0x0100_0000_0000_0000u64 + ((i as u64) << 13));
         rows.push(update_batch::UpdateBatchRow {
             library_id: i as i64,
+            merge_permitted: true,
             title_id: base_id.clone(),
             dlc_id: None,
             name: format!("Generated {i}"),
@@ -983,6 +1142,7 @@ fn isolated_real_finished_transfer_restart_runs_native_nsz_merge() -> anyhow::Re
         kind: update_batch::BatchKind::Update,
         rows: vec![update_batch::UpdateBatchRow {
             library_id: 1,
+            merge_permitted: true,
             title_id: base_id.clone(),
             dlc_id: None,
             name: "Horror Tale 2 isolated Stage 15".into(),
@@ -1096,6 +1256,7 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
         kind: update_batch::BatchKind::Update,
         rows: vec![update_batch::UpdateBatchRow {
             library_id: 25,
+            merge_permitted: true,
             title_id: "0100D2C0115B6000".into(),
             dlc_id: None,
             name: "QA title".into(),

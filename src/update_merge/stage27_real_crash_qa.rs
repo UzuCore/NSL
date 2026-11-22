@@ -153,6 +153,7 @@ fn stage28_real_dlc_postpublish_prejournal_crash_recovers_without_rewriting() ->
         kind: BatchKind::Dlc,
         rows: vec![UpdateBatchRow {
             library_id: 28,
+            merge_permitted: true,
             title_id: BASE.into(),
             dlc_id: Some(DLC.into()),
             name: "Stage28 already-published DLC crash recovery".into(),
@@ -348,6 +349,7 @@ fn stage27_real_dlc_mid_write_owned_child_crash_and_retry() -> Result<()> {
 
     let row = UpdateBatchRow {
         library_id: 27,
+        merge_permitted: true,
         title_id: BASE.into(),
         dlc_id: Some(DLC.into()),
         name: "Stage27 real DLC crash".into(),

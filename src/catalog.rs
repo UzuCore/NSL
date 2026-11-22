@@ -40,6 +40,9 @@ pub struct CatalogItem {
     pub cover: String,
     #[serde(default)]
     pub title_id: Option<String>,
+    /// Optional source-catalog hint. Never substitutes for a real patch CNMT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_version: Option<u32>,
 }
 
 impl CatalogItem {

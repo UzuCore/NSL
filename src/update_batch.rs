@@ -47,6 +47,8 @@ pub(crate) struct UpdateBatch {
 
 pub(crate) struct UpdateBatchRow {
     pub(crate) library_id: i64,
+    /// Decoded CNMT provenance of the original Base, never a catalog hint.
+    pub(crate) merge_permitted: bool,
     pub(crate) title_id: String,
     pub(crate) dlc_id: Option<String>,
     pub(crate) name: String,
@@ -96,7 +98,7 @@ pub(crate) enum UpdateBatchJobStatus {
     Failed(String),
 }
 
-fn preferred_release_score(item: &catalog::CatalogItem, game: &str) -> (u8, u8, u64) {
+fn preferred_release_score(item: &catalog::CatalogItem, game: &str) -> (u8, u8, u8, u32, u64) {
     let title = item.title.to_lowercase();
     let modded = [
         "[mod",
@@ -116,7 +118,17 @@ fn preferred_release_score(item: &catalog::CatalogItem, game: &str) -> (u8, u8, 
     let matching_name =
         search_terms.is_empty() || search_terms.iter().any(|term| title.contains(term));
     let topic = item.topic_id.parse::<u64>().unwrap_or(0);
-    (u8::from(matching_name), u8::from(!modded), topic)
+    // TorrentShopNX ranks confirmed newer release metadata ahead of old
+    // topic numbers. This is ONLY a release-search ordering hint in NSL:
+    // the torrent's exact Update/DLC file ID and decoded CNMT still decide.
+    let update = item.update_version.unwrap_or(0);
+    (
+        u8::from(matching_name),
+        u8::from(!modded),
+        u8::from(update > 0),
+        update,
+        topic,
+    )
 }
 
 pub(crate) fn new_update_batch(
@@ -135,7 +147,11 @@ pub(crate) fn new_update_batch(
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
     let mut pending_catalog_hints = HashMap::new();
-    for row in owned {
+    for row in owned
+        .iter()
+        .filter(|row| row.verified_base)
+        .chain(owned.iter().filter(|row| !row.verified_base))
+    {
         let valid_base = row.title_id.len() == 16
             && row.title_id.bytes().all(|byte| byte.is_ascii_hexdigit())
             && u64::from_str_radix(&row.title_id, 16)
@@ -151,12 +167,12 @@ pub(crate) fn new_update_batch(
             continue;
         }
         if !row.verified_base {
-            // Preserve catalog visibility without treating a filename/ticket
-            // or historical unverified record as a mergeable game.
+            // Metadata-only probing is allowed; a download/merge is not.
             if let Some(indices) = by_id.get(&row.title_id.to_ascii_uppercase()) {
                 pending_catalog_hints.insert(row.id, indices.len());
+            } else {
+                continue;
             }
-            continue;
         }
         if !seen.insert(row.title_id.to_ascii_uppercase()) {
             continue;
@@ -172,6 +188,7 @@ pub(crate) fn new_update_batch(
         candidates.truncate(MAX_RELEASES_PER_GAME);
         rows.push(UpdateBatchRow {
             library_id: row.id,
+            merge_permitted: row.verified_base,
             title_id: row.title_id.to_ascii_uppercase(),
             dlc_id: None,
             name: row.title_name.clone(),
@@ -182,7 +199,7 @@ pub(crate) fn new_update_batch(
             candidates,
             next_candidate: 0,
             found: None,
-            checked: true,
+            checked: row.verified_base,
             failure: None,
             job: None,
         });
@@ -215,7 +232,16 @@ pub(crate) fn new_dlc_batch(
     }
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
-    for game in owned.iter().filter(|row| row.has_base && row.verified_base) {
+    let mut pending_catalog_hints = HashMap::new();
+    for game in owned
+        .iter()
+        .filter(|row| row.has_base && row.verified_base)
+        .chain(
+            owned
+                .iter()
+                .filter(|row| row.has_base && !row.verified_base),
+        )
+    {
         let base = game.title_id.to_ascii_uppercase();
         let Ok(base_num) = u64::from_str_radix(&base, 16) else {
             continue;
@@ -237,6 +263,13 @@ pub(crate) fn new_dlc_batch(
                 continue;
             }
             let mut candidates = by_base.get(&base).cloned().unwrap_or_default();
+            if !game.verified_base {
+                if candidates.is_empty() {
+                    continue;
+                }
+                // Counts pending DLC IDs for this game, not its releases.
+                *pending_catalog_hints.entry(game.id).or_insert(0) += 1;
+            }
             candidates.sort_by(|&a, &b| {
                 let rank = |item: &catalog::CatalogItem| {
                     (
@@ -253,6 +286,7 @@ pub(crate) fn new_dlc_batch(
             candidates.truncate(MAX_RELEASES_PER_DLC);
             rows.push(UpdateBatchRow {
                 library_id: game.id,
+                merge_permitted: game.verified_base,
                 title_id: base.clone(),
                 dlc_id: Some(id),
                 name: format!("{} · {}", game.title_name, name),
@@ -263,7 +297,7 @@ pub(crate) fn new_dlc_batch(
                 candidates,
                 next_candidate: 0,
                 found: None,
-                checked: true,
+                checked: game.verified_base,
                 failure: None,
                 job: None,
             });
@@ -278,7 +312,7 @@ pub(crate) fn new_dlc_batch(
         confirm_queue: false,
         preview_cache: HashMap::new(),
         preview_cache_bytes: 0,
-        pending_catalog_hints: HashMap::new(),
+        pending_catalog_hints,
     }
 }
 
@@ -333,14 +367,14 @@ fn patch_file_version(file: &torrent::TorrentFileEntry, patch_id: &str) -> Optio
     version.filter(|value| *value > 0)
 }
 
-/// Requires a specific update TitleID and a version >= the game's current
-/// title database version; packages without trustworthy filename metadata are
-/// withheld from automatic download rather than guessed from release titles.
+/// Allow a partial newer update even if it does not reach the title DB's
+/// newest known version, following the metadata-probing approach. File names
+/// are not trusted CNMT; actual merging still requires cryptographic parsing.
 pub(crate) fn pick_current_patch<'a>(
     files: &'a [torrent::TorrentFileEntry],
     title_id: &str,
     installed: i64,
-    latest: i64,
+    _latest: i64,
 ) -> Option<(&'a torrent::TorrentFileEntry, i64)> {
     if title_id.len() != 16 || !title_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -354,7 +388,7 @@ pub(crate) fn pick_current_patch<'a>(
         .iter()
         .filter_map(|file| {
             let version = patch_file_version(file, &patch_id)?;
-            (version > installed && version >= latest).then_some((file, version))
+            (version > installed).then_some((file, version))
         })
         .max_by_key(|(_, version)| *version)
 }
@@ -426,16 +460,41 @@ impl UpdateBatch {
     }
 
     pub(crate) fn eligible(&self) -> usize {
-        self.rows.iter().filter(|row| row.found.is_some()).count()
+        self.rows
+            .iter()
+            .filter(|row| row.merge_permitted && row.found.is_some())
+            .count()
     }
     pub(crate) fn chosen(&self) -> usize {
         self.rows
             .iter()
-            .filter(|row| row.checked && row.found.is_some() && row.job.is_none())
+            .filter(|row| {
+                row.merge_permitted && row.checked && row.found.is_some() && row.job.is_none()
+            })
             .count()
     }
     pub(crate) fn pending_catalog_count(&self) -> usize {
         self.pending_catalog_hints.len()
+    }
+
+    pub(crate) fn pending_dlc_id_count(&self) -> usize {
+        if self.kind == BatchKind::Dlc {
+            self.pending_catalog_hints.values().copied().sum()
+        } else {
+            0
+        }
+    }
+
+    /// Remote torrent file names are preliminary matches, not verified CNMT.
+    pub(crate) fn file_candidate_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.found.is_some()).count()
+    }
+
+    pub(crate) fn unverified_file_candidate_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| !row.merge_permitted && row.found.is_some())
+            .count()
     }
 
     pub(crate) fn has_pending_catalog_hint_for_game(&self, id: i64) -> bool {
@@ -443,18 +502,16 @@ impl UpdateBatch {
     }
 
     pub(crate) fn catalog_hint_count(&self) -> usize {
-        self.pending_catalog_count()
-            + self
-                .rows
-                .iter()
-                .filter(|row| !row.candidates.is_empty())
-                .count()
+        self.rows
+            .iter()
+            .filter(|row| !row.candidates.is_empty())
+            .count()
     }
 
     pub(crate) fn has_match_for_game(&self, id: i64) -> bool {
         self.rows
             .iter()
-            .any(|row| row.library_id == id && row.found.is_some())
+            .any(|row| row.library_id == id && row.merge_permitted && row.found.is_some())
     }
     pub(crate) fn progress(&self) -> (usize, usize) {
         (self.cursor.min(self.rows.len()), self.rows.len())
@@ -729,6 +786,10 @@ mod tests {
         let found = pick_current_patch(&files, "0100D2C0115B6000", 65536, 196608).unwrap();
         assert_eq!((found.0.index, found.1), (7, 196608));
         assert!(pick_current_patch(&files, "0100D2C0115B6000", 196608, 262144).is_none());
+        // Even if the title DB lists a higher latest version, a legitimately
+        // newer intermediate patch can still be selected for CNMT verification.
+        let partial = pick_current_patch(&files, "0100D2C0115B6000", 65536, 262144).unwrap();
+        assert_eq!((partial.0.index, partial.1), (7, 196608));
         assert!(pick_current_patch(&files, "invalid", 0, 1).is_none());
     }
 

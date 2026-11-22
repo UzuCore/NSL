@@ -17,7 +17,7 @@ pub(crate) fn grouped_batch_downloads(batch: &update_batch::UpdateBatch) -> Vec<
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut magnets = HashMap::<String, usize>::new();
     for (index, row) in batch.rows.iter().enumerate() {
-        if !row.checked || row.job.is_some() {
+        if !row.merge_permitted || !row.checked || row.job.is_some() {
             continue;
         }
         let Some(found) = &row.found else {
@@ -55,6 +55,9 @@ pub(crate) fn checked_group_selection(
             .rows
             .get(row_index)
             .ok_or_else(|| "일괄 다운로드 행 인덱스가 잘못되었습니다".to_string())?;
+        if !row.merge_permitted {
+            return Err("원본 게임의 CNMT 검증이 완료되지 않아 다운로드를 차단했습니다".into());
+        }
         let found = row
             .found
             .as_ref()
@@ -508,7 +511,7 @@ impl NslApp {
         let eligible = batch
             .rows
             .iter()
-            .filter(|row| !row.candidates.is_empty())
+            .filter(|row| row.merge_permitted && !row.candidates.is_empty())
             .count();
         self.status = format!(
             "{} 카탈로그 대조 시작: 항목 {}개, 토렌트 후보 {}개",
@@ -516,6 +519,13 @@ impl NslApp {
             batch.rows.len(),
             eligible
         );
+        if is_dlc {
+            self.status.push_str(&format!(
+                " | 카탈로그 본편 릴리스가 있는 게임 {}개 / 검증 대기 DLC {}개 (토렌트 내부 DLC ID 검색 예정)",
+                batch.pending_catalog_count(),
+                batch.pending_dlc_id_count()
+            ));
+        }
         if !is_dlc {
             self.status.push_str(&format!(
                 " | 카탈로그 ID 후보 {}개 (CNMT 검증 원본 {}개 · 재검증 대기 {}개). 실제 업데이트 파일은 별도 확인",
@@ -557,6 +567,19 @@ impl NslApp {
                     },
                     batch.eligible()
                 );
+                self.status.push_str(&format!(
+                    " | 토렌트 파일명 후보 {}개 (CNMT 검증 원본 {}개 · 미검증 원본 {}개)",
+                    batch.file_candidate_count(),
+                    batch.eligible(),
+                    batch.unverified_file_candidate_count()
+                ));
+                if batch.kind == update_batch::BatchKind::Dlc {
+                    self.status.push_str(&format!(
+                        " | DLC 카탈로그 검색 대상 {}개 · 본편 CNMT 검증 대기 게임 {}개",
+                        batch.catalog_hint_count(),
+                        batch.pending_catalog_count()
+                    ));
+                }
                 if batch.kind == update_batch::BatchKind::Update {
                     self.status.push_str(&format!(
                         " | 카탈로그 ID 후보 {}개 · 본편 CNMT 재검증 대기 {}개 (다운로드/병합 불가)",
@@ -1064,6 +1087,19 @@ impl NslApp {
                         },
                         batch.eligible()
                     ));
+                    ui.label(format!(
+                        "토렌트 파일명 후보 {}개 · 본편 CNMT 통과 {}개 · 재검증 대기 {}개",
+                        batch.file_candidate_count(),
+                        batch.eligible(),
+                        batch.unverified_file_candidate_count()
+                    )).on_hover_text("토렌트 파일명에 나온 ID·버전은 탐색 정보입니다. 실제 패키지 CNMT 검증 전에는 업데이트 가능으로 확정하지 않습니다.");
+                    if desired_kind == update_batch::BatchKind::Dlc {
+                        ui.label(format!(
+                            "카탈로그 본편 일치 게임 {}개 · 검증 대기 DLC {}개",
+                            batch.pending_catalog_count(),
+                            batch.pending_dlc_id_count()
+                        ));
+                    }
                     if desired_kind == update_batch::BatchKind::Update {
                         ui.label(format!(
                             "카탈로그 ID 후보 {}개 · CNMT 미검증 {}개 (자동 병합 제외)",
@@ -1208,7 +1244,7 @@ impl NslApp {
             ui.horizontal(|ui| {
                 if ui.button("전체 선택").clicked() {
                     for row in &mut batch.rows {
-                        if row.found.is_some() && row.job.is_none() {
+                        if row.merge_permitted && row.found.is_some() && row.job.is_none() {
                             row.checked = true;
                         }
                     }
@@ -1226,9 +1262,12 @@ impl NslApp {
                     for row in &mut batch.rows {
                         ui.horizontal(|ui| {
                             let has_update = row.found.is_some();
-                            ui.add_enabled_ui(has_update && row.job.is_none(), |ui| {
-                                ui.checkbox(&mut row.checked, "");
-                            });
+                            ui.add_enabled_ui(
+                                has_update && row.merge_permitted && row.job.is_none(),
+                                |ui| {
+                                    ui.checkbox(&mut row.checked, "");
+                                },
+                            );
                             let status = if let Some(job) = &row.job {
                                 match &job.status {
                                     update_batch::UpdateBatchJobStatus::Queued => "큐 대기".into(),
@@ -1267,7 +1306,12 @@ impl NslApp {
                                     }
                                 }
                             } else if let Some(found) = &row.found {
-                                if row.dlc_id.is_some() {
+                                if !row.merge_permitted {
+                                    format!(
+                                        "토렌트 파일명 후보 v{} · 본편 CNMT 재검증 대기",
+                                        found.version
+                                    )
+                                } else if row.dlc_id.is_some() {
                                     format!("DLC 파일 확인 · v{}", found.version)
                                 } else {
                                     format!("다운로드 가능 v{}", found.version)
@@ -1285,11 +1329,13 @@ impl NslApp {
                                 row.original_type.to_ascii_uppercase(),
                                 row.original_path.display()
                             ));
-                            ui.label(egui::RichText::new(status).small().color(if has_update {
-                                ui.visuals().hyperlink_color
-                            } else {
-                                ui.visuals().weak_text_color()
-                            }));
+                            ui.label(egui::RichText::new(status).small().color(
+                                if has_update && row.merge_permitted {
+                                    ui.visuals().hyperlink_color
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                },
+                            ));
                         });
                     }
                 });

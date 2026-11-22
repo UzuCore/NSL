@@ -100,8 +100,7 @@ fn validate_job_identity(job: &SavedJob) -> Result<()> {
         anyhow::ensure!(
             job.dlc_id.is_none()
                 && job.expected_version > 0
-                && job.expected_version > job.installed_version
-                && job.expected_version >= job.latest_version,
+                && job.expected_version > job.installed_version,
             "업데이트 작업 기록의 Title ID 또는 설치 버전이 올바르지 않습니다"
         );
     }
@@ -237,6 +236,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         };
         rows.push(UpdateBatchRow {
             library_id: saved.library_id,
+            merge_permitted: true,
             title_id: saved.title_id,
             dlc_id: saved.dlc_id,
             name: saved.name,
@@ -277,6 +277,7 @@ mod tests {
             kind: BatchKind::Update,
             rows: vec![UpdateBatchRow {
                 library_id: 42,
+                merge_permitted: true,
                 title_id: "0100D2C0115B6000".into(),
                 dlc_id: None,
                 name: "Game".into(),
@@ -335,6 +336,21 @@ mod tests {
         assert!(job.recovering_since.is_some());
         assert!(job.output.ends_with("nested/update.nsz"));
         assert!(!recovered.running);
+    }
+
+    #[test]
+    fn stage44_intermediate_patch_is_valid_when_newer_than_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut batch = example_batch(dir.path());
+        batch.rows[0].latest_version = 262_144;
+        batch.rows[0].job.as_mut().unwrap().expected_version = 196_608;
+        save(dir.path(), &batch).unwrap();
+        let recovered = load(dir.path()).unwrap().unwrap();
+        assert_eq!(recovered.rows[0].latest_version, 262_144);
+        assert_eq!(
+            recovered.rows[0].job.as_ref().unwrap().expected_version,
+            196_608
+        );
     }
 
     #[test]

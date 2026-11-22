@@ -298,6 +298,211 @@ fn missing_dlc_audit_is_per_title_id_and_toolbar_is_visible() {
 }
 
 #[test]
+fn stage45_update_and_dlc_audits_are_independent_and_poll_while_tabs_switch() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut base = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    base.latest_version = 196608;
+    base.update_version = 0;
+    let dlc = format!(
+        "{:016X}",
+        u64::from_str_radix(&base.title_id, 16).unwrap() | 0x1001
+    );
+    base.missing_dlcs = vec![(dlc.clone(), "DLC".into())];
+    let catalog = catalog::CatalogItem {
+        title: "Bundle".into(),
+        title_id: Some(base.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    app.catalog_state.items = vec![catalog.clone()];
+    let mut updates = update_batch::new_update_batch(
+        std::slice::from_ref(&base),
+        std::slice::from_ref(&catalog),
+        "",
+    );
+    let mut dlcs = update_batch::new_dlc_batch(&[base.clone()], &[catalog], "");
+    let (update_request, update_sender, _) = torrent::synthetic_preview_request();
+    let (dlc_request, dlc_sender, _) = torrent::synthetic_preview_request();
+    updates.rows[0].next_candidate = 1;
+    updates.active = Some((0, update_request));
+    updates.cursor = 1;
+    dlcs.rows[0].next_candidate = 1;
+    dlcs.active = Some((0, dlc_request));
+    dlcs.cursor = 1;
+    app.update_batch = Some(updates);
+    app.dlc_batch = Some(dlcs);
+    let both = app.active_progress_views();
+    assert!(both.iter().any(|view| view.label.contains("DLC")));
+    assert!(both.iter().any(|view| view.label.contains("업데이트")));
+    app.folder_filter = "MISSING_DLCS".into();
+    let _ = run_app_ticks(&mut app, 1);
+    assert!(app.update_batch.as_ref().unwrap().running);
+    assert!(app.dlc_batch.as_ref().unwrap().running);
+    // DLC metadata completes first. Updating only this result may not cancel
+    // or replace the pending update request (and vice versa).
+    dlc_sender
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: format!("DLC [{dlc}][v0].nsp").into(),
+                size: 123,
+            }],
+            torrent_bytes: vec![1],
+        }))
+        .unwrap();
+    app.folder_filter = "MISSING_UPDATES".into();
+    app.poll_missing_update_audit(&ctx);
+    assert!(app.update_batch.as_ref().unwrap().running);
+    assert!(!app.dlc_batch.as_ref().unwrap().running);
+    assert_eq!(app.dlc_batch.as_ref().unwrap().file_candidate_count(), 1);
+    assert_eq!(app.update_batch.as_ref().unwrap().file_candidate_count(), 0);
+    assert_eq!(app.update_batch.as_ref().unwrap().progress().0, 0);
+    let kinds = app.active_progress_views();
+    assert!(
+        kinds.iter().any(|view| view.label.contains("업데이트")),
+        "the update progress survives a DLC completion"
+    );
+    update_sender
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: format!(
+                    "Patch [{:016X}][v196608].nsp",
+                    u64::from_str_radix(&base.title_id, 16).unwrap() | 0x800
+                )
+                .into(),
+                size: 456,
+            }],
+            torrent_bytes: vec![2],
+        }))
+        .unwrap();
+    app.folder_filter = "MISSING_DLCS".into();
+    app.poll_missing_update_audit(&ctx);
+    assert!(!app.update_batch.as_ref().unwrap().running);
+    assert_eq!(app.update_batch.as_ref().unwrap().file_candidate_count(), 1);
+    assert_eq!(app.dlc_batch.as_ref().unwrap().file_candidate_count(), 1);
+    assert!(app
+        .batch_for_visible_tab()
+        .is_some_and(|batch| batch.kind == update_batch::BatchKind::Dlc));
+    app.folder_filter = "MISSING_UPDATES".into();
+    assert!(app
+        .batch_for_visible_tab()
+        .is_some_and(|batch| batch.kind == update_batch::BatchKind::Update));
+}
+
+#[test]
+fn stage45_shared_failed_magnet_is_not_retried_per_missing_dlc_id() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut game = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    let base = u64::from_str_radix(&game.title_id, 16).unwrap();
+    game.missing_dlcs = vec![
+        (format!("{:016X}", base | 0x1001), "DLC One".into()),
+        (format!("{:016X}", base | 0x1002), "DLC Two".into()),
+    ];
+    let catalog = catalog::CatalogItem {
+        title: game.title_name.clone(),
+        title_id: Some(game.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABCDEF0123".into(),
+        ..Default::default()
+    };
+    let mut batch = update_batch::new_dlc_batch(&[game], std::slice::from_ref(&catalog), "");
+    assert_eq!(batch.rows.len(), 2);
+    let (request, sender, _cancel) = torrent::synthetic_preview_request();
+    batch.rows[0].next_candidate = 1;
+    batch.active = Some((0, request));
+    batch.cursor = 1;
+    sender.send(Err("offline magnet".into())).unwrap();
+    // No torrent engine exists in the fixture. The second DLC must advance
+    // using the memoized error, not try initiating the same bad magnet again.
+    batch.tick(&[catalog], None);
+    assert!(!batch.running);
+    assert_eq!(batch.failed_previews.len(), 1);
+    assert!(batch.rows.iter().all(|row| row.failure.is_some()));
+    assert_eq!(batch.rows[1].next_candidate, 1);
+    assert_eq!(batch.progress(), (2, 2));
+    assert!(batch.parallel_active.is_empty());
+}
+
+#[test]
+fn stage45_parallel_preview_finishes_out_of_order_and_stops_independently() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut first = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    first.latest_version = 196608;
+    let mut second = first.clone();
+    second.id += 200;
+    second.title_id = "0100AABBCCDDE000".into();
+    second.title_name = "Second".into();
+    let make_item = |base: &library::GameFile| catalog::CatalogItem {
+        title: base.title_name.clone(),
+        title_id: Some(base.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:ABCD".into(),
+        ..Default::default()
+    };
+    let catalog = vec![make_item(&first), make_item(&second)];
+    let mut batch = update_batch::new_update_batch(&[first.clone(), second.clone()], &catalog, "");
+    assert_eq!(batch.rows.len(), 2);
+    let (slow, slow_send, slow_cancel) = torrent::synthetic_preview_request();
+    let (fast, fast_send, fast_cancel) = torrent::synthetic_preview_request();
+    batch.active = Some((0, slow));
+    batch.parallel_active = vec![(1, 1, fast)];
+    batch.rows[0].next_candidate = 1;
+    batch.rows[1].next_candidate = 1;
+    batch.cursor = 2;
+    fast_send
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: "Patch [0100AABBCCDDE800][v196608].nsp".into(),
+                size: 80,
+            }],
+            torrent_bytes: vec![7],
+        }))
+        .unwrap();
+    batch.tick(&catalog, None);
+    assert!(batch.running);
+    assert!(batch.rows[1].found.is_some());
+    assert!(batch.rows[0].found.is_none());
+    assert_eq!(batch.progress(), (1, 2));
+    slow_send
+        .send(Ok(torrent::TorrentPreview {
+            files: vec![torrent::TorrentFileEntry {
+                index: 0,
+                path: format!(
+                    "Patch [{:016X}][v196608].nsp",
+                    u64::from_str_radix(&first.title_id, 16).unwrap() | 0x800
+                )
+                .into(),
+                size: 80,
+            }],
+            torrent_bytes: vec![6],
+        }))
+        .unwrap();
+    batch.tick(&catalog, None);
+    assert!(!batch.running);
+    assert_eq!(batch.file_candidate_count(), 2);
+    assert_eq!(batch.progress(), (2, 2));
+    assert!(slow_cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(fast_cancel.load(std::sync::atomic::Ordering::Acquire));
+    let (other_request, _sender, other_cancel) = torrent::synthetic_preview_request();
+    let mut other = update_batch::new_update_batch(&[first], &catalog, "");
+    other.active = Some((0, other_request));
+    other.rows[0].next_candidate = 1;
+    other.cursor = 1;
+    let (pending, _sender, pending_cancel) = torrent::synthetic_preview_request();
+    batch.parallel_active.push((0, 0, pending));
+    batch.stop();
+    assert!(pending_cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(!other_cancel.load(std::sync::atomic::Ordering::Acquire));
+    assert!(other.running);
+}
+
+#[test]
 fn stage44_release_with_newer_known_update_is_probed_before_newer_topic() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -673,8 +878,11 @@ fn stage25_ten_thousand_catalog_matches_group_in_one_pass() {
         running: false,
         cursor: 10_000,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     };
@@ -1172,8 +1380,11 @@ fn isolated_real_finished_transfer_restart_runs_native_nsz_merge() -> anyhow::Re
         running: false,
         cursor: 1,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     };
@@ -1286,8 +1497,11 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
         running: false,
         cursor: 1,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     };

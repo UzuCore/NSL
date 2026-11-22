@@ -9,7 +9,7 @@ use crate::{catalog, library, scanner, torrent, update_merge};
 use anyhow::{Context, Result};
 use regex::Regex;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{mpsc, Arc, OnceLock},
 };
@@ -17,6 +17,9 @@ use std::{
 const MAX_RELEASES_PER_GAME: usize = 3;
 const MAX_RELEASES_PER_DLC: usize = 8;
 const MAX_CACHED_TORRENT_BYTES: usize = 128 * 1024 * 1024;
+/// Limit concurrent probes per audit to avoid tracker/peer overload and memory spikes.
+const MAX_PARALLEL_CATALOG_PREVIEWS: usize = 4;
+const CATALOG_PREVIEW_TIMEOUT_SECS: u64 = 25;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum BatchKind {
@@ -36,8 +39,15 @@ pub(crate) struct UpdateBatch {
     pub(crate) running: bool,
     pub(crate) cursor: usize,
     pub(crate) active: Option<(usize, torrent::TorrentPreviewRequest)>,
+    /// Additional bounded metadata requests; the `active` slot is kept for
+    /// compatibility with isolated existing-preview regression fixtures.
+    pub(crate) parallel_active: Vec<(usize, usize, torrent::TorrentPreviewRequest)>,
+    pub(crate) retry_rows: VecDeque<usize>,
     pub(crate) confirm_queue: bool,
     pub(crate) preview_cache: HashMap<usize, CachedPreview>,
+    /// Cache failures within one audit too: the same unavailable magnet can
+    /// appear in dozens of DLC ID rows and must not be retried per DLC.
+    pub(crate) failed_previews: HashMap<usize, String>,
     /// Maintain this incrementally: repeated O(n) sums become quadratic
     /// during large catalog audits with thousands of unique torrents.
     pub(crate) preview_cache_bytes: usize,
@@ -210,8 +220,11 @@ pub(crate) fn new_update_batch(
         running: true,
         cursor: 0,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: HashMap::new(),
+        failed_previews: HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints,
     }
@@ -309,8 +322,11 @@ pub(crate) fn new_dlc_batch(
         running: true,
         cursor: 0,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: HashMap::new(),
+        failed_previews: HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints,
     }
@@ -514,16 +530,67 @@ impl UpdateBatch {
             .any(|row| row.library_id == id && row.merge_permitted && row.found.is_some())
     }
     pub(crate) fn progress(&self) -> (usize, usize) {
-        (self.cursor.min(self.rows.len()), self.rows.len())
+        let total = self.rows.len();
+        let waiting =
+            self.retry_rows.len() + self.parallel_active.len() + usize::from(self.active.is_some());
+        (self.cursor.saturating_sub(waiting).min(total), total)
     }
+
     pub(crate) fn stop(&mut self) {
-        self.active = None; // Drop cancels an outstanding magnet preview.
+        self.active = None;
+        self.parallel_active.clear(); // Dropping requests cancels only this audit.
+        self.retry_rows.clear();
         self.running = false;
     }
 
-    /// Poll exactly one metadata-only request per frame. A failed or
-    /// uninformative release is followed by the next ranked candidate;
-    /// downloads never start during this audit.
+    fn complete_preview(
+        &mut self,
+        index: usize,
+        catalog_index: usize,
+        result: Result<torrent::TorrentPreview, String>,
+        catalog_items: &[catalog::CatalogItem],
+    ) {
+        match result {
+            Ok(preview) => {
+                if preview.torrent_bytes.len()
+                    > MAX_CACHED_TORRENT_BYTES.saturating_sub(self.preview_cache_bytes)
+                {
+                    let reason = "토렌트 메타데이터 누적 제한(128MiB) 초과".to_string();
+                    self.failed_previews.insert(catalog_index, reason.clone());
+                    self.rows[index].failure = Some(reason);
+                } else {
+                    let incoming_bytes = preview.torrent_bytes.len();
+                    let previous = self.preview_cache.insert(
+                        catalog_index,
+                        CachedPreview {
+                            files: preview.files,
+                            bytes: Arc::new(preview.torrent_bytes),
+                        },
+                    );
+                    if let Some(previous) = previous {
+                        self.preview_cache_bytes = self
+                            .preview_cache_bytes
+                            .saturating_sub(previous.bytes.len());
+                    }
+                    self.preview_cache_bytes += incoming_bytes;
+                    self.apply_preview(index, catalog_index, catalog_items);
+                }
+            }
+            Err(error) => {
+                let reason = format!("토렌트 메타데이터 조회 실패: {error}");
+                self.failed_previews.insert(catalog_index, reason.clone());
+                self.rows[index].failure = Some(reason);
+            }
+        }
+        if self.rows[index].found.is_none()
+            && self.rows[index].next_candidate < self.rows[index].candidates.len()
+        {
+            self.retry_rows.push_back(index);
+        }
+    }
+
+    /// Bounded parallel lookup: no payload downloads. Failure of one magnet
+    /// cannot block unrelated titles; matching DLC IDs share cached metadata.
     pub(crate) fn tick(
         &mut self,
         catalog_items: &[catalog::CatalogItem],
@@ -532,78 +599,130 @@ impl UpdateBatch {
         if !self.running {
             return;
         }
-        let completed = self
-            .active
-            .as_mut()
-            .map(|(index, request)| (*index, request.receiver.try_recv()));
-        if let Some((index, result)) = completed {
-            match result {
-                Ok(Ok(preview)) => {
-                    let catalog_index =
+        if let Some((index, request)) = self.active.take() {
+            match request.receiver.try_recv() {
+                Ok(result) => {
+                    let candidate =
                         self.rows[index].candidates[self.rows[index].next_candidate - 1];
-                    if preview.torrent_bytes.len()
-                        > MAX_CACHED_TORRENT_BYTES.saturating_sub(self.preview_cache_bytes)
-                    {
-                        self.rows[index].failure =
-                            Some("일괄 대조 메타데이터 메모리 한도(128MiB) 초과".into());
-                    } else {
-                        let incoming_bytes = preview.torrent_bytes.len();
-                        let old = self.preview_cache.insert(
-                            catalog_index,
-                            CachedPreview {
-                                files: preview.files,
-                                bytes: Arc::new(preview.torrent_bytes),
-                            },
-                        );
-                        if let Some(previous) = old {
-                            self.preview_cache_bytes = self
-                                .preview_cache_bytes
-                                .saturating_sub(previous.bytes.len());
-                        }
-                        self.preview_cache_bytes += incoming_bytes;
-                        self.apply_preview(index, catalog_index, catalog_items);
-                    }
-                    self.active = None;
-                }
-                Ok(Err(error)) => {
-                    self.rows[index].failure = Some(format!("토렌트 조회 실패: {error}"));
-                    self.active = None;
+                    self.complete_preview(index, candidate, result, catalog_items);
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.rows[index].failure = Some("토렌트 목록 조회 연결 끊김".into());
-                    self.active = None;
+                    let reason = "토렌트 메타데이터 응답 채널 종료".to_string();
+                    let candidate =
+                        self.rows[index].candidates[self.rows[index].next_candidate - 1];
+                    self.failed_previews.insert(candidate, reason.clone());
+                    self.rows[index].failure = Some(reason);
+                    if self.rows[index].next_candidate < self.rows[index].candidates.len() {
+                        self.retry_rows.push_back(index);
+                    }
                 }
-                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Empty) => self.active = Some((index, request)),
             }
         }
-        while self.cursor < self.rows.len() {
-            let row = &mut self.rows[self.cursor];
+        let mut slot = 0;
+        while slot < self.parallel_active.len() {
+            let result = self.parallel_active[slot].2.receiver.try_recv();
+            match result {
+                Ok(result) => {
+                    let (index, catalog_index, _request) = self.parallel_active.swap_remove(slot);
+                    self.complete_preview(index, catalog_index, result, catalog_items);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let (index, catalog_index, _request) = self.parallel_active.swap_remove(slot);
+                    let reason = "토렌트 메타데이터 응답 채널 종료".to_string();
+                    self.failed_previews.insert(catalog_index, reason.clone());
+                    self.rows[index].failure = Some(reason);
+                    if self.rows[index].next_candidate < self.rows[index].candidates.len() {
+                        self.retry_rows.push_back(index);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => slot += 1,
+            }
+        }
+        let mut deferred = VecDeque::new();
+        let mut visits = 0usize;
+        while usize::from(self.active.is_some()) + self.parallel_active.len()
+            < MAX_PARALLEL_CATALOG_PREVIEWS
+            && visits < 256
+        {
+            visits += 1;
+            let index = if let Some(index) = self.retry_rows.pop_front() {
+                index
+            } else if self.cursor < self.rows.len() {
+                let index = self.cursor;
+                self.cursor += 1;
+                index
+            } else {
+                break;
+            };
+            let row = &mut self.rows[index];
             if row.found.is_some() || row.next_candidate >= row.candidates.len() {
                 if row.found.is_none() && row.failure.is_none() {
-                    row.failure = Some("카탈로그 일치 항목 없음".into());
+                    row.failure = Some("일치하는 업데이트 또는 DLC 파일 없음".into());
                 }
-                self.cursor += 1;
                 continue;
             }
             let catalog_index = row.candidates[row.next_candidate];
-            row.next_candidate += 1;
+            if let Some(reason) = self.failed_previews.get(&catalog_index) {
+                row.next_candidate += 1;
+                row.failure = Some(reason.clone());
+                if row.next_candidate < row.candidates.len() {
+                    self.retry_rows.push_back(index);
+                }
+                continue;
+            }
             if self.preview_cache.contains_key(&catalog_index) {
-                self.apply_preview(self.cursor, catalog_index, catalog_items);
+                row.next_candidate += 1;
+                self.apply_preview(index, catalog_index, catalog_items);
+                if self.rows[index].found.is_none() {
+                    self.retry_rows.push_back(index);
+                }
+                continue;
+            }
+            let same_inflight = self.active.as_ref().is_some_and(|(other, _)| {
+                self.rows[*other].candidates[self.rows[*other].next_candidate - 1] == catalog_index
+            }) || self
+                .parallel_active
+                .iter()
+                .any(|(_, candidate, _)| *candidate == catalog_index);
+            if same_inflight {
+                deferred.push_back(index);
                 continue;
             }
             let Some(engine) = engine else {
                 self.stop();
                 return;
             };
-            match engine.preview_files(&catalog_items[catalog_index].magnet) {
+            self.rows[index].next_candidate += 1;
+            match engine.preview_files_with_timeout(
+                &catalog_items[catalog_index].magnet,
+                CATALOG_PREVIEW_TIMEOUT_SECS,
+            ) {
                 Ok(request) => {
-                    self.active = Some((self.cursor, request));
-                    return;
+                    if self.active.is_none() {
+                        self.active = Some((index, request));
+                    } else {
+                        self.parallel_active.push((index, catalog_index, request));
+                    }
                 }
-                Err(error) => row.failure = Some(format!("토렌트 조회 시작 실패: {error}")),
+                Err(error) => {
+                    let reason = format!("토렌트 메타데이터 요청 실패: {error}");
+                    self.failed_previews.insert(catalog_index, reason.clone());
+                    self.rows[index].failure = Some(reason);
+                    if self.rows[index].next_candidate < self.rows[index].candidates.len() {
+                        self.retry_rows.push_back(index);
+                    }
+                }
             }
         }
-        self.running = false;
+        self.retry_rows.extend(deferred);
+        if self.cursor >= self.rows.len()
+            && self.retry_rows.is_empty()
+            && self.active.is_none()
+            && self.parallel_active.is_empty()
+        {
+            self.running = false;
+        }
     }
 }
 

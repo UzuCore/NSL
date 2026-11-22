@@ -217,6 +217,7 @@ pub enum EngineCommand {
         magnet: String,
         response: mpsc::Sender<Result<TorrentPreview, String>>,
         cancel: Arc<AtomicBool>,
+        timeout_secs: u64,
     },
     /// Pause the torrent behind a progress key.
     Pause(String),
@@ -471,10 +472,11 @@ fn spawn_engine(
                             magnet,
                             response,
                             cancel,
+                            timeout_secs,
                         } => {
                             let result = tokio::select! {
                                 result = tokio::time::timeout(
-                                    Duration::from_secs(90),
+                                    Duration::from_secs(timeout_secs),
                                     preview_torrent(&session, &magnet),
                                 ) => match result {
                                     Ok(result) => result.map_err(|error| format!("{error:#}")),
@@ -1380,6 +1382,20 @@ impl TorrentEngine {
     /// Resolve the magnet metadata without starting a download. The receiver
     /// is polled by egui; dropping the request cancels metadata resolution.
     pub fn preview_files(&self, magnet: &str) -> Result<TorrentPreviewRequest> {
+        self.preview_files_with_timeout(magnet, 90)
+    }
+
+    /// Batch catalog probes use a bounded shorter timeout so one offline
+    /// magnet does not hold back the rest of the catalog for 90 seconds.
+    pub fn preview_files_with_timeout(
+        &self,
+        magnet: &str,
+        timeout_secs: u64,
+    ) -> Result<TorrentPreviewRequest> {
+        anyhow::ensure!(
+            (10..=90).contains(&timeout_secs),
+            "토렌트 메타데이터 제한시간 범위 오류"
+        );
         anyhow::ensure!(
             magnet.starts_with("magnet:?"),
             "올바른 마그넷 링크가 아닙니다"
@@ -1391,6 +1407,7 @@ impl TorrentEngine {
                 magnet: magnet.to_owned(),
                 response,
                 cancel: cancel.clone(),
+                timeout_secs,
             })
             .map_err(|_| anyhow::anyhow!("토렌트 엔진이 중지되었습니다"))?;
         Ok(TorrentPreviewRequest { receiver, cancel })

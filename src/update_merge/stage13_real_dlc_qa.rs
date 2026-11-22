@@ -536,8 +536,11 @@ fn stage26_real_two_dlc_batch_cancel_restart_and_cleanup() -> Result<()> {
         running: false,
         cursor: 2,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     };

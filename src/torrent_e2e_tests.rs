@@ -743,8 +743,11 @@ fn stage25_two_games_one_torrent_selected_files_and_originals_preserved() -> any
         running: false,
         cursor: 2,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     };
@@ -1087,8 +1090,11 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
         running: false,
         cursor: 1,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     });

@@ -165,6 +165,7 @@ impl NslApp {
             torrent_progress: Vec::new(),
             catalog_torrent_dialog: None,
             update_batch: None,
+            dlc_batch: None,
             download_selected: None,
             download_search: String::new(),
             download_status_filter: "all".into(),
@@ -248,14 +249,19 @@ impl NslApp {
         match update_manifest::load(&app.base_dir) {
             Ok(Some(batch)) => {
                 let count = batch.rows.len();
-                app.update_batch = Some(batch);
+                if batch.kind == update_batch::BatchKind::Dlc {
+                    app.dlc_batch = Some(batch);
+                } else {
+                    app.update_batch = Some(batch);
+                }
+                let restored_kind = app
+                    .dlc_batch
+                    .as_ref()
+                    .map(|_| update_batch::BatchKind::Dlc)
+                    .unwrap_or(update_batch::BatchKind::Update);
                 let _ = app.log_sender.send(format!(
                     "ℹ {} 작업 {count}개 복원 · 다운로드 상태 재연결 중",
-                    if app
-                        .update_batch
-                        .as_ref()
-                        .is_some_and(|batch| batch.kind == update_batch::BatchKind::Dlc)
-                    {
+                    if restored_kind == update_batch::BatchKind::Dlc {
                         "일괄 DLC"
                     } else {
                         "일괄 업데이트"

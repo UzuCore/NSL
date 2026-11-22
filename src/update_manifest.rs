@@ -259,8 +259,11 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         running: false,
         cursor: count,
         active: None,
+        parallel_active: Vec::new(),
+        retry_rows: std::collections::VecDeque::new(),
         confirm_queue: false,
         preview_cache: Default::default(),
+        failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
     }))
@@ -307,8 +310,11 @@ mod tests {
             running: false,
             cursor: 1,
             active: None,
+            parallel_active: Vec::new(),
+            retry_rows: std::collections::VecDeque::new(),
             confirm_queue: false,
             preview_cache: Default::default(),
+            failed_previews: std::collections::HashMap::new(),
             preview_cache_bytes: 0,
             pending_catalog_hints: Default::default(),
         }

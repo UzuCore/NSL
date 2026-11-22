@@ -429,6 +429,47 @@ fn spawn_batch_merge(
 }
 
 impl NslApp {
+    pub(crate) fn batch_for_visible_tab(&self) -> Option<&update_batch::UpdateBatch> {
+        if self.folder_filter == "MISSING_DLCS" {
+            self.dlc_batch.as_ref()
+        } else {
+            self.update_batch.as_ref()
+        }
+    }
+
+    /// The two metadata-only searches have fully independent state and
+    /// cancellation; the active toolbar uses the appropriate slot temporarily.
+    fn with_dlc_batch<R>(&mut self, action: impl FnOnce(&mut Self) -> R) -> R {
+        std::mem::swap(&mut self.update_batch, &mut self.dlc_batch);
+        let result = action(self);
+        std::mem::swap(&mut self.update_batch, &mut self.dlc_batch);
+        result
+    }
+
+    pub(crate) fn missing_update_toolbar(&mut self, ui: &mut egui::Ui) {
+        if self.folder_filter == "MISSING_DLCS" {
+            self.with_dlc_batch(|app| app.missing_update_toolbar_active(ui));
+        } else {
+            self.missing_update_toolbar_active(ui);
+        }
+    }
+
+    pub(crate) fn poll_missing_update_audit(&mut self, ctx: &egui::Context) {
+        self.poll_missing_update_audit_active(ctx);
+        self.with_dlc_batch(|app| app.poll_missing_update_audit_active(ctx));
+    }
+
+    pub(crate) fn handle_missing_update_completion(
+        &mut self,
+        key: &str,
+        result: &Result<(), String>,
+    ) {
+        self.handle_missing_update_completion_active(key, result);
+        self.with_dlc_batch(|app| app.handle_missing_update_completion_active(key, result));
+    }
+}
+
+impl NslApp {
     pub(crate) fn retry_failed_batch_merges(&mut self) {
         let Some(batch) = self.update_batch.as_mut() else {
             return;
@@ -462,7 +503,7 @@ impl NslApp {
         }
     }
 
-    pub(crate) fn start_missing_update_audit(&mut self) {
+    fn start_missing_update_audit_active(&mut self) {
         let is_dlc = self.folder_filter == "MISSING_DLCS";
         if !is_dlc && self.folder_filter != "MISSING_UPDATES" {
             return;
@@ -547,7 +588,7 @@ impl NslApp {
         self.update_batch = Some(batch);
     }
 
-    pub(crate) fn poll_missing_update_audit(&mut self, ctx: &egui::Context) {
+    fn poll_missing_update_audit_active(&mut self, ctx: &egui::Context) {
         let Some(batch) = self.update_batch.as_mut() else {
             return;
         };
@@ -756,11 +797,7 @@ impl NslApp {
 
     /// Called only for a matching job key, after the torrent engine's actual
     /// completion notice (not merely a progress bar reaching 100 percent).
-    pub(crate) fn handle_missing_update_completion(
-        &mut self,
-        key: &str,
-        result: &Result<(), String>,
-    ) {
+    fn handle_missing_update_completion_active(&mut self, key: &str, result: &Result<(), String>) {
         let Some(batch) = self.update_batch.as_mut() else {
             return;
         };
@@ -818,6 +855,14 @@ impl NslApp {
             self.status = "토렌트 엔진을 사용할 수 없습니다".into();
             return;
         };
+        if self
+            .dlc_batch
+            .as_ref()
+            .is_some_and(|other| other.rows.iter().any(|row| row.job.is_some()))
+        {
+            self.status = "다른 종류의 다운로드·병합 작업이 기록되어 있습니다. 카탈로그 대조는 동시에 가능하지만, 다른 종류의 작업을 먼저 완료하거나 정리해야 다운로드할 수 있습니다".into();
+            return;
+        }
         let Some(batch) = self.update_batch.as_mut() else {
             return;
         };
@@ -1006,7 +1051,7 @@ impl NslApp {
 
     /// Rendered exclusively in the Missing Updates view. No changes to
     /// the global menu bar or other tabs.
-    pub(crate) fn missing_update_toolbar(&mut self, ui: &mut egui::Ui) {
+    fn missing_update_toolbar_active(&mut self, ui: &mut egui::Ui) {
         let desired_kind = if self.folder_filter == "MISSING_DLCS" {
             update_batch::BatchKind::Dlc
         } else {
@@ -1024,27 +1069,6 @@ impl NslApp {
                 })
             })
         });
-        if self
-            .update_batch
-            .as_ref()
-            .is_some_and(|batch| batch.kind != desired_kind)
-        {
-            let mut scan = false;
-            ui.horizontal_wrapped(|ui| {
-                scan = ui
-                    .add_enabled(!ongoing, egui::Button::new("카탈로그 전체 대조"))
-                    .clicked();
-                ui.label(if ongoing {
-                    "다른 일괄 작업 진행 중 · 완료 후 이 목록을 대조할 수 있습니다"
-                } else {
-                    "이 목록은 아직 카탈로그와 대조하지 않았습니다"
-                });
-            });
-            if scan {
-                self.start_missing_update_audit();
-            }
-            return;
-        }
         let mut scan = false;
         let mut queue = false;
         let mut stop = false;
@@ -1181,7 +1205,7 @@ impl NslApp {
             }
         }
         if scan {
-            self.start_missing_update_audit();
+            self.start_missing_update_audit_active();
         }
         if retry {
             self.retry_failed_batch_merges();

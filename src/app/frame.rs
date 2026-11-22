@@ -131,7 +131,7 @@ impl NslApp {
                 |progress| ProgressView::from_task(progress.snapshot()),
             ));
         }
-        if let Some(batch) = &self.update_batch {
+        for batch in self.update_batch.iter().chain(self.dlc_batch.iter()) {
             if batch.running {
                 let (done, total) = batch.progress();
                 views.push(ProgressView::counted(
@@ -1750,7 +1750,7 @@ impl NslApp {
                                                         });
                                                     });
                                                 let pending_catalog = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
-                                                    && self.update_batch.as_ref().is_some_and(|batch| {
+                                                    && self.batch_for_visible_tab().is_some_and(|batch| {
                                                         batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update }
                                                             && batch.has_pending_catalog_hint_for_game(row.id)
                                                     });
@@ -1769,7 +1769,7 @@ impl NslApp {
                                                     }
                                                 }
                                                 if matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
-                                                    && self.update_batch.as_ref().is_some_and(|batch| {
+                                                    && self.batch_for_visible_tab().is_some_and(|batch| {
                                                         (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
                                                             && batch.has_match_for_game(row.id)
                                                     })
@@ -1970,12 +1970,12 @@ impl NslApp {
                                 for row in &page_items[row_range] {
                                     let selected = self.selected == Some(row.id);
                                     let update_audited = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
-                                        && self.update_batch.as_ref().is_some_and(|batch| {
+                                        && self.batch_for_visible_tab().is_some_and(|batch| {
                                             (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
                                                 && batch.has_match_for_game(row.id)
                                         });
                                     let catalog_pending = matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
-                                        && self.update_batch.as_ref().is_some_and(|batch| {
+                                        && self.batch_for_visible_tab().is_some_and(|batch| {
                                             batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update }
                                                 && batch.has_pending_catalog_hint_for_game(row.id)
                                         });

@@ -859,6 +859,8 @@ struct NslApp {
     catalog_torrent_dialog: Option<CatalogTorrentDialog>,
     /// Metadata-only bulk scan and independently verified selective updates.
     update_batch: Option<update_batch::UpdateBatch>,
+    /// Independent DLC catalog audit; never replace the update audit on tab changes.
+    dlc_batch: Option<update_batch::UpdateBatch>,
     download_selected: Option<String>,
     download_search: String,
     download_status_filter: String,

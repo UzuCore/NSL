@@ -728,9 +728,9 @@ fn copy_romfs_entry<R: Read + Seek>(
 ) -> Result<()> {
     ensure_not_cancelled(cancel)?;
     let path = output.join(&entry.relative);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    // The checked RomFS plan precreates every directory once. Repeating
+    // CreateDirectoryW for each file dominated large small-file workloads.
+    // A missing parent is therefore an error, not an implicit mkdir.
     let absolute = base
         .checked_add(entry.offset)
         .context("RomFS file absolute offset overflow")?;
@@ -831,6 +831,7 @@ where
         Some("chunks") => false,
         _ => prefer_whole_file_tasks(&plan.files, total_size, workers),
     };
+    let source_order = std::env::var("NSRP_BKTR_BENCH_IO_ORDER").ok().as_deref() == Some("source");
     let mut mode = "serial";
     let mut setup_ms = 0u128;
     let mut task_count = plan.files.len();
@@ -841,10 +842,15 @@ where
     } else if per_file && plan.files.len() >= workers {
         mode = "files";
         let pool = romfs_worker_pool(workers)?;
+        // Opt-in only: NSRP Stage52 found no consistent source-order benefit.
+        // Never change the validated output paths or the default tree order.
+        let mut jobs = plan.files.iter().collect::<Vec<_>>();
+        if source_order {
+            jobs.sort_unstable_by_key(|entry| entry.offset);
+        }
         pool.install(|| {
-            plan.files
-                .par_iter()
-                .try_for_each_init(&create_reader, |state, entry| -> Result<()> {
+            jobs.par_iter()
+                .try_for_each_init(&create_reader, |state, &entry| -> Result<()> {
                     let worker = state
                         .as_mut()
                         .map_err(|error| anyhow::anyhow!("BKTR worker start failed: {error:#}"))?;
@@ -862,9 +868,7 @@ where
         for (file_index, entry) in plan.files.iter().enumerate() {
             ensure_not_cancelled(cancel)?;
             let path = output.join(&entry.relative);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            // All directories were created from the validated plan above.
             File::create(&path)?.set_len(entry.size)?;
             let mut start = 0u64;
             while start < entry.size {
@@ -881,7 +885,7 @@ where
         // Source-order scheduling did not outperform directory-tree ordering
         // consistently in the Stage 14 real BKTR A/B benchmark. Preserve
         // the established default and keep opt-in ordering for future tests.
-        if std::env::var("NSRP_BKTR_BENCH_IO_ORDER").ok().as_deref() == Some("source") {
+        if source_order {
             tasks.sort_unstable_by_key(|&(file_index, from, _)| {
                 plan.files[file_index].offset.saturating_add(from)
             });
@@ -1479,6 +1483,29 @@ mod tests {
             dominant.iter().map(|file| file.size).sum(),
             4,
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn stage39_romfs_workers_require_precreated_directories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = b"stage39 validated payload";
+        let entry = RomfsFile {
+            relative: PathBuf::from("nested").join("inside.bin"),
+            offset: 0,
+            size: source.len() as u64,
+            table_record: 0,
+        };
+        let cancelled = AtomicBool::new(false);
+        let mut input = Cursor::new(source);
+        assert!(
+            copy_romfs_entry(&mut input, 0, &entry, root.path(), &cancelled).is_err(),
+            "BKTR worker must not create a missing parent outside checked plan"
+        );
+        assert!(!root.path().join("nested").exists());
+        fs::create_dir_all(root.path().join("nested"))?;
+        copy_romfs_entry(&mut input, 0, &entry, root.path(), &cancelled)?;
+        assert_eq!(fs::read(root.path().join("nested/inside.bin"))?, source);
         Ok(())
     }
 

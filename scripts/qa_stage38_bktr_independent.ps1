@@ -1,5 +1,9 @@
 # Isolated retail BKTR QA. Never mutate E:\nsw source or existing emulator.
 # The reference executable is read-only and invoked against private test NCAs.
+param(
+    [switch]$Release,
+    [switch]$LibHacFirst
+)
 $ErrorActionPreference = 'Stop'
 $origin = 'E:\nsw\BALL x PIT [010086A022444000][B+U262144].nsz'
 $expectedHash = 'A2C746450751F1977A5F8422158F4FF2226A2B7037147FFCB0311472DBC2E289'
@@ -32,7 +36,11 @@ try {
     $env:NSRP_ROOT = $qaDir
     $env:NSRP_STAGE41_VERIFY_ROMS = '1'
     $env:NSRP_STAGE41_HACTOOLNET_REFERENCE = $reference
-    & cargo test --locked -p nsrp-core stage38_real_hashed_bktr_native_libhac_exact_sha -- --ignored --nocapture --test-threads=1
+    if ($LibHacFirst) { $env:NSRP_STAGE52_BKTR_ORDER = 'libhac_first' }
+    $cargoArgs = @('test','--locked','-p','nsrp-core')
+    if ($Release) { $cargoArgs += '--release' }
+    $cargoArgs += @('stage38_real_hashed_bktr_native_libhac_exact_sha','--','--ignored','--nocapture','--test-threads=1')
+    & cargo @cargoArgs
     if ($LASTEXITCODE -ne 0) { throw "Independent Stage38 Rust test failed with $LASTEXITCODE" }
     if ((Get-FileHash -LiteralPath $origin -Algorithm SHA256).Hash -ne $expectedHash) {
         throw 'Original input changed after private BKTR test'
@@ -40,7 +48,7 @@ try {
     Write-Output "STAGE38_ORIGINAL_SHA256=$expectedHash"
     Write-Output 'STAGE38_RETAIL_BKTR_LIBHAC_EXACT_SHA=PASS'
 } finally {
-    Remove-Item Env:NSRP_ROOT,Env:NSRP_STAGE41_VERIFY_ROMS,Env:NSRP_STAGE41_HACTOOLNET_REFERENCE -ErrorAction SilentlyContinue
+    Remove-Item Env:NSRP_ROOT,Env:NSRP_STAGE41_VERIFY_ROMS,Env:NSRP_STAGE41_HACTOOLNET_REFERENCE,Env:NSRP_STAGE52_BKTR_ORDER -ErrorAction SilentlyContinue
     if ((Test-Path -LiteralPath $marker -PathType Leaf) -and
         ((Split-Path -Leaf $qaDir).StartsWith('stage38-owned-')) -and
         ((Split-Path -Parent $qaDir).Equals($qaBase, [StringComparison]::OrdinalIgnoreCase))) {

@@ -373,6 +373,43 @@ mod tests {
         assert_eq!(sub.entries.len(), 2);
         assert_eq!(sub.entries[0].name, "base.nca");
         assert_eq!(sub.entries[1].name, "patch.cnmt.nca");
+        // Stage33: independently inspect every reconstructed partition and
+        // assert byte-exact, not merely name-count, equivalence.
+        let original_root = hfs0::find_xci_root(&source).unwrap();
+        let original_normal = original_root.entry("normal").unwrap();
+        let output_normal = root.entry("normal").unwrap();
+        assert_eq!(original_normal.size, output_normal.size);
+        let read_partition = |file: &mut File, start: u64, size: u64| -> Vec<u8> {
+            file.seek(SeekFrom::Start(start)).unwrap();
+            let mut bytes = vec![0u8; size as usize];
+            file.read_exact(&mut bytes).unwrap();
+            bytes
+        };
+        let mut source_read = File::open(&source).unwrap();
+        assert_eq!(
+            read_partition(
+                &mut source_read,
+                original_root.data_start + original_normal.offset,
+                original_normal.size,
+            ),
+            read_partition(
+                &mut new_file,
+                root.data_start + output_normal.offset,
+                output_normal.size,
+            ),
+            "non-secure gamecard partition changed during XCI merge"
+        );
+        let secure_data_start = sub.data_start;
+        for (index, entry) in sub.entries.iter().enumerate() {
+            let extracted =
+                read_partition(&mut new_file, secure_data_start + entry.offset, entry.size);
+            let expected_offset = if index == 0 { 0 } else { 0xC00 };
+            assert_eq!(
+                extracted,
+                raw[raw.len() - 0x1800 + expected_offset
+                    ..raw.len() - 0x1800 + expected_offset + 0xC00]
+            );
+        }
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert_eq!(std::fs::read(&merged).unwrap(), raw);
         // Stage 10 must produce exactly the same XCI with selected files,

@@ -91,6 +91,53 @@ fn stage41_untrusted_library_base_is_never_queued_for_update_or_dlc() {
 }
 
 #[test]
+fn stage43_catalog_hints_do_not_authorize_unverified_game_downloads() {
+    let (mut app, _dir) = seeded_app();
+    let ctx = run_app_ticks(&mut app, 2);
+    wait_for_rows(&mut app, &ctx);
+    let mut verified = app.rows.iter().find(|row| row.has_base).unwrap().clone();
+    assert!(verified.verified_base);
+    verified.latest_version = 196608;
+    verified.update_version = 65536;
+    let mut pending = verified.clone();
+    pending.id += 1000;
+    pending.path.push_str("-unverified");
+    pending.verified_base = false;
+    let mut unavailable = verified.clone();
+    unavailable.id += 2000;
+    unavailable.title_id = "0100AABBCCDDE000".into();
+    unavailable.verified_base = false;
+    let release = catalog::CatalogItem {
+        title: "Possible match, not a verified update".into(),
+        title_id: Some(verified.title_id.clone()),
+        magnet: "magnet:?xt=urn:btih:1111111111111111111111111111111111111111".into(),
+        ..Default::default()
+    };
+    let batch = update_batch::new_update_batch(
+        &[verified.clone(), pending.clone(), unavailable],
+        &[release],
+        "",
+    );
+    assert_eq!(batch.rows.len(), 1);
+    assert_eq!(batch.catalog_hint_count(), 2);
+    assert_eq!(batch.pending_catalog_count(), 1);
+    assert!(batch.has_pending_catalog_hint_for_game(pending.id));
+    assert!(!batch.has_pending_catalog_hint_for_game(verified.id));
+    assert!(!batch.has_match_for_game(pending.id));
+    assert_eq!(
+        batch.eligible(),
+        0,
+        "a matching catalog ID cannot prove a patch exists"
+    );
+    assert_eq!(
+        batch.chosen(),
+        0,
+        "a pending source cannot become a download"
+    );
+    assert!(crate::app::update_batch::grouped_batch_downloads(&batch).is_empty());
+}
+
+#[test]
 fn missing_updates_catalog_batch_only_offers_matching_title_ids() {
     let (mut app, _dir) = seeded_app();
     let ctx = run_app_ticks(&mut app, 2);
@@ -470,6 +517,7 @@ fn stage25_ten_thousand_catalog_matches_group_in_one_pass() {
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     let groups = app::update_batch::grouped_batch_downloads(&batch);
     assert_eq!(groups.len(), 500);
@@ -967,6 +1015,7 @@ fn isolated_real_finished_transfer_restart_runs_native_nsz_merge() -> anyhow::Re
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     app.update_batch = Some(batch);
     // Actual NSL completion handler persists "all bytes transferred".
@@ -1079,6 +1128,7 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     update_manifest::save(&app.base_dir, &batch).unwrap();
     app.update_batch = update_manifest::load(&app.base_dir).unwrap();

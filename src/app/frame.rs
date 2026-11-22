@@ -1749,6 +1749,25 @@ impl NslApp {
                                                             ));
                                                         });
                                                     });
+                                                let pending_catalog = self.folder_filter == "MISSING_UPDATES"
+                                                    && self.update_batch.as_ref().is_some_and(|batch| {
+                                                        batch.kind == update_batch::BatchKind::Update
+                                                            && batch.has_pending_catalog_hint_for_game(row.id)
+                                                    });
+                                                if pending_catalog {
+                                                    if let Some(icon) = &icon_response {
+                                                        let indicator = egui::Rect::from_min_size(
+                                                            icon.rect.right_top() - egui::vec2(19.0, 0.0),
+                                                            egui::vec2(19.0, 19.0),
+                                                        );
+                                                        ui.painter().rect_filled(indicator, 4.0, ui.visuals().weak_text_color());
+                                                        ui.painter().text(
+                                                            indicator.center(), egui::Align2::CENTER_CENTER,
+                                                            "?", egui::FontId::proportional(14.0),
+                                                            ui.visuals().extreme_bg_color,
+                                                        );
+                                                    }
+                                                }
                                                 if matches!(self.folder_filter.as_str(), "MISSING_UPDATES" | "MISSING_DLCS")
                                                     && self.update_batch.as_ref().is_some_and(|batch| {
                                                         (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
@@ -1955,7 +1974,14 @@ impl NslApp {
                                             (batch.kind == if self.folder_filter == "MISSING_DLCS" { update_batch::BatchKind::Dlc } else { update_batch::BatchKind::Update })
                                                 && batch.has_match_for_game(row.id)
                                         });
-                                    let display_name: std::borrow::Cow<'_, str> = if update_audited {
+                                    let catalog_pending = self.folder_filter == "MISSING_UPDATES"
+                                        && self.update_batch.as_ref().is_some_and(|batch| {
+                                            batch.kind == update_batch::BatchKind::Update
+                                                && batch.has_pending_catalog_hint_for_game(row.id)
+                                        });
+                                    let display_name: std::borrow::Cow<'_, str> = if catalog_pending {
+                                        std::borrow::Cow::Owned(format!("◇ {}", row.title_name))
+                                    } else if update_audited {
                                         std::borrow::Cow::Owned(format!("{}  {}", if self.folder_filter == "MISSING_DLCS" { "+" } else { "↑" }, row.title_name))
                                     } else {
                                         std::borrow::Cow::Borrowed(row.title_name.as_str())

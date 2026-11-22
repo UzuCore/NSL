@@ -262,6 +262,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     }))
 }
 
@@ -308,6 +309,7 @@ mod tests {
             confirm_queue: false,
             preview_cache: Default::default(),
             preview_cache_bytes: 0,
+            pending_catalog_hints: Default::default(),
         }
     }
 

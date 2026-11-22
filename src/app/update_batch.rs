@@ -516,6 +516,14 @@ impl NslApp {
             batch.rows.len(),
             eligible
         );
+        if !is_dlc {
+            self.status.push_str(&format!(
+                " | 카탈로그 ID 후보 {}개 (CNMT 검증 원본 {}개 · 재검증 대기 {}개). 실제 업데이트 파일은 별도 확인",
+                batch.catalog_hint_count(),
+                eligible,
+                batch.pending_catalog_count()
+            ));
+        }
         let withheld = self
             .rows
             .iter()
@@ -549,6 +557,13 @@ impl NslApp {
                     },
                     batch.eligible()
                 );
+                if batch.kind == update_batch::BatchKind::Update {
+                    self.status.push_str(&format!(
+                        " | 카탈로그 ID 후보 {}개 · 본편 CNMT 재검증 대기 {}개 (다운로드/병합 불가)",
+                        batch.catalog_hint_count(),
+                        batch.pending_catalog_count()
+                    ));
+                }
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
@@ -1049,6 +1064,13 @@ impl NslApp {
                         },
                         batch.eligible()
                     ));
+                    if desired_kind == update_batch::BatchKind::Update {
+                        ui.label(format!(
+                            "카탈로그 ID 후보 {}개 · CNMT 미검증 {}개 (자동 병합 제외)",
+                            batch.catalog_hint_count(),
+                            batch.pending_catalog_count()
+                        )).on_hover_text("카탈로그의 게임 ID가 일치하는 후보입니다. 실제 업데이트 패키지 존재와 호환성은 아직 검증하지 않았습니다.");
+                    }
                 }
                 let retryable = batch
                     .rows

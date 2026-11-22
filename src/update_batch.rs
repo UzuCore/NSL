@@ -41,6 +41,8 @@ pub(crate) struct UpdateBatch {
     /// Maintain this incrementally: repeated O(n) sums become quadratic
     /// during large catalog audits with thousands of unique torrents.
     pub(crate) preview_cache_bytes: usize,
+    /// Catalog Title-ID hints for unverified local Base files. Never queueable.
+    pub(crate) pending_catalog_hints: HashMap<i64, usize>,
 }
 
 pub(crate) struct UpdateBatchRow {
@@ -132,6 +134,7 @@ pub(crate) fn new_update_batch(
     }
     let mut seen = std::collections::HashSet::new();
     let mut rows = Vec::new();
+    let mut pending_catalog_hints = HashMap::new();
     for row in owned {
         let valid_base = row.title_id.len() == 16
             && row.title_id.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -139,14 +142,23 @@ pub(crate) fn new_update_batch(
                 .ok()
                 .is_some_and(|id| id & 0x1fff == 0);
         if !row.has_base
-            || !row.verified_base
             || !valid_base
             || row.latest_version <= row.version.max(row.update_version)
             || excluded
                 .split([',', '\n', ';'])
                 .any(|id| id.trim().eq_ignore_ascii_case(&row.title_id))
-            || !seen.insert(row.title_id.to_ascii_uppercase())
         {
+            continue;
+        }
+        if !row.verified_base {
+            // Preserve catalog visibility without treating a filename/ticket
+            // or historical unverified record as a mergeable game.
+            if let Some(indices) = by_id.get(&row.title_id.to_ascii_uppercase()) {
+                pending_catalog_hints.insert(row.id, indices.len());
+            }
+            continue;
+        }
+        if !seen.insert(row.title_id.to_ascii_uppercase()) {
             continue;
         }
         let mut candidates = by_id
@@ -184,6 +196,7 @@ pub(crate) fn new_update_batch(
         confirm_queue: false,
         preview_cache: HashMap::new(),
         preview_cache_bytes: 0,
+        pending_catalog_hints,
     }
 }
 
@@ -265,6 +278,7 @@ pub(crate) fn new_dlc_batch(
         confirm_queue: false,
         preview_cache: HashMap::new(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: HashMap::new(),
     }
 }
 
@@ -420,6 +434,23 @@ impl UpdateBatch {
             .filter(|row| row.checked && row.found.is_some() && row.job.is_none())
             .count()
     }
+    pub(crate) fn pending_catalog_count(&self) -> usize {
+        self.pending_catalog_hints.len()
+    }
+
+    pub(crate) fn has_pending_catalog_hint_for_game(&self, id: i64) -> bool {
+        self.pending_catalog_hints.contains_key(&id)
+    }
+
+    pub(crate) fn catalog_hint_count(&self) -> usize {
+        self.pending_catalog_count()
+            + self
+                .rows
+                .iter()
+                .filter(|row| !row.candidates.is_empty())
+                .count()
+    }
+
     pub(crate) fn has_match_for_game(&self, id: i64) -> bool {
         self.rows
             .iter()

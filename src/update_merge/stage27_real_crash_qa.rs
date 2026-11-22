@@ -173,6 +173,7 @@ fn stage28_real_dlc_postpublish_prejournal_crash_recovers_without_rewriting() ->
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     crate::update_manifest::save(&app_root, &batch)?;
     let destination = expected_dlc_output(&game, BASE, DLC, 0)?;
@@ -382,6 +383,7 @@ fn stage27_real_dlc_mid_write_owned_child_crash_and_retry() -> Result<()> {
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     crate::update_manifest::save(&app_root, &batch)?;
     let destination = expected_dlc_output(&game, BASE, DLC, 0)?;

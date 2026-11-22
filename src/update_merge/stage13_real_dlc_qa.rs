@@ -538,6 +538,7 @@ fn stage26_real_two_dlc_batch_cancel_restart_and_cleanup() -> Result<()> {
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     crate::update_manifest::save(&app_root, &batch)?;
     anyhow::ensure!(crate::update_manifest::load(&app_root)?.is_some());

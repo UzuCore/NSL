@@ -745,6 +745,7 @@ fn stage25_two_games_one_torrent_selected_files_and_originals_preserved() -> any
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     };
     assert_eq!(
         crate::app::update_batch::grouped_batch_downloads(&batch),
@@ -1087,6 +1088,7 @@ fn real_patch_loopback_torrent_to_restarted_batch_and_native_merge() -> anyhow::
         confirm_queue: false,
         preview_cache: Default::default(),
         preview_cache_bytes: 0,
+        pending_catalog_hints: Default::default(),
     });
     // Invoke the real catalog-to-download queue code, not a synthetic Add.
     app.queue_missing_updates();

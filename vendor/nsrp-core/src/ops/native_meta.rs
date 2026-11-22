@@ -15,7 +15,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{Cursor, Read, Seek, SeekFrom},
     path::Path,
 };
 
@@ -29,11 +29,27 @@ pub fn read_cnmt_from_nca_region(
     nca_size: u64,
     keys: &KeySet,
 ) -> Result<Vec<u8>> {
+    let mut file = File::open(container)?;
+    let container_size = file.metadata()?.len();
+    read_cnmt_from_nca_reader(&mut file, container_size, nca_offset, nca_size, keys)
+}
+
+/// Decode an already size-bounded NCZ-reconstructed metadata NCA in memory.
+pub(crate) fn read_cnmt_from_nca_bytes(data: &[u8], keys: &KeySet) -> Result<Vec<u8>> {
+    let mut reader = Cursor::new(data);
+    read_cnmt_from_nca_reader(&mut reader, data.len() as u64, 0, data.len() as u64, keys)
+}
+
+fn read_cnmt_from_nca_reader<R: Read + Seek>(
+    file: &mut R,
+    container_size: u64,
+    nca_offset: u64,
+    nca_size: u64,
+    keys: &KeySet,
+) -> Result<Vec<u8>> {
     if nca_size < NCA_XTS_HEADER_SIZE as u64 {
         bail!("CNMT NCA header is truncated");
     }
-    let mut file = File::open(container)?;
-    let container_size = file.metadata()?.len();
     if nca_offset
         .checked_add(nca_size)
         .is_none_or(|end| end > container_size)
@@ -57,7 +73,7 @@ pub fn read_cnmt_from_nca_region(
             3 | 5 => Some(derive_section_key(&info, keys)?),
             _ => continue,
         };
-        let mut plaintext = SectionReader::new(&mut file, nca_offset, section, section_key);
+        let mut plaintext = SectionReader::new(&mut *file, nca_offset, section, section_key);
         // Hierarchical SHA-256 PartitionFS stores its *filesystem* extent in
         // the decrypted NCA FsHeader HashData, not necessarily at the start
         // of the encrypted section. The initial region holds hash blocks
@@ -120,17 +136,17 @@ pub fn read_cnmt_from_nca_region(
     bail!("No supported CNMT PartitionFS section was found")
 }
 
-pub(crate) struct SectionReader<'a> {
-    file: &'a mut File,
+pub(crate) struct SectionReader<'a, R: Read + Seek> {
+    file: &'a mut R,
     nca_base: u64,
     section: &'a NcaSection,
     section_key: Option<[u8; 16]>,
     position: u64,
 }
 
-impl<'a> SectionReader<'a> {
+impl<'a, R: Read + Seek> SectionReader<'a, R> {
     pub(crate) fn new(
-        file: &'a mut File,
+        file: &'a mut R,
         nca_base: u64,
         section: &'a NcaSection,
         section_key: Option<[u8; 16]>,
@@ -145,7 +161,7 @@ impl<'a> SectionReader<'a> {
     }
 }
 
-impl Read for SectionReader<'_> {
+impl<R: Read + Seek> Read for SectionReader<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.position >= self.section.size || buf.is_empty() {
             return Ok(0);
@@ -172,7 +188,7 @@ impl Read for SectionReader<'_> {
     }
 }
 
-impl Seek for SectionReader<'_> {
+impl<R: Read + Seek> Seek for SectionReader<'_, R> {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
         let current = i128::from(self.position);
         let len = i128::from(self.section.size);

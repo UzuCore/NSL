@@ -677,9 +677,8 @@ fn add_named_entry(
     names: &mut HashSet<String>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let entry = entries
-        .iter()
-        .find(|e| e.name.eq_ignore_ascii_case(wanted))
+    // The canonical CNMT .nca name can refer to a compressed .cnmt.ncz.
+    let entry = resolve_content_entry(entries, wanted)
         .with_context(|| format!("필수 엔트리 누락: {wanted}"))?;
     let key = wanted.to_ascii_lowercase();
     if names.insert(key) {
@@ -787,6 +786,31 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::formats::pfs0::Pfs0Index;
+    use sha2::Digest;
+
+    #[test]
+    fn stage35_compressed_cnmt_is_materialized_as_selected_nca() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let fixture = crate::ops::cnmt::compressed_tests::fixture(temp.path(), false)?;
+        let original_sha = sha2::Sha256::digest(fs::read(&fixture.nsz)?);
+        let entries = crate::ops::container::list_entries(&fixture.nsz, true)?;
+        let mut files = Vec::new();
+        let mut names = HashSet::new();
+        add_named_entry(
+            &fixture.nsz,
+            &entries,
+            &fixture.meta_name,
+            temp.path(),
+            &mut files,
+            &mut names,
+            &AtomicBool::new(false),
+        )?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, fixture.meta_name);
+        assert_eq!(fs::read(&files[0].1)?, fixture.nca);
+        assert_eq!(sha2::Sha256::digest(fs::read(&fixture.nsz)?), original_sha);
+        Ok(())
+    }
 
     fn candidate(source: usize, title_id: &str, meta_type: ContentMetaType) -> Candidate {
         Candidate {

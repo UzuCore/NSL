@@ -1,21 +1,128 @@
 use crate::{
+    formats::ncz_stream::{decompress_ncz_region_to_nca, validate_ncz_region_layout},
     keys::{KeySet, sanitize_title_keys_file},
     ops::{
         container::{ContainerEntry, extract_entry, list_entries},
         native_fs,
-        native_meta::read_cnmt_from_nca_region,
+        native_meta::{read_cnmt_from_nca_bytes, read_cnmt_from_nca_region},
         title_support::nacp_language_records,
     },
     process::run_tool,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::HashSet,
     ffi::OsString,
-    fs,
+    fs::{self, File},
+    io::BufReader,
     path::{Path, PathBuf},
-    sync::atomic::AtomicBool,
+    sync::atomic::{AtomicBool, Ordering},
 };
+
+const MAX_IN_MEMORY_CNMT_NCA: u64 = 64 * 1024 * 1024;
+
+fn is_cnmt_container_entry(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".cnmt.nca") || lower.ends_with(".cnmt.ncz")
+}
+
+fn canonical_cnmt_nca_name(name: &str) -> Result<String> {
+    ensure!(is_cnmt_container_entry(name), "Not a CNMT NCA/NCZ: {name}");
+    ensure!(
+        !name.contains(['/', '\\', '\0']) && !name.contains(".."),
+        "Unsafe CNMT container entry name: {name}"
+    );
+    if name.to_ascii_lowercase().ends_with(".ncz") {
+        Ok(format!("{}.nca", &name[..name.len() - 4]))
+    } else {
+        Ok(name.to_owned())
+    }
+}
+
+#[cfg(test)]
+#[path = "cnmt_compressed_tests.rs"]
+pub(crate) mod compressed_tests;
+
+/// Decode only a size-bounded metadata NCZ; never allocate a full game image.
+fn read_cnmt_from_container_entry(
+    container: &Path,
+    entry: &ContainerEntry,
+    keys: &KeySet,
+    cancel: &AtomicBool,
+) -> Result<CnmtInfo> {
+    ensure!(!cancel.load(Ordering::Relaxed), "CNMT discovery cancelled");
+    let name = canonical_cnmt_nca_name(&entry.name)?;
+    let len = fs::metadata(container)?.len();
+    ensure!(
+        entry
+            .offset
+            .checked_add(entry.size)
+            .is_some_and(|end| end <= len),
+        "CNMT entry exceeds container: {}",
+        entry.name
+    );
+    let raw = if entry.name.to_ascii_lowercase().ends_with(".ncz") {
+        let mut input = BufReader::with_capacity(1024 * 1024, File::open(container)?);
+        let decoded_size = validate_ncz_region_layout(&mut input, entry.offset, entry.size)?;
+        ensure!(
+            decoded_size <= MAX_IN_MEMORY_CNMT_NCA,
+            "CNMT NCZ exceeds 64 MiB in-memory limit: {}",
+            entry.name
+        );
+        let mut decoded = Vec::with_capacity(usize::try_from(decoded_size)?);
+        let written = decompress_ncz_region_to_nca(
+            &mut input,
+            entry.offset,
+            entry.size,
+            &mut decoded,
+            cancel,
+            |_, _| {},
+        )?;
+        ensure!(
+            written == decoded_size && decoded.len() as u64 == decoded_size,
+            "CNMT NCZ decoded length mismatch"
+        );
+        read_cnmt_from_nca_bytes(&decoded, keys)?
+    } else {
+        read_cnmt_from_nca_region(container, entry.offset, entry.size, keys)?
+    };
+    ensure!(!cancel.load(Ordering::Relaxed), "CNMT discovery cancelled");
+    parse_cnmt(&raw, name)
+}
+
+/// Fallback for unsupported native layouts: decode only metadata into an
+/// explicitly caller-owned scratch workspace, never a game directory.
+fn extract_cnmt_nca_file(
+    container: &Path,
+    entry: &ContainerEntry,
+    output: &Path,
+    cancel: &AtomicBool,
+) -> Result<()> {
+    if !entry.name.to_ascii_lowercase().ends_with(".ncz") {
+        return extract_entry(container, entry, output, cancel);
+    }
+    let mut source = BufReader::with_capacity(1024 * 1024, File::open(container)?);
+    let decoded_size = validate_ncz_region_layout(&mut source, entry.offset, entry.size)?;
+    ensure!(
+        decoded_size <= MAX_IN_MEMORY_CNMT_NCA,
+        "CNMT NCZ exceeds 64 MiB limit"
+    );
+    let mut out = File::create_new(output)?;
+    let written = decompress_ncz_region_to_nca(
+        &mut source,
+        entry.offset,
+        entry.size,
+        &mut out,
+        cancel,
+        |_, _| {},
+    )?;
+    ensure!(
+        written == decoded_size,
+        "CNMT fallback decoded size mismatch"
+    );
+    out.sync_all()?;
+    Ok(())
+}
 
 /// XCI/XCZ에서 secure 파티션을 우선 사용하되, 구형 병합 도구가 Update/DLC의
 /// CNMT를 update/normal 파티션에 둔 경우에는 실제 게임 메타데이터만 추가로
@@ -51,11 +158,11 @@ pub fn discover_game_metadata(
     let all_entries = list_entries(container, false)?;
     let primary_meta_names = primary_entries
         .iter()
-        .filter(|entry| entry.name.to_ascii_lowercase().ends_with(".cnmt.nca"))
+        .filter(|entry| is_cnmt_container_entry(&entry.name))
         .map(|entry| entry.name.to_ascii_lowercase())
         .collect::<HashSet<_>>();
     let has_extra_meta = all_entries.iter().any(|entry| {
-        entry.name.to_ascii_lowercase().ends_with(".cnmt.nca")
+        is_cnmt_container_entry(&entry.name)
             && !primary_meta_names.contains(&entry.name.to_ascii_lowercase())
     });
     if !has_extra_meta {
@@ -127,7 +234,11 @@ pub fn select_entries_for_cnmts(
     let mut names = HashSet::new();
     let mut title_prefixes = HashSet::new();
     for cnmt in cnmts {
-        names.insert(cnmt.cnmt_nca_name.to_ascii_lowercase());
+        let metadata_name = cnmt.cnmt_nca_name.to_ascii_lowercase();
+        if let Some(stem) = metadata_name.strip_suffix(".nca") {
+            names.insert(format!("{stem}.ncz"));
+        }
+        names.insert(metadata_name);
         title_prefixes.insert(cnmt.title_id.to_ascii_lowercase());
         for content in &cnmt.contents {
             let stem = content.nca_id.to_ascii_lowercase();
@@ -311,30 +422,28 @@ pub fn extract_and_parse_cnmts(
     // Read metadata directly from the encrypted container whenever possible.
     // Unsupported layouts still use the proven hactool/LibHac fallback.
     let native_keys = KeySet::load_with_local_title_keys(prod_keys).ok();
-    for entry in entries
-        .iter()
-        .filter(|e| e.name.to_ascii_lowercase().ends_with(".cnmt.nca"))
-    {
+    for entry in entries.iter().filter(|e| is_cnmt_container_entry(&e.name)) {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("작업이 중단되었습니다");
         }
-        if let Some(info) = native_keys.as_ref().and_then(|keys| {
-            read_cnmt_from_nca_region(container, entry.offset, entry.size, keys)
-                .and_then(|raw| parse_cnmt(&raw, entry.name.clone()))
-                .ok()
-        }) {
+        if let Some(info) = native_keys
+            .as_ref()
+            .and_then(|keys| read_cnmt_from_container_entry(container, entry, keys, cancel).ok())
+        {
             result.push(info);
             continue;
         }
-        let nca_path = temp_dir.join(&entry.name);
-        extract_entry(container, entry, &nca_path, cancel)?;
+        ensure!(!cancel.load(Ordering::Relaxed), "CNMT fallback cancelled");
+        let nca_name = canonical_cnmt_nca_name(&entry.name)?;
+        let nca_path = temp_dir.join(&nca_name);
+        extract_cnmt_nca_file(container, entry, &nca_path, cancel)?;
         let out_dir = temp_dir.join(format!("cnmt_{}", sanitize(&entry.name)));
         let _ = fs::remove_dir_all(&out_dir);
         fs::create_dir_all(&out_dir)?;
         let cnmt_path =
-            extract_cnmt_payload(&nca_path, &entry.name, &out_dir, hactool, prod_keys, cancel)?;
+            extract_cnmt_payload(&nca_path, &nca_name, &out_dir, hactool, prod_keys, cancel)?;
         let raw = fs::read(&cnmt_path)?;
-        result.push(parse_cnmt(&raw, entry.name.clone())?);
+        result.push(parse_cnmt(&raw, nca_name)?);
     }
     if result.is_empty() {
         bail!("cnmt.nca를 찾거나 해석하지 못했습니다");
@@ -355,26 +464,29 @@ fn extract_and_parse_cnmts_best_effort(
     let native_keys = KeySet::load_with_local_title_keys(prod_keys).ok();
     for entry in entries
         .iter()
-        .filter(|entry| entry.name.to_ascii_lowercase().ends_with(".cnmt.nca"))
+        .filter(|entry| is_cnmt_container_entry(&entry.name))
     {
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("작업이 중단되었습니다");
         }
-        if let Some(info) = native_keys.as_ref().and_then(|keys| {
-            read_cnmt_from_nca_region(container, entry.offset, entry.size, keys)
-                .and_then(|raw| parse_cnmt(&raw, entry.name.clone()))
-                .ok()
-        }) {
+        if let Some(info) = native_keys
+            .as_ref()
+            .and_then(|keys| read_cnmt_from_container_entry(container, entry, keys, cancel).ok())
+        {
             result.push(info);
             continue;
         }
+        if cancel.load(Ordering::Relaxed) {
+            bail!("CNMT fallback cancelled");
+        }
         let nca_path = temp_dir.join(format!("meta_{}", sanitize(&entry.name)));
-        if extract_entry(container, entry, &nca_path, cancel).is_err() {
+        if extract_cnmt_nca_file(container, entry, &nca_path, cancel).is_err() {
             continue;
         }
         let out_dir = temp_dir.join(format!("parsed_{}", sanitize(&entry.name)));
+        let nca_name = canonical_cnmt_nca_name(&entry.name)?;
         if let Ok(info) =
-            parse_cnmt_nca_file(&nca_path, &entry.name, &out_dir, hactool, prod_keys, cancel)
+            parse_cnmt_nca_file(&nca_path, &nca_name, &out_dir, hactool, prod_keys, cancel)
         {
             result.push(info);
         }

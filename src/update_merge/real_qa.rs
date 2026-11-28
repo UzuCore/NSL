@@ -385,6 +385,7 @@ fn real_package_fast_nsz_equivalence() {
             work: temp.path(),
             disabled_tool: &tool,
             prod_keys: &prod_keys,
+            control: None,
         },
         &mut keys,
         &cancel,

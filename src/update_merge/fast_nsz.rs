@@ -9,7 +9,7 @@
 
 use super::{
     compression_options, ensure_existing_content_preserved, validate_dlc_cnmts,
-    validate_selected_cnmts,
+    validate_selected_cnmts, MergeControl,
 };
 use anyhow::{ensure, Context, Result};
 use nsrp_core::{
@@ -129,10 +129,10 @@ fn latest_candidates(
         .collect::<Vec<_>>();
     if let Some(dlc_id) = dlc_id {
         validate_dlc_cnmts(&cnmts, base_id, dlc_id, version)?;
-        ensure_existing_content_preserved(base_cnmts, &cnmts)?;
     } else {
         validate_selected_cnmts(&cnmts, base_id, version)?;
     }
+    ensure_existing_content_preserved(base_cnmts, &cnmts)?;
     selected.sort_by_key(|item| {
         (
             match item.cnmt.meta_type {
@@ -289,6 +289,7 @@ pub(super) struct FastNszRequest<'a> {
     pub(super) work: &'a Path,
     pub(super) disabled_tool: &'a Path,
     pub(super) prod_keys: &'a Path,
+    pub(super) control: Option<&'a MergeControl>,
 }
 
 /// Returns None for formats/layouts that must use the existing NSRP route.
@@ -307,6 +308,7 @@ pub(super) fn try_merge_nsz_fast(
         work,
         disabled_tool,
         prod_keys,
+        control,
     } = request;
     let ext = |path: &Path| {
         path.extension()
@@ -317,6 +319,9 @@ pub(super) fn try_merge_nsz_fast(
     let patch_is_nsz = ext(patch) == "nsz";
     if ext(original) != "nsz" || !(ext(patch) == "nsp" || patch_is_nsz) {
         return Ok(None);
+    }
+    if let Some(control) = control {
+        control.stage("NSZ index and metadata");
     }
     let base = IndexedSource::open(original)?;
     let raw_patch = IndexedSource::open(patch)?;
@@ -377,6 +382,9 @@ pub(super) fn try_merge_nsz_fast(
         // Reuse already compressed update NCZ without decoding or re-encoding.
         None
     } else {
+        if let Some(control) = control {
+            control.measured_stage("NSZ patch compression");
+        }
         let patch_nsz = work.join("fast_patch.nsz");
         compress::compress_nsp(
             patch,
@@ -384,12 +392,19 @@ pub(super) fn try_merge_nsz_fast(
             keys,
             &compression_options(),
             cancel,
-            &mut |_| {},
+            &mut |fraction| {
+                if let Some(control) = control {
+                    control.fraction(fraction);
+                }
+            },
             &mut |_| {},
         )
         .context("추가 패키지 NSP 독립 압축 실패")?;
         Some(IndexedSource::open(&patch_nsz)?)
     };
+    if let Some(control) = control {
+        control.stage("NSZ bounded stream assembly");
+    }
     let output = work.join("fast_merged.nsz");
     let count = compose_nsz(
         &candidates,
@@ -738,6 +753,7 @@ mod tests {
                 work: temp.path(),
                 disabled_tool: &temp.path().join("no_tools.exe"),
                 prod_keys: &temp.path().join("missing_keys"),
+                control: None,
             },
             &mut KeySet::default(),
             &AtomicBool::new(false),

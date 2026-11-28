@@ -37,6 +37,8 @@ mod fast_nsz;
 pub(crate) struct MergeControl {
     cancelled: AtomicBool,
     pub(crate) progress: TaskProgress,
+    #[cfg(test)]
+    trace: std::sync::Mutex<Option<(String, std::time::Instant)>>,
 }
 
 impl MergeControl {
@@ -57,16 +59,51 @@ impl MergeControl {
     }
 
     pub(crate) fn stage(&self, label: &str) {
+        #[cfg(test)]
+        self.trace_transition(label);
         self.progress.begin(label, None, false);
     }
 
     fn measured_stage(&self, label: &str) {
+        #[cfg(test)]
+        self.trace_transition(label);
         self.progress.begin(label, Some(100), false);
+    }
+
+    #[cfg(test)]
+    fn trace_transition(&self, label: &str) {
+        if std::env::var_os("NSL_QA_MERGE_TRACE").is_none() {
+            return;
+        }
+        if let Ok(mut trace) = self.trace.lock() {
+            if let Some((previous, started)) = trace.take() {
+                eprintln!(
+                    "MERGE_STAGE_DONE {previous} elapsed_s={:.3}",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            eprintln!("MERGE_STAGE_START {label}");
+            *trace = Some((label.to_owned(), std::time::Instant::now()));
+        }
     }
 
     fn fraction(&self, fraction: f32) {
         if fraction.is_finite() {
             self.progress.set((fraction.clamp(0.0, 1.0) * 100.0) as u64);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MergeControl {
+    fn drop(&mut self) {
+        if let Ok(trace) = self.trace.get_mut() {
+            if let Some((label, started)) = trace.take() {
+                eprintln!(
+                    "MERGE_STAGE_END {label} elapsed_s={:.3}",
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
     }
 }
@@ -196,20 +233,41 @@ fn validate_dlc_cnmts(
     Ok(())
 }
 
+/// For both Update and DLC merges, retain every prior Base, Update and DLC.
+/// A higher version may replace the same title; an unchanged version must
+/// retain its non-delta content identity, not just the display version.
 fn ensure_existing_content_preserved(prior: &[CnmtInfo], final_cnmts: &[CnmtInfo]) -> Result<()> {
     for entry in prior.iter().filter(|entry| {
         matches!(
             entry.meta_type,
-            ContentMetaType::Update | ContentMetaType::Dlc
+            ContentMetaType::Base | ContentMetaType::Update | ContentMetaType::Dlc
         )
     }) {
         anyhow::ensure!(
             final_cnmts.iter().any(|present| {
-                present.title_id.eq_ignore_ascii_case(&entry.title_id)
-                    && present.meta_type == entry.meta_type
-                    && present.version >= entry.version
+                if !present.title_id.eq_ignore_ascii_case(&entry.title_id)
+                    || present.meta_type != entry.meta_type
+                    || present.version < entry.version
+                {
+                    return false;
+                }
+                if present.version > entry.version {
+                    return entry.meta_type != ContentMetaType::Base;
+                }
+                entry
+                    .contents
+                    .iter()
+                    .filter(|part| part.content_type != 6)
+                    .all(|part| {
+                        present.contents.iter().any(|other| {
+                            other.nca_id.eq_ignore_ascii_case(&part.nca_id)
+                                && other.hash == part.hash
+                                && other.size == part.size
+                                && other.content_type == part.content_type
+                        })
+                    })
             }),
-            "DLC 병합에서 기존 콘텐츠가 누락됨: {}",
+            "Prior package content not preserved: {}",
             entry.title_id
         );
     }
@@ -313,7 +371,7 @@ fn preflight_input_cnmts(
     dlc_id: Option<&str>,
     required_version: i64,
     control: &MergeControl,
-) -> Result<()> {
+) -> Result<Vec<CnmtInfo>> {
     control.ensure_running()?;
     let prod_keys = scanner::prod_keys().context("CNMT 검사에 필요한 키 파일이 없습니다")?;
     let workspace = tempfile::Builder::new()
@@ -344,7 +402,8 @@ fn preflight_input_cnmts(
         base_id,
         dlc_id,
         required_version,
-    )
+    )?;
+    Ok(original_cnmts)
 }
 
 fn compression_options() -> CompressOptions {
@@ -752,6 +811,13 @@ fn merge_verified_package_controlled(
     )
 }
 
+fn input_stamp(path: &Path) -> Result<(PathBuf, u64, std::time::SystemTime)> {
+    let canonical = path.canonicalize()?;
+    let info = fs::metadata(&canonical)?;
+    anyhow::ensure!(info.is_file(), "Merge input is not a regular file");
+    Ok((canonical, info.len(), info.modified()?))
+}
+
 fn merge_verified_package_target_controlled(
     original: &Path,
     patch: &Path,
@@ -784,10 +850,12 @@ fn merge_verified_package_target_controlled(
         !destination.exists(),
         "이미 같은 업데이트 버전의 병합 파일이 있습니다"
     );
+    let original_stamp = input_stamp(original)?;
+    let patch_stamp = input_stamp(patch)?;
     // Fail closed on mismatched, unreadable, stale or mixed CNMT inputs
     // before allocating merge output, cleaning workspaces or copying NCAs.
     control.stage("입력 파일 CNMT 호환성 검증");
-    preflight_input_cnmts(original, patch, base_id, dlc_id, wanted_version, control)?;
+    let prior = preflight_input_cnmts(original, patch, base_id, dlc_id, wanted_version, control)?;
     let parent = destination.parent().context("원본 게임 폴더 없음")?;
     // Only a dead, locked-marker-free workspace for this exact destination
     // may be reclaimed. Do this before the free-space preflight: a crashed
@@ -825,6 +893,7 @@ fn merge_verified_package_target_controlled(
                 work: work.path(),
                 disabled_tool: &disabled_tool,
                 prod_keys: &prod_keys,
+                control: Some(control),
             },
             &mut keys,
             cancelled,
@@ -982,20 +1051,15 @@ fn merge_verified_package_target_controlled(
     .context("병합 출력 CNMT 검증 실패")?;
     if let Some(dlc_id) = dlc_id {
         validate_dlc_cnmts(&verified, base_id, dlc_id, wanted_version)?;
-        // A second DLC must not replace the first one or discard an installed
-        // update. Verify every prior update/DLC CNMT is still represented.
-        let (_, prior, _) = cnmt::discover_game_metadata(
-            original,
-            &work.path().join("verify_original"),
-            &disabled_tool,
-            &prod_keys,
-            cancelled,
-        )?;
-        ensure_existing_content_preserved(&prior, &verified)?;
     } else {
         validate_selected_cnmts(&verified, base_id, wanted_version)?;
     }
+    ensure_existing_content_preserved(&prior, &verified)?;
     control.ensure_running()?;
+    anyhow::ensure!(
+        input_stamp(original)? == original_stamp && input_stamp(patch)? == patch_stamp,
+        "Merge inputs changed while processing; original files retained"
+    );
     control.stage("병합 파일 안전 게시");
     publish_without_overwrite(&produced, &destination, cancelled)?;
     // A crash after no-clobber publication but before the owning batch
@@ -1105,18 +1169,18 @@ fn merge_or_recover_target_controlled(
         if let Some(id) = dlc_id {
             validate_dlc_cnmts(&cnmts, base_id, id, version)
                 .context("동일 이름의 기존 파일이 요청한 DLC와 다릅니다")?;
-            let (_, prior, _) = cnmt::discover_game_metadata(
-                original,
-                &work.path().join("verify_original"),
-                &disabled_tool,
-                &keys,
-                &control.cancelled,
-            )?;
-            ensure_existing_content_preserved(&prior, &cnmts)?;
         } else {
             validate_selected_cnmts(&cnmts, base_id, version)
                 .context("동일 이름의 기존 파일이 요청한 병합 결과와 일치하지 않습니다")?;
         }
+        let (_, prior, _) = cnmt::discover_game_metadata(
+            original,
+            &work.path().join("verify_original"),
+            &disabled_tool,
+            &keys,
+            &control.cancelled,
+        )?;
+        ensure_existing_content_preserved(&prior, &cnmts)?;
         match format {
             OutputKind::Nsz => {
                 let index = nsrp_core::formats::pfs0::Pfs0Index::parse(&destination)?;
@@ -1525,5 +1589,40 @@ mod tests {
         let mut cumulative = prior.clone();
         cumulative.push(dlc);
         assert!(ensure_existing_content_preserved(&prior, &cumulative).is_ok());
+    }
+    #[test]
+    fn stage61_update_requires_prior_base_and_dlc_content_identity() {
+        let make = |id: &str, kind: ContentMetaType, version: u32| CnmtInfo {
+            cnmt_nca_name: format!("{id}.cnmt.nca"),
+            title_id: id.into(),
+            version,
+            meta_type: kind,
+            required_system_version: 0,
+            contents: vec![cnmt::CnmtContent {
+                hash: [7; 32],
+                nca_id: "ab".repeat(16),
+                size: 42,
+                content_type: 0,
+            }],
+            raw: vec![],
+        };
+        let base = make("0100111122220000", ContentMetaType::Base, 0);
+        let old = make("0100111122220800", ContentMetaType::Update, 65536);
+        let new = make("0100111122220800", ContentMetaType::Update, 131072);
+        let dlc = make("0100111122221001", ContentMetaType::Dlc, 0);
+        let prior = vec![base.clone(), old, dlc.clone()];
+        assert!(ensure_existing_content_preserved(&prior, &[base.clone(), new.clone()]).is_err());
+        assert!(ensure_existing_content_preserved(
+            &prior,
+            &[base.clone(), new.clone(), dlc.clone()]
+        )
+        .is_ok());
+        let mut changed = dlc.clone();
+        changed.contents[0].hash = [8; 32];
+        assert!(
+            ensure_existing_content_preserved(&prior, &[base.clone(), new.clone(), changed])
+                .is_err()
+        );
+        assert!(ensure_existing_content_preserved(&prior, &[new, dlc]).is_err());
     }
 }

@@ -246,29 +246,22 @@ impl NslApp {
         // Runtime torrent keys are different after restart. Restore our
         // independent, crash-safe post-download manifest; reconnect by the
         // torrent's original output directory once librqbit is ready.
-        match update_manifest::load(&app.base_dir) {
-            Ok(Some(batch)) => {
-                let count = batch.rows.len();
-                if batch.kind == update_batch::BatchKind::Dlc {
-                    app.dlc_batch = Some(batch);
-                } else {
-                    app.update_batch = Some(batch);
+        match update_manifest::load_all(&app.base_dir) {
+            Ok((updates, dlcs)) => {
+                for batch in updates.iter().chain(dlcs.iter()) {
+                    let _ = app.log_sender.send(format!(
+                        "ℹ {} 작업 {}개 복원 · 다운로드 상태 재연결 중",
+                        if batch.kind == update_batch::BatchKind::Dlc {
+                            "일괄 DLC"
+                        } else {
+                            "일괄 업데이트"
+                        },
+                        batch.rows.len()
+                    ));
                 }
-                let restored_kind = app
-                    .dlc_batch
-                    .as_ref()
-                    .map(|_| update_batch::BatchKind::Dlc)
-                    .unwrap_or(update_batch::BatchKind::Update);
-                let _ = app.log_sender.send(format!(
-                    "ℹ {} 작업 {count}개 복원 · 다운로드 상태 재연결 중",
-                    if restored_kind == update_batch::BatchKind::Dlc {
-                        "일괄 DLC"
-                    } else {
-                        "일괄 업데이트"
-                    }
-                ));
+                app.update_batch = updates;
+                app.dlc_batch = dlcs;
             }
-            Ok(None) => {}
             Err(error) => {
                 let _ = app.log_sender.send(format!(
                     "⚠ 일괄 업데이트 작업 기록을 읽지 못했습니다: {error} · 원본 유지"

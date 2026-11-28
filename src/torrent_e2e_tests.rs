@@ -3018,3 +3018,226 @@ fn nested_magnet_preview_downloads_only_selected_files() {
     drop(runtime);
     drop(tracker);
 }
+
+/// Reproduce the production registration pressure (45 distinct torrent
+/// jobs), with strictly loopback peers and generated files only.
+#[test]
+#[ignore = "loopback-only bulk torrent registration and exact byte transfer"]
+fn stage52_bulk_registration_45_distinct_sessions_and_duplicate_isolation() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let seed_dir = root.path().join("seed");
+    let download_dir = root.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    let (seeder, fixtures) = rt.block_on(async {
+        let seed = Session::new_with_opts(
+            seed_dir.clone(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: true,
+                listen: Some(ListenerOptions {
+                    mode: ListenerMode::TcpOnly,
+                    listen_addr: "127.0.0.1:0".parse()?,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let mut fixtures = Vec::new();
+        for i in 0..45usize {
+            let name = format!("fixture-{i:02}.bin");
+            let path = seed_dir.join(&name);
+            let payload: Vec<u8> = (0..131072usize)
+                .map(|offset| ((offset.wrapping_mul(37) + i * 13) % 251) as u8)
+                .collect();
+            std::fs::write(&path, &payload)?;
+            let fixture = librqbit::create_torrent(
+                &path,
+                CreateTorrentOptions {
+                    piece_length: Some(32768),
+                    ..Default::default()
+                },
+                &BlockingSpawner::new(1),
+            )
+            .await?;
+            let bytes = fixture.as_bytes()?;
+            let handle = seed
+                .add_torrent(
+                    AddTorrent::from_bytes(bytes.clone()),
+                    Some(AddTorrentOptions {
+                        overwrite: true,
+                        output_folder: Some(seed_dir.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("seeder registration missing")?;
+            fixtures.push((name, payload, fixture.info_hash(), bytes, handle));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        while fixtures.iter().any(|(_, _, _, _, h)| !h.stats().finished) {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "bulk seeder initialization timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok::<_, anyhow::Error>((seed, fixtures))
+    })?;
+    let tracker = LocalTracker::new(
+        seeder
+            .listen_addr()
+            .context("local seeder listener missing")?,
+    );
+    let engine = TorrentEngine::new(download_dir.clone())?;
+    let mut keys = Vec::new();
+    let mut magnets = Vec::new();
+    for (i, (name, _, hash, bytes, _)) in fixtures.iter().enumerate() {
+        let magnet =
+            librqbit::Magnet::from_id20(*hash, vec![tracker.url.clone()], None).to_string();
+        let key = engine.start_download_selected(
+            name,
+            &magnet,
+            PathBuf::from(format!("group-{i:02}")),
+            Some(bytes.to_vec()),
+            Some(vec![0]),
+        )?;
+        keys.push(key);
+        magnets.push(magnet);
+    }
+    let started = Instant::now();
+    let mut completed = HashSet::new();
+    while completed.len() < fixtures.len() {
+        let (progress, notices) = engine.poll();
+        for notice in notices {
+            if let EngineNotice::Download { key, result } = notice {
+                anyhow::ensure!(result.is_ok(), "bulk transfer {key} failed: {result:?}");
+                completed.insert(key);
+            }
+        }
+        anyhow::ensure!(
+            progress.iter().all(|(_, p)| p.error.is_none()),
+            "bulk transfer encountered an error"
+        );
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(120),
+            "bulk transfer timeout: {}",
+            completed.len()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for (i, (name, payload, _, _, _)) in fixtures.iter().enumerate() {
+        anyhow::ensure!(
+            std::fs::read(download_dir.join(format!("group-{i:02}")).join(name))? == *payload,
+            "bulk payload mismatch"
+        );
+    }
+    let journal: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        download_dir
+            .parent()
+            .unwrap()
+            .join("torrent-session/session.json"),
+    )?)?;
+    anyhow::ensure!(
+        journal["torrents"]
+            .as_object()
+            .context("session map missing")?
+            .len()
+            == 45,
+        "persistent IDs collided"
+    );
+    // Duplicate and mismatched metadata must not mutate any original session.
+    let duplicate = engine.start_download_selected(
+        "duplicate",
+        &magnets[0],
+        PathBuf::from("duplicate"),
+        Some(fixtures[0].3.to_vec()),
+        Some(vec![0]),
+    )?;
+    let mismatch = engine.start_download_selected(
+        "mismatch",
+        &magnets[0],
+        PathBuf::from("mismatch"),
+        Some(fixtures[1].3.to_vec()),
+        Some(vec![0]),
+    )?;
+    let wait_error = |key: &str| -> anyhow::Result<String> {
+        let start = Instant::now();
+        loop {
+            let (rows, _) = engine.poll();
+            if let Some(error) = rows
+                .iter()
+                .find(|(id, _)| id == key)
+                .and_then(|(_, row)| row.error.clone())
+            {
+                return Ok(error);
+            }
+            anyhow::ensure!(
+                start.elapsed() < Duration::from_secs(15),
+                "expected rejection not received"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert!(wait_error(&duplicate)?.contains("중복"));
+    assert!(wait_error(&mismatch)?.contains("정보 해시"));
+    anyhow::ensure!(
+        !download_dir.join("duplicate").exists() && !download_dir.join("mismatch").exists(),
+        "rejected request created payload"
+    );
+    let journal2: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        download_dir
+            .parent()
+            .unwrap()
+            .join("torrent-session/session.json"),
+    )?)?;
+    anyhow::ensure!(
+        journal2["torrents"].as_object().unwrap().len() == 45,
+        "rejected duplicate modified session count"
+    );
+    println!("STAGE52_BULK_PASS sessions=45 files=45 exact_payloads=45 duplicate_rejected=true hash_mismatch_rejected=true elapsed_s={:.2}", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
+#[test]
+#[ignore = "loopback-only preview cache restart test"]
+fn stage55_preview_cache_survives_peer_outage_and_restart() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let seed_dir = root.path().join("seed");
+    let downloads = root.path().join("client").join("downloads");
+    std::fs::create_dir_all(&seed_dir)?;
+    let source = seed_dir.join("metadata-only.bin");
+    std::fs::write(&source, vec![42u8; 32768])?;
+    let (rt, seeder, _handle, tracker, magnet) = local_file_seeder(&source, &seed_dir, 1024 * 1024);
+    let engine = TorrentEngine::new(downloads.clone())?;
+    let request = engine.preview_files(&magnet)?;
+    let first = request
+        .receiver
+        .recv_timeout(Duration::from_secs(20))?
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(first.files.len(), 1);
+    drop(engine);
+    drop(seeder);
+    drop(rt);
+    drop(tracker);
+    let restarted = TorrentEngine::new(downloads.clone())?;
+    let started = Instant::now();
+    let request = restarted.preview_files_with_timeout(&magnet, 10)?;
+    let second = request
+        .receiver
+        .recv_timeout(Duration::from_secs(5))?
+        .map_err(anyhow::Error::msg)?;
+    assert_eq!(first.torrent_bytes, second.torrent_bytes);
+    assert_eq!(first.files[0].path, second.files[0].path);
+    assert!(!downloads.join("metadata-only.bin").exists());
+    println!(
+        "STAGE55_OFFLINE_CACHE_PASS elapsed_s={:.3}",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}

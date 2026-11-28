@@ -26,6 +26,8 @@
 # Torrent downloads and resume state
 /downloads/
 /torrent-session/
+/batch-updates.json
+/.nsl-batch-*.json.tmp
 /.nsl-torrent-session.lock
 
 # QA screenshots and archived GUI evidence are local-only

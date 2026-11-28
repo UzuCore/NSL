@@ -12,7 +12,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_JOBS: usize = 5000;
 
@@ -108,7 +108,7 @@ fn validate_job_identity(job: &SavedJob) -> Result<()> {
 }
 
 pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
-    let jobs: Vec<SavedJob> = batch
+    let mut jobs: Vec<SavedJob> = batch
         .rows
         .iter()
         .filter_map(|row| {
@@ -133,6 +133,17 @@ pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
             })
         })
         .collect();
+    // Every UI mutation replaces only its own kind; keep the other kind's
+    // recovery entries in the same atomic journal. Fail closed if the old
+    // journal is corrupt rather than silently losing pending downloads.
+    if let Some(previous) = read_manifest(base_dir)? {
+        jobs.extend(
+            previous
+                .jobs
+                .into_iter()
+                .filter(|job| job.kind != batch.kind),
+        );
+    }
     let file = manifest_file(base_dir);
     if jobs.is_empty() {
         if let Err(error) = fs::remove_file(&file) {
@@ -155,7 +166,13 @@ pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
         );
     }
     let bytes = serde_json::to_vec_pretty(&Manifest {
-        version: SCHEMA_VERSION,
+        version: if jobs.iter().any(|job| job.kind == BatchKind::Update)
+            && jobs.iter().any(|job| job.kind == BatchKind::Dlc)
+        {
+            SCHEMA_VERSION
+        } else {
+            1
+        },
         jobs,
     })?;
     anyhow::ensure!(
@@ -177,7 +194,7 @@ pub(crate) fn save(base_dir: &Path, batch: &UpdateBatch) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
+fn read_manifest(base_dir: &Path) -> Result<Option<Manifest>> {
     let path = manifest_file(base_dir);
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
@@ -191,28 +208,61 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(&path)?)
         .context("일괄 업데이트 작업 기록 형식이 올바르지 않습니다")?;
     anyhow::ensure!(
-        manifest.version == SCHEMA_VERSION,
+        matches!(manifest.version, 1 | SCHEMA_VERSION),
         "지원하지 않는 일괄 업데이트 기록 버전"
     );
     anyhow::ensure!(
         manifest.jobs.len() <= MAX_JOBS,
         "일괄 업데이트 작업 기록 수가 너무 많습니다"
     );
-    let kind = manifest
-        .jobs
-        .first()
-        .map_or(BatchKind::Update, |job| job.kind);
-    anyhow::ensure!(
-        manifest.jobs.iter().all(|job| job.kind == kind),
-        "한 작업 기록에서 업데이트와 DLC가 섞여 있습니다"
-    );
-    let mut rows = Vec::with_capacity(manifest.jobs.len());
-    for saved in manifest.jobs {
-        validate_job_identity(&saved)?;
+    if manifest.version == 1 {
+        if let Some(first) = manifest.jobs.first() {
+            anyhow::ensure!(
+                manifest.jobs.iter().all(|job| job.kind == first.kind),
+                "버전 1 작업 기록에 업데이트와 DLC가 섞여 있습니다"
+            );
+        }
+    }
+    for job in &manifest.jobs {
+        validate_job_identity(job)?;
         anyhow::ensure!(
-            valid_download_location(base_dir, &saved.download_folder, &saved.download_file),
+            valid_download_location(base_dir, &job.download_folder, &job.download_file),
             "안전하지 않은 일괄 업데이트 다운로드 경로"
         );
+    }
+    Ok(Some(manifest))
+}
+
+pub(crate) fn load_all(base_dir: &Path) -> Result<(Option<UpdateBatch>, Option<UpdateBatch>)> {
+    let Some(manifest) = read_manifest(base_dir)? else {
+        return Ok((None, None));
+    };
+    let (updates, dlcs): (Vec<_>, Vec<_>) = manifest
+        .jobs
+        .into_iter()
+        .partition(|job| job.kind == BatchKind::Update);
+    Ok((
+        restore_batch(BatchKind::Update, updates),
+        restore_batch(BatchKind::Dlc, dlcs),
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
+    let (updates, dlcs) = load_all(base_dir)?;
+    anyhow::ensure!(
+        updates.is_none() || dlcs.is_none(),
+        "use load_all for mixed batches"
+    );
+    Ok(updates.or(dlcs))
+}
+
+fn restore_batch(kind: BatchKind, jobs: Vec<SavedJob>) -> Option<UpdateBatch> {
+    if jobs.is_empty() {
+        return None;
+    }
+    let mut rows = Vec::with_capacity(jobs.len());
+    for saved in jobs {
         let status = if matches!(saved.status, UpdateBatchJobStatus::Verifying) {
             // The worker did not survive exit. A recorded completed transfer
             // is safe to verify/merge again; a partial transfer must wait for
@@ -236,7 +286,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         };
         rows.push(UpdateBatchRow {
             library_id: saved.library_id,
-            merge_permitted: true,
+            merge_permitted: false,
             title_id: saved.title_id,
             dlc_id: saved.dlc_id,
             name: saved.name,
@@ -253,7 +303,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         });
     }
     let count = rows.len();
-    Ok(Some(UpdateBatch {
+    Some(UpdateBatch {
         kind,
         rows,
         running: false,
@@ -266,7 +316,7 @@ pub(crate) fn load(base_dir: &Path) -> Result<Option<UpdateBatch>> {
         failed_previews: std::collections::HashMap::new(),
         preview_cache_bytes: 0,
         pending_catalog_hints: Default::default(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -318,6 +368,30 @@ mod tests {
             preview_cache_bytes: 0,
             pending_catalog_hints: Default::default(),
         }
+    }
+
+    #[test]
+    fn stage50_mixed_journal_preserves_other_kind_and_legacy_v1() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut update = example_batch(dir.path());
+        let mut dlc = example_batch(dir.path());
+        dlc.kind = BatchKind::Dlc;
+        dlc.rows[0].dlc_id = Some("0100D2C0115B7001".into());
+        dlc.rows[0].job.as_mut().unwrap().expected_version = 0;
+        dlc.rows[0].job.as_mut().unwrap().key = "t15".into();
+        save(dir.path(), &update).unwrap();
+        assert_eq!(read_manifest(dir.path()).unwrap().unwrap().version, 1);
+        save(dir.path(), &dlc).unwrap();
+        assert_eq!(read_manifest(dir.path()).unwrap().unwrap().version, 2);
+        let (u, d) = load_all(dir.path()).unwrap();
+        assert_eq!(u.unwrap().rows[0].job.as_ref().unwrap().key, "t14");
+        assert_eq!(d.unwrap().rows[0].job.as_ref().unwrap().key, "t15");
+        update.rows.clear();
+        save(dir.path(), &update).unwrap();
+        let (u, d) = load_all(dir.path()).unwrap();
+        assert!(u.is_none());
+        assert_eq!(d.unwrap().rows.len(), 1);
+        assert_eq!(read_manifest(dir.path()).unwrap().unwrap().version, 1);
     }
 
     #[test]

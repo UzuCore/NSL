@@ -1613,6 +1613,24 @@ fn restored_batch_rebinds_new_torrent_key_by_output_folder_without_starting_merg
     };
     update_manifest::save(&app.base_dir, &batch).unwrap();
     app.update_batch = update_manifest::load(&app.base_dir).unwrap();
+    // A new unrelated transfer may reuse t1 after restart. Its completion
+    // must not mark the recovered batch as downloaded or trigger a merge.
+    let wrong = vec![(
+        "t1".to_owned(),
+        torrent::TorrentProgress {
+            output_folder: Some(dir.path().join("unrelated")),
+            finished: true,
+            ..Default::default()
+        },
+    )];
+    app.handle_missing_update_completion_from_snapshot("t1", &Ok(()), &wrong);
+    assert!(
+        !app.update_batch.as_ref().unwrap().rows[0]
+            .job
+            .as_ref()
+            .unwrap()
+            .transfer_finished
+    );
     app.torrent_progress = vec![(
         "r42".into(),
         torrent::TorrentProgress {
@@ -3672,6 +3690,127 @@ fn store_original_post_button_opens_selected_web_url() {
         }
     }
     assert!(app.torrent_progress.is_empty());
+}
+
+#[test]
+#[ignore = "real cached catalog and library; read-only database snapshot, no peer connections"]
+fn stage51_catalog_inventory_read_only() -> anyhow::Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let catalog = catalog::load(root).ok_or_else(|| anyhow::anyhow!("cached catalog missing"))?;
+    let temp = tempfile::tempdir()?;
+    let snapshot = temp.path().join("library.db");
+    database::backup_read_only(&root.join("library.db"), &snapshot)?;
+    let db = database::Database::open(snapshot)?;
+    let rows = db.files("ko")?;
+    let config = database::load_config(&root.join("config.json"))?;
+    let exclude = |key: &str| {
+        config
+            .settings
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+    let updates =
+        update_batch::new_update_batch(&rows, &catalog.items, exclude("exception_update"));
+    let dlcs = update_batch::new_dlc_batch(&rows, &catalog.items, exclude("exception_dlc"));
+    let update_games = updates
+        .rows
+        .iter()
+        .filter(|r| !r.candidates.is_empty())
+        .map(|r| r.title_id.as_str())
+        .collect::<HashSet<_>>();
+    let dlc_games = dlcs
+        .rows
+        .iter()
+        .filter(|r| !r.candidates.is_empty())
+        .map(|r| r.title_id.as_str())
+        .collect::<HashSet<_>>();
+    println!("STAGE51_LOCAL_CATALOG catalog={} library_rows={} missing_update_rows={} update_catalog_candidates={} dlc_catalog_games={} dlc_id_candidates={} metadata_confirmed=NOT_MEASURED",
+        catalog.items.len(), rows.len(), rows.iter().filter(|r|r.has_base && r.update_version < r.latest_version).count(),update_games.len(),dlc_games.len(),dlcs.catalog_hint_count());
+    assert_eq!(updates.file_candidate_count(), 0);
+    assert_eq!(dlcs.file_candidate_count(), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "native read-only CNMT revalidation of bounded local legacy candidates"]
+fn stage53_legacy_cnmt_sample_read_only() -> anyhow::Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let temp = tempfile::tempdir()?;
+    let snapshot = temp.path().join("library.db");
+    database::backup_read_only(&root.join("library.db"), &snapshot)?;
+    let db = database::Database::open(snapshot)?;
+    let catalog = catalog::load(root).ok_or_else(|| anyhow::anyhow!("cached catalog missing"))?;
+    let rows = db.files("ko")?;
+    let updates = update_batch::new_update_batch(&rows, &catalog.items, "");
+    let dlcs = update_batch::new_dlc_batch(&rows, &catalog.items, "");
+    let wanted = updates
+        .rows
+        .iter()
+        .chain(dlcs.rows.iter())
+        .filter(|r| !r.merge_permitted && !r.candidates.is_empty())
+        .map(|r| (r.original_path.clone(), r.title_id.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let records = db.cached_file_records()?;
+    let limit = std::env::var("NSL_QA_CNMT_LIMIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+        .min(256);
+    let mut tested = 0;
+    let mut decoded = 0;
+    let mut fallback = 0;
+    let mut unavailable = 0;
+    let start = std::time::Instant::now();
+    for (path, id) in wanted.iter().take(limit) {
+        let Ok(before) = std::fs::metadata(path) else {
+            unavailable += 1;
+            continue;
+        };
+        let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
+            unavailable += 1;
+            continue;
+        };
+        let hash = records
+            .get(path.to_string_lossy().as_ref())
+            .map(|record| record.fast_hash.clone())
+            .unwrap_or_default();
+        tested += 1;
+        match scanner::scan_file_hashed(path, name, hash) {
+            Ok(scan)
+                if scan.contents.iter().any(|item| {
+                    item.content_type == "base"
+                        && item
+                            .title_id
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case(id))
+                        && matches!(
+                            item.source.as_str(),
+                            "header_cnmt" | "header_native" | "header_native_card"
+                        )
+                }) =>
+            {
+                decoded += 1
+            }
+            _ => fallback += 1,
+        }
+        let after = std::fs::metadata(path)?;
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "read-only scan changed original size"
+        );
+        assert_eq!(
+            before.modified()?,
+            after.modified()?,
+            "read-only scan changed original modification time"
+        );
+        if start.elapsed() > std::time::Duration::from_secs(90) {
+            break;
+        }
+    }
+    println!("STAGE53_CNMT_SAMPLE candidate_paths={} tested={tested} decoded={decoded} fallback={fallback} unavailable={unavailable} elapsed_s={:.2} database_writes=0",wanted.len(),start.elapsed().as_secs_f64());
+    Ok(())
 }
 
 #[test]

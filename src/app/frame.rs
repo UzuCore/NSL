@@ -646,7 +646,7 @@ impl NslApp {
                             continue;
                         }
                     };
-                    self.handle_missing_update_completion(&key, &result);
+                    self.handle_missing_update_completion_from_snapshot(&key, &result, &snapshot);
                     let label = snapshot
                         .iter()
                         .find(|(k, _)| *k == key)

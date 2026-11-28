@@ -4,6 +4,10 @@ use librqbit::{
     SessionPersistenceConfig, TorrentStatsState,
 };
 
+#[path = "torrent_metadata_cache.rs"]
+mod metadata_cache;
+use metadata_cache::MetadataCache;
+
 #[path = "torrent_removal.rs"]
 mod removal_journal;
 #[path = "torrent_session_lock.rs"]
@@ -301,8 +305,15 @@ fn spawn_engine(
                 let _ = ready_tx.send(Err(error.clone()));
                 anyhow::bail!(error);
             }
+            // Limit initialization and per-torrent peer fan-out under large queues.
+            // Serialize ID allocation, persistence and state mutations separately;
+            // transferring payload and resolving peer metadata remain concurrent.
+            let mutation_gate = Arc::new(tokio::sync::Mutex::new(()));
+            let metadata_cache = Arc::new(MetadataCache::new(&default_folder));
             #[allow(unused_mut)]
             let mut session_options = SessionOptions {
+                concurrent_init_limit: Some(2),
+                peer_limit: Some(32),
                 persistence: Some(SessionPersistenceConfig::Json {
                     folder: Some(persistence_folder.clone()),
                 }),
@@ -420,6 +431,7 @@ fn spawn_engine(
                 let handles = handles.clone();
                 let session = session.clone();
                 let done_tx = done_tx.clone();
+                let mutation_gate = mutation_gate.clone();
                 runtime.spawn(async move {
                     let cancel = Arc::new(AtomicBool::new(false));
                     if let Some(result) = watch_torrent(
@@ -430,6 +442,7 @@ fn spawn_engine(
                         cancels,
                         handles,
                         cancel,
+                        mutation_gate,
                     )
                     .await
                     {
@@ -440,7 +453,9 @@ fn spawn_engine(
             // Purge stale session entries (old output folders) off the runtime.
             if !stale_ids.is_empty() {
                 let session = session.clone();
+                let mutation_gate = mutation_gate.clone();
                 runtime.spawn(async move {
+                    let _guard = mutation_gate.lock().await;
                     for id in stale_ids {
                         let _ = session.delete(id, false).await;
                     }
@@ -463,10 +478,13 @@ fn spawn_engine(
                 let done_tx = done_tx.clone();
                 let persistence_folder = persistence_folder.clone();
                 let active_removals = active_removals.clone();
+                let default_folder_for_commands = default_folder.clone();
+                let mutation_gate = mutation_gate.clone();
+                let metadata_cache = metadata_cache.clone();
                 runtime.spawn(async move {
                     let notice = match command {
                         EngineCommand::Add(job) => {
-                            run_job(session, job, progress, cancels, handles).await
+                            run_job(session, job, progress, cancels, handles, mutation_gate, metadata_cache).await
                         }
                         EngineCommand::Preview {
                             magnet,
@@ -477,7 +495,7 @@ fn spawn_engine(
                             let result = tokio::select! {
                                 result = tokio::time::timeout(
                                     Duration::from_secs(timeout_secs),
-                                    preview_torrent(&session, &magnet),
+                                    preview_torrent(&session, &magnet, &metadata_cache),
                                 ) => match result {
                                     Ok(result) => result.map_err(|error| format!("{error:#}")),
                                     Err(_) => Err("토렌트 파일 목록 조회 시간이 초과되었습니다".into()),
@@ -492,6 +510,7 @@ fn spawn_engine(
                             None
                         }
                         EngineCommand::Pause(key) => {
+                            let _guard = mutation_gate.lock().await;
                             let result = pause_torrent(&session, &handles, &key, true).await;
                             Some(EngineNotice::Command {
                                 key,
@@ -500,6 +519,7 @@ fn spawn_engine(
                             })
                         }
                         EngineCommand::Resume(key) => {
+                            let _guard = mutation_gate.lock().await;
                             let result = pause_torrent(&session, &handles, &key, false).await;
                             Some(EngineNotice::Command {
                                 key,
@@ -508,6 +528,7 @@ fn spawn_engine(
                             })
                         }
                         EngineCommand::Retry(key) => {
+                            let _guard = mutation_gate.lock().await;
                             let result = retry_failed_torrent(
                                 session,
                                 key.clone(),
@@ -515,6 +536,9 @@ fn spawn_engine(
                                 cancels,
                                 handles,
                                 done_tx.clone(),
+                                mutation_gate.clone(),
+                                &default_folder_for_commands,
+                                &persistence_folder,
                             )
                             .await;
                             Some(EngineNotice::Command {
@@ -544,6 +568,7 @@ fn spawn_engine(
                             // the session actually drops the torrent. A failed
                             // delete (e.g. a stale id) must not strand a
                             // cancelled but still-registered transfer.
+                            let _guard = mutation_gate.lock().await;
                             let (result, session_removed) =
                                 remove_torrent(
                                     &session,
@@ -604,6 +629,9 @@ async fn pause_torrent(
         .ok()
         .and_then(|map| map.get(key).cloned())
         .ok_or_else(|| "해당 다운로드 항목을 찾을 수 없습니다".to_string())?;
+    if handle.is_paused() == pause && handle.stats().error.is_none() {
+        return Ok(());
+    }
     let outcome = if pause {
         session.pause(&handle).await
     } else {
@@ -615,6 +643,7 @@ async fn pause_torrent(
 /// A failed transfer has no watch task anymore: merely unpausing its session
 /// handle would leave the UI stuck on an old error forever. Reserve the key
 /// before awaiting so repeated retry clicks cannot start multiple watchers.
+#[allow(clippy::too_many_arguments)]
 async fn retry_failed_torrent(
     session: Arc<Session>,
     key: String,
@@ -622,6 +651,9 @@ async fn retry_failed_torrent(
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
     done_tx: mpsc::Sender<EngineNotice>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    default_folder: &Path,
+    persistence_folder: &Path,
 ) -> Result<(), String> {
     let failed = progress.lock().ok().and_then(|map| map.get(&key).cloned());
     if !failed.is_some_and(|row| retryable_failed_transfer(&row)) {
@@ -629,7 +661,7 @@ async fn retry_failed_torrent(
             "실패한 전송 기록이 없습니다. 메타데이터 실패라면 스토어에서 다시 선택하세요".into(),
         );
     }
-    let handle = handles
+    let mut handle = handles
         .lock()
         .ok()
         .and_then(|map| map.get(&key).cloned())
@@ -657,7 +689,30 @@ async fn retry_failed_torrent(
         }
         return Err("취소한 다운로드는 재시도할 수 없습니다".into());
     }
-    if let Err(error) = session.unpause(&handle).await {
+    let resumed = if broken_none_state(&handle) {
+        match rebuild_broken_handle(
+            &session,
+            &handles,
+            &key,
+            &handle,
+            default_folder,
+            persistence_folder,
+        )
+        .await
+        {
+            Ok(rebuilt) => {
+                handle = rebuilt;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        session
+            .unpause(&handle)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    };
+    if let Err(error) = resumed {
         if let Ok(mut active) = cancels.lock() {
             active.remove(&key);
         }
@@ -701,6 +756,7 @@ async fn retry_failed_torrent(
             cancels,
             handles,
             cancel,
+            mutation_gate,
         )
         .await
         {
@@ -708,6 +764,67 @@ async fn retry_failed_torrent(
         }
     });
     Ok(())
+}
+
+fn broken_none_state(handle: &ManagedTorrentHandle) -> bool {
+    handle.stats().error.as_deref() == Some("bug: torrent in broken \"None\" state")
+}
+
+/// Caller holds the session mutation gate. Preserve all existing payloads,
+/// rebuild from the exact persisted infohash and original selected-file set.
+async fn rebuild_broken_handle(
+    session: &Arc<Session>,
+    handles: &Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
+    key: &str,
+    handle: &ManagedTorrentHandle,
+    default_folder: &Path,
+    persistence_folder: &Path,
+) -> Result<ManagedTorrentHandle, String> {
+    let folder = handle.output_folder().to_path_buf();
+    if !is_restorable_folder(&folder, default_folder) {
+        return Err("복구 경로가 현재 다운로드 폴더와 일치하지 않습니다".into());
+    }
+    let sub_folder = folder
+        .strip_prefix(default_folder)
+        .map_err(|_| "복구 대상 경로 오류".to_string())?
+        .to_path_buf();
+    let bytes = handle
+        .with_metadata(|meta| meta.torrent_bytes.to_vec())
+        .map_err(|error| format!("{error:#}"))?;
+    let magnet = librqbit::Magnet::from_id20(
+        handle.info_hash(),
+        handle
+            .shared()
+            .trackers
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        None,
+    )
+    .to_string();
+    let job = TorrentJob {
+        key: key.to_owned(),
+        magnet,
+        sub_folder,
+        torrent_bytes: Some(bytes),
+        only_files: handle.only_files(),
+        cancel: Arc::new(AtomicBool::new(false)),
+    };
+    let (result, removed) = remove_torrent(session, handles, key, false, persistence_folder).await;
+    result?;
+    if !removed {
+        return Err("손상된 세션 제거를 확인하지 못했습니다".into());
+    }
+    if let Ok(mut map) = handles.lock() {
+        map.remove(key);
+    }
+    let rebuilt = add_torrent(session, &job)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    if let Ok(mut map) = handles.lock() {
+        map.insert(key.to_owned(), rebuilt.clone());
+    }
+    Ok(rebuilt)
 }
 
 /// File removal in librqbit 9.1.0 is best-effort and can quietly ignore
@@ -971,6 +1088,7 @@ async fn remove_torrent(
 /// Watch one torrent (restored or newly added) and mirror its progress into
 /// the shared map. Exits when the torrent finishes, errors, or the cancel flag
 /// is set by an engine command.
+#[allow(clippy::too_many_arguments)]
 async fn watch_torrent(
     session: Arc<Session>,
     key: String,
@@ -979,11 +1097,18 @@ async fn watch_torrent(
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
     cancel: Arc<AtomicBool>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
 ) -> Option<Result<(), String>> {
     if let Ok(mut map) = handles.lock() {
+        if cancel.load(Ordering::Acquire) {
+            return None;
+        }
         map.insert(key.clone(), handle.clone());
     }
     if let Ok(mut map) = cancels.lock() {
+        if cancel.load(Ordering::Acquire) {
+            return None;
+        }
         map.insert(key.clone(), cancel.clone());
     }
     let name = handle.name().unwrap_or_default();
@@ -1095,7 +1220,15 @@ async fn watch_torrent(
             // Release the file locks so emulators can open the freshly
             // downloaded files immediately (rqbit keeps them open for seeding
             // otherwise, and the emulator then fails with permission denied).
-            let pause_result = session.pause(&handle).await;
+            let _guard = mutation_gate.lock().await;
+            if cancel.load(Ordering::Acquire) {
+                return None;
+            }
+            let pause_result = if error.is_some() || handle.is_paused() {
+                Ok(())
+            } else {
+                session.pause(&handle).await
+            };
             if let Ok(mut map) = cancels.lock() {
                 map.remove(&key);
             }
@@ -1115,28 +1248,44 @@ async fn run_job(
     progress: Arc<Mutex<HashMap<String, TorrentProgress>>>,
     cancels: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     handles: Arc<Mutex<HashMap<String, ManagedTorrentHandle>>>,
+    mutation_gate: Arc<tokio::sync::Mutex<()>>,
+    metadata_cache: Arc<MetadataCache>,
 ) -> Option<EngineNotice> {
+    let mut job = job;
     let key = job.key.clone();
-    let added = tokio::select! {
-        result = add_torrent(&session, &job) => result,
-        _ = async {
-            while !job.cancel.load(Ordering::Relaxed) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+    let added = async {
+        if job.torrent_bytes.is_none() {
+            // Preserve a magnet's explicit file-selection parameter when
+            // resolving metadata before the serialized registration step.
+            if job.only_files.is_none() {
+                job.only_files = librqbit::Magnet::parse(&job.magnet)?.get_select_only();
             }
-        } => return None,
-    };
+            let preview = tokio::select! {
+                result = tokio::time::timeout(Duration::from_secs(90), preview_torrent(&session, &job.magnet, &metadata_cache)) =>
+                    result.context("토렌트 메타데이터 응답 시간 초과")??,
+                _ = async {
+                    while !job.cancel.load(Ordering::Acquire) {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                } => anyhow::bail!("다운로드 취소"),
+            };
+            job.torrent_bytes = Some(preview.torrent_bytes);
+        }
+        let _guard = mutation_gate.lock().await;
+        anyhow::ensure!(!job.cancel.load(Ordering::Acquire), "다운로드 취소");
+        let handle = add_torrent(&session, &job).await?;
+        // Register ownership before releasing the gate. Cancel can now
+        // remove exactly this handle, never an in-flight foreign session.
+        if let Ok(mut map) = handles.lock() {
+            map.insert(key.clone(), handle.clone());
+        }
+        Ok::<_, anyhow::Error>(handle)
+    }.await;
+    if job.cancel.load(Ordering::Acquire) {
+        return None;
+    }
     let result = match added {
         Ok(handle) => {
-            if job.cancel.load(Ordering::Relaxed) {
-                return session
-                    .delete(TorrentIdOrHash::Id(handle.id()), false)
-                    .await
-                    .err()
-                    .map(|error| EngineNotice::Download {
-                        key,
-                        result: Err(format!("취소한 다운로드의 세션 정리 실패: {error:#}")),
-                    });
-            }
             // Hand the torrent over to the shared watch loop so pause/resume
             // and cancel keep working after the magnet handshake.
             watch_torrent(
@@ -1147,10 +1296,23 @@ async fn run_job(
                 cancels,
                 handles,
                 job.cancel,
+                mutation_gate,
             )
             .await
         }
         Err(error) => {
+            let _guard = mutation_gate.lock().await;
+            if job.cancel.load(Ordering::Acquire)
+                || !cancels.lock().is_ok_and(|map| {
+                    map.get(&key)
+                        .is_some_and(|flag| Arc::ptr_eq(flag, &job.cancel))
+                })
+            {
+                return None;
+            }
+            if let Ok(mut map) = cancels.lock() {
+                map.remove(&key);
+            }
             let text = format!("{error:#}");
             let mut final_state = progress
                 .lock()
@@ -1168,7 +1330,40 @@ async fn run_job(
     result.map(|result| EngineNotice::Download { key, result })
 }
 
-async fn preview_torrent(session: &Arc<Session>, magnet: &str) -> Result<TorrentPreview> {
+async fn preview_torrent(
+    session: &Arc<Session>,
+    magnet: &str,
+    cache: &Arc<MetadataCache>,
+) -> Result<TorrentPreview> {
+    let expected = librqbit::Magnet::parse(magnet)?
+        .as_id20()
+        .context("지원되지 않는 토렌트 정보 해시")?;
+    let key = expected
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    // Both update and DLC audits share a single lookup per infohash.
+    let lock = cache.lock_for(&key);
+    let _guard = lock.lock().await;
+    if let Some(bytes) = cache.read_async(key.clone()).await {
+        if let Ok(librqbit::AddTorrentResponse::ListOnly(info)) = session
+            .add_torrent(
+                AddTorrent::from_bytes(bytes),
+                Some(AddTorrentOptions {
+                    list_only: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if info.info_hash == expected {
+                if let Ok(preview) = checked_preview(info) {
+                    return Ok(preview);
+                }
+            }
+        }
+    }
     let response = session
         .add_torrent(
             AddTorrent::from_url(magnet.to_owned()),
@@ -1178,10 +1373,20 @@ async fn preview_torrent(session: &Arc<Session>, magnet: &str) -> Result<Torrent
             }),
         )
         .await
-        .context("토렌트 파일 목록을 가져오지 못했습니다")?;
+        .context("토렌트 파일 목록을 읽어오지 못했습니다")?;
     let librqbit::AddTorrentResponse::ListOnly(info) = response else {
-        anyhow::bail!("다운로드 없이 파일 목록을 확인할 수 없습니다");
+        anyhow::bail!("다운로드 대상 파일 목록을 확인할 수 없습니다");
     };
+    anyhow::ensure!(
+        info.info_hash == expected,
+        "토렌트 메타데이터 정보 해시가 일치하지 않습니다"
+    );
+    let preview = checked_preview(info)?;
+    cache.store_async(key, preview.torrent_bytes.clone()).await;
+    Ok(preview)
+}
+
+fn checked_preview(info: librqbit::ListOnlyResponse) -> Result<TorrentPreview> {
     anyhow::ensure!(
         info.torrent_bytes.len() <= 64 * 1024 * 1024,
         "토렌트 메타데이터가 64MB를 초과했습니다"
@@ -1230,24 +1435,57 @@ async fn add_torrent(
         overwrite: true,
         ..Default::default()
     };
-    let torrent = match &job.torrent_bytes {
-        Some(bytes) => AddTorrent::from_bytes(bytes.clone()),
-        None => AddTorrent::from_url(job.magnet.clone()),
+    let bytes = job
+        .torrent_bytes
+        .as_ref()
+        .context("토렌트 메타데이터 없음")?;
+    anyhow::ensure!(
+        bytes.len() <= 64 * 1024 * 1024,
+        "토렌트 메타데이터가 너무 큽니다"
+    );
+    let expected_hash = librqbit::Magnet::parse(&job.magnet)?
+        .as_id20()
+        .context("지원되지 않는 토렌트 정보 해시")?;
+    let preview = session
+        .add_torrent(
+            AddTorrent::from_bytes(bytes.clone()),
+            Some(AddTorrentOptions {
+                list_only: true,
+                only_files: job.only_files.clone(),
+                ..Default::default()
+            }),
+        )
+        .await?;
+    let librqbit::AddTorrentResponse::ListOnly(preview) = preview else {
+        anyhow::bail!("토렌트 메타데이터 확인 실패");
     };
-    let handle = session
-        .add_torrent(torrent, Some(opts))
-        .await
-        .and_then(|response| {
-            response
-                .into_handle()
-                .context("이 토렌트는 파일 목록만 조회할 수 있습니다")
-        })
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    anyhow::ensure!(
+        preview.info_hash == expected_hash,
+        "마그넷과 토렌트 메타데이터 정보 해시가 다릅니다"
+    );
+    let response = session
+        .add_torrent(AddTorrent::from_bytes(bytes.clone()), Some(opts))
+        .await?;
+    let handle = match response {
+        librqbit::AddTorrentResponse::Added(_, handle) => handle,
+        librqbit::AddTorrentResponse::AlreadyManaged(_, _) => {
+            anyhow::bail!(
+                "동일 토렌트가 이미 등록되어 있습니다. 기존 작업을 유지하며 중복 등록하지 않습니다"
+            );
+        }
+        librqbit::AddTorrentResponse::ListOnly(_) => anyhow::bail!("토렌트 등록 실패"),
+    };
     if let Some(expected) = &job.only_files {
-        anyhow::ensure!(
-            handle.only_files().as_ref() == Some(expected),
-            "토렌트 엔진에 선택된 파일 목록이 적용되지 않았습니다"
-        );
+        let expected = expected.iter().copied().collect::<HashSet<_>>();
+        let actual = handle
+            .only_files()
+            .map(|files| files.into_iter().collect::<HashSet<_>>());
+        if actual.as_ref() != Some(&expected) {
+            let removal = session
+                .delete(TorrentIdOrHash::Id(handle.id()), false)
+                .await;
+            anyhow::bail!("토렌트 선택 파일 목록이 일치하지 않습니다 (세션 정리: {removal:?})");
+        }
     }
     Ok(handle)
 }

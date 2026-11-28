@@ -456,13 +456,26 @@ impl NslApp {
         self.with_dlc_batch(|app| app.poll_missing_update_audit_active(ctx));
     }
 
+    #[cfg(test)]
     pub(crate) fn handle_missing_update_completion(
         &mut self,
         key: &str,
         result: &Result<(), String>,
     ) {
-        self.handle_missing_update_completion_active(key, result);
-        self.with_dlc_batch(|app| app.handle_missing_update_completion_active(key, result));
+        let snapshot = self.torrent_progress.clone();
+        self.handle_missing_update_completion_from_snapshot(key, result, &snapshot);
+    }
+
+    pub(crate) fn handle_missing_update_completion_from_snapshot(
+        &mut self,
+        key: &str,
+        result: &Result<(), String>,
+        snapshot: &[(String, torrent::TorrentProgress)],
+    ) {
+        self.handle_missing_update_completion_active(key, result, snapshot);
+        self.with_dlc_batch(|app| {
+            app.handle_missing_update_completion_active(key, result, snapshot)
+        });
     }
 }
 
@@ -549,6 +562,11 @@ impl NslApp {
         let eligible = batch
             .rows
             .iter()
+            .filter(|row| !row.candidates.is_empty())
+            .count();
+        let verified = batch
+            .rows
+            .iter()
             .filter(|row| row.merge_permitted && !row.candidates.is_empty())
             .count();
         self.status = format!(
@@ -568,7 +586,7 @@ impl NslApp {
             self.status.push_str(&format!(
                 " | 카탈로그 ID 후보 {}개 (CNMT 검증 원본 {}개 · 재검증 대기 {}개). 실제 업데이트 파일은 별도 확인",
                 batch.catalog_hint_count(),
-                eligible,
+                verified,
                 batch.pending_catalog_count()
             ));
         }
@@ -579,7 +597,7 @@ impl NslApp {
             .count();
         if withheld != 0 {
             self.status.push_str(&format!(
-                " | CNMT 출처 미검증 원본 {withheld}개 자동 처리 제외 (라이브러리 재스캔 필요)"
+                " | CNMT 출처 미검증 원본 {withheld}개 (병합 전 검증 필요)"
             ));
         }
         self.update_batch = Some(batch);
@@ -738,6 +756,7 @@ impl NslApp {
         let active_merges = batch
             .rows
             .iter()
+            .chain(self.dlc_batch.iter().flat_map(|other| other.rows.iter()))
             .filter(|row| row.job.as_ref().is_some_and(|job| job.verifying.is_some()))
             .count();
         let mut available = MAX_PARALLEL_UPDATE_MERGES.saturating_sub(active_merges);
@@ -752,6 +771,30 @@ impl NslApp {
         for index in verify_rows {
             if available == 0 {
                 break;
+            }
+            let other_conflict = self.dlc_batch.as_ref().is_some_and(|other| {
+                let row = &batch.rows[index];
+                other.rows.iter().any(|prior| {
+                    prior.title_id == row.title_id
+                        && prior.original_path == row.original_path
+                        && prior.job.as_ref().is_some_and(|job| {
+                            job.transfer_finished
+                                || matches!(
+                                    job.status,
+                                    update_batch::UpdateBatchJobStatus::Verifying
+                                        | update_batch::UpdateBatchJobStatus::Merged(_)
+                                )
+                        })
+                })
+            });
+            if other_conflict {
+                if let Some(job) = batch.rows[index].job.as_mut() {
+                    job.status = update_batch::UpdateBatchJobStatus::Failed(
+                        "동일 원본의 다른 종류 병합 작업이 있습니다. 최신 병합본을 재스캔한 뒤 다시 대조하세요".into()
+                    );
+                    changed = true;
+                }
+                continue;
             }
             let Some(cumulative_input) = cumulative
                 .as_ref()
@@ -793,20 +836,44 @@ impl NslApp {
 
     /// Called only for a matching job key, after the torrent engine's actual
     /// completion notice (not merely a progress bar reaching 100 percent).
-    fn handle_missing_update_completion_active(&mut self, key: &str, result: &Result<(), String>) {
+    fn handle_missing_update_completion_active(
+        &mut self,
+        key: &str,
+        result: &Result<(), String>,
+        snapshot: &[(String, torrent::TorrentProgress)],
+    ) {
         let Some(batch) = self.update_batch.as_mut() else {
             return;
         };
         let mut changed = false;
         for row in &mut batch.rows {
-            let Some(job) = row.job.as_mut().filter(|job| job.key == key) else {
+            let Some(job) = row.job.as_mut() else {
                 continue;
             };
-            if !matches!(
-                job.status,
-                update_batch::UpdateBatchJobStatus::Queued
-                    | update_batch::UpdateBatchJobStatus::Downloading
-            ) {
+            if job.transfer_finished
+                || !matches!(
+                    job.status,
+                    update_batch::UpdateBatchJobStatus::Queued
+                        | update_batch::UpdateBatchJobStatus::Downloading
+                        | update_batch::UpdateBatchJobStatus::Failed(_)
+                )
+            {
+                continue;
+            }
+            // An rNN restored completion may arrive before the next frame's
+            // poll; an old tNN may also be reused by an unrelated transfer.
+            // Resolved output directory is authoritative, never a stale key.
+            let folder = snapshot
+                .iter()
+                .find(|(id, _)| id == key)
+                .and_then(|(_, progress)| progress.output_folder.as_deref());
+            if let Some(folder) = folder {
+                if folder != job.directory.as_path() {
+                    continue;
+                }
+                job.key = key.to_owned();
+                job.recovering_since = None;
+            } else if job.recovering_since.is_some() || job.key != key {
                 continue;
             }
             if let Err(error) = result {
@@ -851,14 +918,24 @@ impl NslApp {
             self.status = "토렌트 엔진을 사용할 수 없습니다".into();
             return;
         };
-        if self
+        let other_titles = self
             .dlc_batch
-            .as_ref()
-            .is_some_and(|other| other.rows.iter().any(|row| row.job.is_some()))
-        {
-            self.status = "다른 종류의 다운로드·병합 작업이 기록되어 있습니다. 카탈로그 대조는 동시에 가능하지만, 다른 종류의 작업을 먼저 완료하거나 정리해야 다운로드할 수 있습니다".into();
-            return;
-        }
+            .iter()
+            .flat_map(|other| other.rows.iter())
+            .filter(|row| {
+                row.job.as_ref().is_some_and(|job| {
+                    job.transfer_finished
+                        || matches!(
+                            job.status,
+                            update_batch::UpdateBatchJobStatus::Queued
+                                | update_batch::UpdateBatchJobStatus::Downloading
+                                | update_batch::UpdateBatchJobStatus::Verifying
+                        )
+                })
+            })
+            .map(|row| row.title_id.clone())
+            .collect::<HashSet<_>>();
+        let other_rows = self.dlc_batch.iter().flat_map(|other| other.rows.iter());
         let Some(batch) = self.update_batch.as_mut() else {
             return;
         };
@@ -883,12 +960,16 @@ impl NslApp {
             .fold(0u64, |bytes, (_, progress)| {
                 bytes.saturating_add(progress.total_bytes.saturating_sub(progress.progress_bytes))
             });
-        for row in &batch.rows {
-            if let Some(job) = row
-                .job
-                .as_ref()
-                .filter(|job| !job.transfer_finished && !live_folders.contains(&job.directory))
-            {
+        for row in batch.rows.iter().chain(other_rows) {
+            if let Some(job) = row.job.as_ref().filter(|job| {
+                !job.transfer_finished
+                    && !live_folders.contains(&job.directory)
+                    && matches!(
+                        job.status,
+                        update_batch::UpdateBatchJobStatus::Queued
+                            | update_batch::UpdateBatchJobStatus::Downloading
+                    )
+            }) {
                 reserved_bytes = reserved_bytes.saturating_add(job.expected_file_size);
             }
         }
@@ -896,7 +977,18 @@ impl NslApp {
         let mut failed = 0;
         let mut torrent_jobs = 0;
         let mut space_rejections = 0;
-        for indices in grouped_batch_downloads(batch) {
+        for mut indices in grouped_batch_downloads(batch) {
+            indices.retain(|&index| {
+                let row = &mut batch.rows[index];
+                if other_titles.contains(&row.title_id) {
+                    row.failure = Some("동일 게임의 다른 종류 병합 작업이 있습니다. 완료 후 최신 파일을 다시 대조하세요".into());
+                    failed += 1;
+                    false
+                } else { true }
+            });
+            if indices.is_empty() {
+                continue;
+            }
             let first = &batch.rows[indices[0]];
             let first_found = first
                 .found

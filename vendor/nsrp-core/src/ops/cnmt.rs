@@ -360,12 +360,16 @@ pub fn parse_cnmt(data: &[u8], cnmt_nca_name: impl Into<String>) -> Result<CnmtI
     let title_id = hex::encode_upper(tid_bytes);
     let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let meta_type = ContentMetaType::from_byte(data[0x0c]);
-    let required_system_version = if data.len() >= 0x30 {
-        u64::from_le_bytes(data[0x28..0x30].try_into().unwrap())
-    } else {
-        0
-    };
     let extended_header_size = u16::from_le_bytes(data[0x0e..0x10].try_into().unwrap()) as usize;
+    let required_system_version =
+        if matches!(meta_type, ContentMetaType::Base | ContentMetaType::Update)
+            && extended_header_size >= 12
+            && data.len() >= 0x2c
+        {
+            u64::from(u32::from_le_bytes(data[0x28..0x2c].try_into()?))
+        } else {
+            0
+        };
     let content_count = u16::from_le_bytes(data[0x10..0x12].try_into().unwrap()) as usize;
     let table = 0x20usize
         .checked_add(extended_header_size)
@@ -983,6 +987,23 @@ mod tests {
             info.required_nca_names(),
             vec!["metadata.cnmt.nca", "11111111111111111111111111111111.nca"]
         );
+    }
+
+    #[test]
+    fn stage117_system_version_preserves_metadata_type_semantics() -> Result<()> {
+        for kind in [0x80, 0x81, 0x82] {
+            let mut data = vec![0u8; 0x20 + 0x18 + 0x38];
+            data[0x0c] = kind;
+            data[0x0e..0x10].copy_from_slice(&0x18u16.to_le_bytes());
+            data[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+            data[0x28..0x2c].copy_from_slice(&0x11223344u32.to_le_bytes());
+            data[0x2c..0x30].copy_from_slice(&0x55667788u32.to_le_bytes());
+            assert_eq!(
+                parse_cnmt(&data, "synthetic.cnmt.nca")?.required_system_version,
+                if kind == 0x82 { 0 } else { 0x11223344 }
+            );
+        }
+        Ok(())
     }
 
     #[test]

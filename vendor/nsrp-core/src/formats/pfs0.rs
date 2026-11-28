@@ -108,6 +108,12 @@ impl Pfs0Index {
         base: u64,
         container_size: u64,
     ) -> Result<Self> {
+        let limit = base
+            .checked_add(container_size)
+            .context("PFS0 size overflow")?;
+        if container_size < 16 {
+            bail!("PFS0 header exceeds its bounded region");
+        }
         reader.seek(SeekFrom::Start(base))?;
         let mut magic = [0u8; 4];
         reader.read_exact(&mut magic)?;
@@ -124,14 +130,15 @@ impl Pfs0Index {
             bail!("PFS0 문자열 테이블이 너무 큽니다");
         }
 
+        let table_size = 16u64 + u64::from(count) * 24 + u64::from(string_size);
+        if table_size > container_size {
+            bail!("PFS0 index exceeds its bounded region");
+        }
         let mut raw = vec![0u8; count as usize * 24];
         reader.read_exact(&mut raw)?;
         let mut strings = vec![0u8; string_size as usize];
         reader.read_exact(&mut strings)?;
         let data_start = reader.stream_position()?;
-        let limit = base
-            .checked_add(container_size)
-            .context("PFS0 크기 오버플로")?;
 
         let mut entries = Vec::with_capacity(count as usize);
         let mut seen = HashSet::new();
@@ -166,6 +173,15 @@ impl Pfs0Index {
                 bail!("PFS0 엔트리가 컨테이너 범위를 벗어납니다: {name}");
             }
             entries.push(Pfs0Entry { name, offset, size });
+        }
+        let mut extents: Vec<(u64, u64)> = entries
+            .iter()
+            .filter(|e| e.size != 0)
+            .map(|e| (e.offset, e.offset + e.size))
+            .collect();
+        extents.sort_unstable();
+        if !extents.windows(2).all(|w| w[0].1 <= w[1].0) {
+            bail!("Overlapping PFS0 payload entries");
         }
         Ok(Self {
             data_start,
@@ -694,6 +710,39 @@ mod tests {
         );
         assert!(!canceled.exists());
         assert!(!canceled.with_extension("nsp.partial").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn stage117_index_bounds_and_overlap_match_ns_rp() -> Result<()> {
+        let mut data = b"PFS0".to_vec();
+        data.write_u32::<LittleEndian>(1)?;
+        data.write_u32::<LittleEndian>(MAX_STRING_TABLE)?;
+        data.write_u32::<LittleEndian>(0)?;
+        let mut reader = std::io::Cursor::new(data);
+        let error = Pfs0Index::parse_reader(&mut reader, 0, 16).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("index exceeds its bounded region")
+        );
+        assert_eq!(reader.position(), 16);
+        let root = tempfile::tempdir()?;
+        let a = root.path().join("a.bin");
+        let b = root.path().join("b.bin");
+        fs::write(&a, [1u8; 32])?;
+        fs::write(&b, [2u8; 32])?;
+        let package = root.path().join("valid.nsp");
+        build_from_paths(&[("a.bin".into(), a), ("b.bin".into(), b)], &package)?;
+        let mut bytes = fs::read(&package)?;
+        bytes[40..48].copy_from_slice(&16u64.to_le_bytes());
+        let len = bytes.len() as u64;
+        assert!(
+            Pfs0Index::parse_reader(&mut std::io::Cursor::new(bytes), 0, len)
+                .unwrap_err()
+                .to_string()
+                .contains("Overlapping PFS0")
+        );
         Ok(())
     }
 
